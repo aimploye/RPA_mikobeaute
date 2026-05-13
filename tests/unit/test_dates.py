@@ -1,0 +1,32 @@
+from datetime import date
+
+import pytest
+
+from pos_report_bot.core.dates import format_pos_date, format_filename_date, resolve_date_token
+
+
+def test_resolve_relative_date_tokens_from_injected_today() -> None:
+    today = date(2026, 5, 13)
+
+    assert resolve_date_token("{today}", today=today) == date(2026, 5, 13)
+    assert resolve_date_token("{yesterday}", today=today) == date(2026, 5, 12)
+    assert resolve_date_token("{month_start}", today=today) == date(2026, 5, 1)
+
+
+def test_resolve_fixed_and_literal_dates() -> None:
+    today = date(2026, 5, 13)
+
+    assert resolve_date_token("{fixed:2024-01-01}", today=today) == date(2024, 1, 1)
+    assert resolve_date_token("2024/01/01", today=today) == date(2024, 1, 1)
+
+
+def test_format_dates_for_pos_and_filename() -> None:
+    value = date(2026, 5, 12)
+
+    assert format_pos_date(value) == "2026/05/12"
+    assert format_filename_date(value) == "20260512"
+
+
+def test_unknown_date_token_fails_explicitly() -> None:
+    with pytest.raises(ValueError, match="Unsupported date token"):
+        resolve_date_token("{tomorrow}", today=date(2026, 5, 13))

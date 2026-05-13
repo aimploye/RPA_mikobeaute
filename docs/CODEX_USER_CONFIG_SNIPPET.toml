@@ -1,0 +1,16 @@
+# 可選：放到你的使用者層級設定：
+# %USERPROFILE%\.codex\config.toml
+#
+# 注意：這是 user-level config，不要直接覆蓋既有檔案；請合併。
+# 目的：讓 Codex 知道此專案是 trusted，並預設用較安全的 on-request + workspace-write。
+
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[windows]
+sandbox = "elevated"
+
+[projects."D:\\工作\\霈方國際\\工作流\\raw_data_RPA"]
+trust_level = "trusted"

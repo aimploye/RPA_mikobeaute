@@ -1,0 +1,188 @@
+{
+  "execution_id": "dry-run-20260513091134",
+  "started_at": "2026-05-13T09:11:34.618691Z",
+  "ended_at": "2026-05-13T09:11:34.618691Z",
+  "status": "failed",
+  "outputs": [
+    {
+      "task_id": "R01",
+      "output_key": "R01",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R02",
+      "output_key": "R02",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R03",
+      "output_key": "R03",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R04",
+      "output_key": "R04",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R05A",
+      "output_key": "R05A",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R05B",
+      "output_key": "R05B",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R06",
+      "output_key": "R06_N001",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R06",
+      "output_key": "R06_N002",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R06",
+      "output_key": "R06_N003",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R06",
+      "output_key": "R06_N004",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R06",
+      "output_key": "R06_N005",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R06",
+      "output_key": "R06_N006",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R07",
+      "output_key": "R07",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R08",
+      "output_key": "R08",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R09",
+      "output_key": "R09",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R10",
+      "output_key": "R10",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R11",
+      "output_key": "R11",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    },
+    {
+      "task_id": "R12",
+      "output_key": "R12",
+      "status": "failed",
+      "local_file_path": null,
+      "drive_folder_id": null,
+      "drive_file_id": null,
+      "error_code": "DRIVE_FOLDER_ID_MISSING",
+      "message": "Drive folder target is missing"
+    }
+  ]
+}

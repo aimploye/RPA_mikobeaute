@@ -1,0 +1,48 @@
+branches:
+  - code: "N001"
+    pos_code: "PA"
+    pos_text: "PA→站前4F"
+    display_name: "站前4F"
+    note: "站前微整"
+    drive_folder_id: ""
+    enabled: true
+
+  - code: "N002"
+    pos_code: "PB"
+    pos_text: "PB→站前11F"
+    display_name: "站前11F"
+    note: "站前體雕"
+    drive_folder_id: ""
+    enabled: true
+
+  - code: "N003"
+    pos_code: "PC"
+    pos_text: "PC→忠孝7F"
+    display_name: "忠孝7F"
+    note: "忠孝微整"
+    drive_folder_id: ""
+    enabled: true
+
+  - code: "N004"
+    pos_code: "PD"
+    pos_text: "PD→忠孝國際3F"
+    display_name: "忠孝國際3F"
+    note: "忠孝體雕"
+    drive_folder_id: ""
+    enabled: true
+
+  - code: "N005"
+    pos_code: "PE"
+    pos_text: "PE→忠孝健康7F"
+    display_name: "忠孝健康7F"
+    note: "忠孝微整"
+    drive_folder_id: ""
+    enabled: true
+
+  - code: "N006"
+    pos_code: "PF"
+    pos_text: "PF→忠孝預防醫學3F"
+    display_name: "忠孝預防醫學3F"
+    note: "忠孝體雕"
+    drive_folder_id: ""
+    enabled: true

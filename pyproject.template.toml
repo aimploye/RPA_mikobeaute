@@ -1,0 +1,46 @@
+[project]
+name = "pos-report-bot"
+version = "0.1.0"
+description = "Windows desktop RPA tool for SPA-POS report export and Google Drive upload"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "PySide6>=6.7",
+  "pywinauto>=0.6.8",
+  "pywin32>=306; platform_system == 'Windows'",
+  "pydantic>=2.8",
+  "PyYAML>=6.0",
+  "watchdog>=4.0",
+  "keyring>=25.0",
+  "google-api-python-client>=2.120",
+  "google-auth-oauthlib>=1.2",
+  "google-auth-httplib2>=0.2",
+  "Pillow>=10.0",
+  "typing-extensions>=4.10"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-qt>=4.4",
+  "ruff>=0.4",
+  "mypy>=1.10",
+  "pyinstaller>=6.0",
+  "types-PyYAML"
+]
+
+[project.scripts]
+pos-report-bot = "pos_report_bot.app.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

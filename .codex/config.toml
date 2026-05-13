@@ -1,0 +1,28 @@
+# Project-scoped Codex config for:
+# D:\工作\霈方國際\工作流\raw_data_RPA
+#
+# 注意：
+# - Codex 只有在你信任此專案時才會載入 repo 內 .codex/config.toml。
+# - 若 Codex 問是否 trust project，請確認路徑正確後選 trust。
+# - 不要在此檔放 API keys、Drive token、SMTP password、POS password。
+
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+model_verbosity = "medium"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+web_search = "cached"
+
+project_root_markers = [".git", "pyproject.toml", "AGENTS.md"]
+project_doc_max_bytes = 65536
+
+[windows]
+sandbox = "elevated"
+
+[features]
+codex_hooks = true
+shell_snapshot = true
+
+# 建議保留，讓 Codex 能做 local file edits，但不要開 danger-full-access。
+[sandbox_workspace_write]
+network_access = false

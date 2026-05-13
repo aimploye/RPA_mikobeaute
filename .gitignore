@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Build
+build/
+dist/
+*.spec
+
+# Runtime
+runtime_dev/downloads/*
+runtime_dev/output/*
+runtime_dev/logs/*
+runtime_dev/screenshots/*
+runtime_dev/state/*
+!runtime_dev/downloads/.gitkeep
+!runtime_dev/output/.gitkeep
+!runtime_dev/logs/.gitkeep
+!runtime_dev/screenshots/.gitkeep
+!runtime_dev/state/.gitkeep
+
+# Secrets
+*.token
+client_secret*.json
+credentials*.json
+token*.json
+*.key
+*.pem
+
+# External cloned skills
+_external/
+
+# OS
+.DS_Store
+Thumbs.db

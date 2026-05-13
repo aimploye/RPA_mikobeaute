@@ -1,0 +1,1 @@
+"""SPA-POS automation abstractions."""

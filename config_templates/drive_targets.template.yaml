@@ -1,0 +1,37 @@
+# 這份檔案可由 GUI 產生或維護。
+# 每個輸出檔案都可以有自己的 Google Drive folder ID。
+# 使用者可貼資料夾網址或純 ID；程式要自動解析。
+
+drive_targets:
+  R01:
+    folder_id_or_url: ""
+  R02:
+    folder_id_or_url: ""
+  R03:
+    folder_id_or_url: ""
+  R04:
+    folder_id_or_url: ""
+  R05A:
+    folder_id_or_url: ""
+  R05B:
+    folder_id_or_url: ""
+  R06:
+    branches:
+      N001: ""
+      N002: ""
+      N003: ""
+      N004: ""
+      N005: ""
+      N006: ""
+  R07:
+    folder_id_or_url: ""
+  R08:
+    folder_id_or_url: ""
+  R09:
+    folder_id_or_url: ""
+  R10:
+    folder_id_or_url: ""
+  R11:
+    folder_id_or_url: ""
+  R12:
+    folder_id_or_url: ""

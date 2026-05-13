@@ -1,0 +1,73 @@
+app:
+  name: "POSReportBot"
+  work_dir: "C:\\ProgramData\\POSReportBot"
+  downloads_dir: "C:\\ProgramData\\POSReportBot\\downloads"
+  output_dir: "C:\\ProgramData\\POSReportBot\\output"
+  logs_dir: "C:\\ProgramData\\POSReportBot\\logs"
+  screenshots_dir: "C:\\ProgramData\\POSReportBot\\screenshots"
+  state_dir: "C:\\ProgramData\\POSReportBot\\state"
+  language: "zh-TW"
+
+pos:
+  executable_path: ""
+  launch_args: ""
+  working_dir: ""
+  window_title_contains: "SPA-POS"
+  window_title_regex: ""
+  backend: "auto"   # auto | uia | win32
+  startup_wait_seconds: 20
+  run_as_admin: false
+
+login:
+  required: false
+  username: ""
+  company_code: ""
+  login_button_text: "登入"
+  login_success_text: "統計報表"
+  login_failure_text: "帳號或密碼錯誤"
+  timeout_seconds: 30
+
+save_as:
+  dialog_title_contains: "另存新檔"
+  filename_label: "檔案名稱"
+  save_button_text: "存檔"
+  default_extension: ".xls"
+  overwrite_policy: "rename_unique" # rename_unique | overwrite | fail
+  wait_timeout_seconds: 60
+  stable_seconds: 3
+
+google_drive:
+  auth_mode: "drive_api"
+  allow_folder_url_or_id: true
+  token_storage: "keyring"
+  client_secret_path: ""
+
+email:
+  enabled: false
+  smtp_host: ""
+  smtp_port: 587
+  use_tls: true
+  username: ""
+  recipients: []
+  cc: []
+  notify_on_failure: true
+  notify_on_success_summary: true
+
+scheduler:
+  enabled: false
+  daily_time: "07:30"
+  weekly_enabled: true
+  weekly_day: "Thursday"
+  weekly_time: "07:30"
+  retry_count: 2
+  retry_interval_seconds: 60
+
+pos_update:
+  enabled: true
+  update_dialog_title_contains: "程式更新需重新啟動"
+  update_message_contains: "新版程式已經下載安裝完成"
+  action: "click_yes_and_restart"
+  expected_update_weekday: "Thursday"
+  restart_wait_seconds: 180
+  max_restart_wait_seconds: 600
+  resume_unfinished_tasks: true

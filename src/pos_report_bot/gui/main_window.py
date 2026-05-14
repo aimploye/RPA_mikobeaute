@@ -3,10 +3,21 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
-from PySide6.QtWidgets import QLabel, QMainWindow, QPushButton, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
+from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
 from pos_report_bot.pos.ui_probe import probe_window_controls, write_probe_report
 from pos_report_bot.reports.planner import build_dry_run_plan
 
@@ -102,7 +113,8 @@ class SettingsMainWindow(QMainWindow):
 
         tabs = QTabWidget()
         for page in build_settings_pages(config):
-            tabs.addTab(self._build_page_widget(page), page.title)
+            widget = self._build_drive_page_widget() if page.page_id == "drive" else self._build_page_widget(page)
+            tabs.addTab(widget, page.title)
         self.setCentralWidget(tabs)
 
     def set_drive_target(self, task_id: str, folder_id_or_url: str) -> None:
@@ -123,7 +135,13 @@ class SettingsMainWindow(QMainWindow):
         return save_project_config(self.config, path)
 
     def trigger_dry_run(self, *, today: date | None = None) -> dict[str, Any]:
+        self._sync_drive_target_table_to_config()
         return build_dry_run_plan(self.config, today=today).to_payload()
+
+    def fill_all_drive_targets_for_testing(self, *, prefix: str) -> None:
+        values = {row.target_key: f"{prefix}_{row.target_key}" for row in build_drive_target_rows(self.config)}
+        apply_drive_target_values(self.config, values)
+        self._refresh_drive_target_table()
 
     def test_pos_connection(self) -> GuiActionResult:
         if not self.config.pos.executable_path:
@@ -162,6 +180,50 @@ class SettingsMainWindow(QMainWindow):
             layout.addWidget(button)
         layout.addStretch()
         return widget
+
+    def _build_drive_page_widget(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(QLabel("Google Drive folder ID / URL"))
+
+        table = QTableWidget()
+        table.setObjectName("drive_target_table")
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["輸出項目", "任務代號", "任務名稱", "分館", "Folder ID / URL"])
+        layout.addWidget(table)
+        self._drive_target_table = table
+        self._refresh_drive_target_table()
+        return widget
+
+    def _refresh_drive_target_table(self) -> None:
+        table = getattr(self, "_drive_target_table", None)
+        if table is None:
+            return
+
+        rows = build_drive_target_rows(self.config)
+        table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            table.setItem(index, 0, QTableWidgetItem(row.target_key))
+            table.setItem(index, 1, QTableWidgetItem(row.task_id))
+            table.setItem(index, 2, QTableWidgetItem(row.task_name))
+            table.setItem(index, 3, QTableWidgetItem(row.branch_display_name or ""))
+            editor = QLineEdit(row.folder_id_or_url)
+            editor.setObjectName(f"drive_target_{row.target_key}")
+            table.setCellWidget(index, 4, editor)
+
+    def _sync_drive_target_table_to_config(self) -> None:
+        table = getattr(self, "_drive_target_table", None)
+        if table is None:
+            return
+
+        values: dict[str, str] = {}
+        for row_index in range(table.rowCount()):
+            target_item = table.item(row_index, 0)
+            editor = table.cellWidget(row_index, 4)
+            if target_item is None or not isinstance(editor, QLineEdit):
+                continue
+            values[target_item.text()] = editor.text()
+        apply_drive_target_values(self.config, values)
 
 
 def launch_settings_gui(config: ProjectConfig) -> int:

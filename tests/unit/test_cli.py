@@ -73,8 +73,9 @@ def test_dry_run_cli_can_write_summary(tmp_path: Path) -> None:
 def test_gui_cli_loads_config_and_launches_gui(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     launched = {}
 
-    def fake_launch(config) -> int:  # type: ignore[no-untyped-def]
+    def fake_launch(config, *, settings_path: Path | None = None) -> int:  # type: ignore[no-untyped-def]
         launched["app_name"] = config.app.name
+        launched["settings_path"] = settings_path
         return 0
 
     monkeypatch.setattr(cli, "launch_settings_gui", fake_launch)
@@ -89,3 +90,4 @@ def test_gui_cli_loads_config_and_launches_gui(monkeypatch) -> None:  # type: ig
 
     assert exit_code == 0
     assert launched["app_name"] == "POSReportBot"
+    assert launched["settings_path"] == ROOT / "config_templates" / "app.template.yaml"

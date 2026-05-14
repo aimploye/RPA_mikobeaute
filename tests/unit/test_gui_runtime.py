@@ -4,7 +4,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QTableWidget, QTabWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton, QTableWidget, QTabWidget  # noqa: E402
 
 from pos_report_bot.config.loader import load_project_config  # noqa: E402
 from pos_report_bot.drive.folder_id import parse_drive_folder_id  # noqa: E402
@@ -87,6 +87,59 @@ def test_settings_window_can_trigger_dry_run_without_pos() -> None:
     assert payload["mode"] == "dry_run"
     assert payload["counts"]["outputs"] == 18
     assert payload["counts"]["missing_drive_targets"] == 18
+    window.close()
+
+
+def test_dry_run_button_updates_status_and_result() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    button = window.findChild(QPushButton, "dashboard_立即 Dry-run")
+    assert button is not None
+    button.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert window.last_dry_run_payload is not None
+    assert window.last_dry_run_payload["counts"]["outputs"] == 18
+    assert "Dry-run 完成" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_save_settings_button_persists_drive_table_edits(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+
+    editor = window.findChild(QLineEdit, "drive_target_R01")
+    assert editor is not None
+    editor.setText("https://drive.google.com/drive/folders/folder_from_button")
+    button = window.findChild(QPushButton, "dashboard_儲存設定")
+    assert button is not None
+    button.click()
+
+    reloaded = load_project_config(tmp_path / "app.yaml")
+    assert reloaded.drive_targets.targets["R01"].folder_id_or_url.endswith("folder_from_button")
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert "設定已儲存" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_pos_test_button_returns_visible_friendly_error() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    button = window.findChild(QPushButton, "pos_測試啟動 POS")
+    assert button is not None
+    button.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is False
+    assert window.last_action_result.error_code == "POS_EXECUTABLE_NOT_CONFIGURED"
+    assert "POS exe 路徑" in window.statusBar().currentMessage()
     window.close()
 
 

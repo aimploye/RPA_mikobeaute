@@ -27,7 +27,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.gui:
         config = load_project_config(args.config)
-        return launch_settings_gui(config)
+        return launch_settings_gui(config, settings_path=args.config)
 
     if not args.dry_run:
         parser.print_help()

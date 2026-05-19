@@ -1,5 +1,7 @@
 import argparse
 import json
+import os
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Sequence
@@ -10,9 +12,29 @@ from pos_report_bot.gui.main_window import launch_settings_gui
 from pos_report_bot.reports.planner import build_dry_run_plan
 
 
+def default_config_path() -> Path:
+    programdata = os.environ.get("PROGRAMDATA")
+    if programdata:
+        installed_config = Path(programdata) / "POSReportBot" / "config" / "app.yaml"
+        if installed_config.exists():
+            return installed_config
+
+    source_config = Path("config_templates/app.template.yaml")
+    if source_config.exists():
+        return source_config.resolve()
+
+    frozen_base = getattr(sys, "_MEIPASS", None)
+    if frozen_base:
+        bundled_config = Path(frozen_base) / "config_templates" / "app.template.yaml"
+        if bundled_config.exists():
+            return bundled_config
+
+    return source_config
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pos_report_bot")
-    parser.add_argument("--config", type=Path, default=Path("config_templates/app.template.yaml"))
+    parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--dry-run", action="store_true", help="展開報表任務但不操作 POS")
     parser.add_argument("--gui", action="store_true", help="啟動 PySide6 設定中心")
     parser.add_argument("--today", help="測試用日期，格式 YYYY-MM-DD")
@@ -22,10 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_args)
 
-    if args.gui:
+    if args.gui or not raw_args:
         config = load_project_config(args.config)
         return launch_settings_gui(config, settings_path=args.config)
 

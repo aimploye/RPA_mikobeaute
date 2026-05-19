@@ -253,6 +253,67 @@ def test_pos_test_button_returns_visible_friendly_error() -> None:
     window.close()
 
 
+def test_report_entry_probe_button_exists_and_returns_clear_real_pos_requirement() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    button = window.findChild(QPushButton, "pos_測報表入口")
+    assert button is not None
+    button.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is False
+    assert window.last_action_result.error_code == "POS_REAL_MACHINE_REQUIRED"
+    assert "報表入口" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_report_entry_probe_finds_expected_report_menu_names_with_mock_window() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+    fake_window = FakeControl(
+        "SPA-POS",
+        [
+            FakeControl("課程服務明細表"),
+            FakeControl("商品銷售明細表"),
+            FakeControl("會員剩餘點數殘值統計表"),
+            FakeControl("預約紀錄查詢統計表"),
+            FakeControl("客戶來源與產值統計表"),
+        ],
+    )
+
+    result = window.probe_report_entries(fake_window)
+
+    assert result.ok is True
+    assert "5/5" in result.message
+    window.close()
+
+
+def test_report_page_can_enable_only_r01_for_single_report_dry_run() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    only_r01 = window.findChild(QPushButton, "reports_只啟用 R01 測試")
+    dry_run = window.findChild(QPushButton, "reports_立即 Dry-run")
+    assert only_r01 is not None
+    assert dry_run is not None
+
+    only_r01.click()
+    dry_run.click()
+
+    assert window.last_dry_run_payload is not None
+    assert window.last_dry_run_payload["counts"]["outputs"] == 1
+    assert window.last_dry_run_payload["outputs"][0]["task_id"] == "R01"
+    r01_enabled = window.findChild(QCheckBox, "report_R01_enabled")
+    r02_enabled = window.findChild(QCheckBox, "report_R02_enabled")
+    assert r01_enabled is not None and r01_enabled.isChecked()
+    assert r02_enabled is not None and not r02_enabled.isChecked()
+    window.close()
+
+
 def test_settings_window_pos_test_returns_friendly_error_without_pos_path() -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")

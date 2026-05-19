@@ -29,7 +29,14 @@ def test_settings_pages_cover_required_sections_without_importing_pyside() -> No
         "測試啟動 POS",
         "連接已開啟 POS",
         "探測 POS 畫面元件",
+        "測報表入口",
         "匯出 UI 探測報告",
+    ]
+    assert next(page for page in pages if page.page_id == "reports").actions == [
+        "只啟用 R01 測試",
+        "啟用全部報表",
+        "測試上傳",
+        "立即 Dry-run",
     ]
 
 

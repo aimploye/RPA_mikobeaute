@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
-from pos_report_bot.pos.ui_probe import UiProbeError, probe_window_controls, write_probe_report
+from pos_report_bot.pos.ui_probe import UiProbeError, connect_pos_window, probe_window_controls, write_probe_report
 from pos_report_bot.reports.planner import build_dry_run_plan
 
 
@@ -74,7 +74,7 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             page_id="pos",
             title="POS 設定",
             fields=["POS exe 路徑", "啟動參數", "工作目錄", "視窗標題包含", "視窗標題 regex", "automation backend"],
-            actions=["測試啟動 POS", "連接已開啟 POS", "探測 POS 畫面元件", "匯出 UI 探測報告"],
+            actions=["測試啟動 POS", "連接已開啟 POS", "探測 POS 畫面元件", "測報表入口", "匯出 UI 探測報告"],
         ),
         SettingsPageContract(
             page_id="login",
@@ -91,7 +91,7 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             page_id="reports",
             title="報表任務設定",
             fields=["啟用", "任務代號", "任務名稱", "執行頻率", "報表入口", "分館模式", "日期規則", "輸出檔名規則"],
-            actions=["測試上傳", "立即 Dry-run"],
+            actions=["只啟用 R01 測試", "啟用全部報表", "測試上傳", "立即 Dry-run"],
             badge=f"{enabled_reports} enabled",
         ),
         SettingsPageContract(
@@ -199,6 +199,45 @@ class SettingsMainWindow(QMainWindow):
         )
         write_probe_report(report, path)
         return GuiActionResult(ok=True, message=f"UI Probe report exported: {path}")
+
+    def probe_report_entries(self, window: Any | None = None) -> GuiActionResult:
+        if window is None:
+            try:
+                window = connect_pos_window(
+                    window_title_contains=self.config.pos.window_title_contains,
+                    backend=self.config.pos.backend,
+                )
+            except UiProbeError as exc:
+                return GuiActionResult(
+                    ok=False,
+                    error_code="POS_REAL_MACHINE_REQUIRED",
+                    message=f"測報表入口需要已開啟的 SPA-POS 視窗：{exc}",
+                )
+
+        report = probe_window_controls(
+            window,
+            window_title=self.config.pos.window_title_contains,
+            backend=self.config.pos.backend,
+        )
+        expected_entries = sorted({item.report_menu_text for item in self.config.reports if item.enabled})
+        control_names = [control.name for control in report.controls if control.visible and control.name]
+        found = [
+            entry
+            for entry in expected_entries
+            if any(entry in control_name or control_name in entry for control_name in control_names)
+        ]
+        missing = [entry for entry in expected_entries if entry not in found]
+
+        if missing:
+            return GuiActionResult(
+                ok=False,
+                error_code="REPORT_ENTRIES_MISSING",
+                message=f"已找到 {len(found)}/{len(expected_entries)} 個報表入口；缺少：{', '.join(missing)}",
+            )
+        return GuiActionResult(
+            ok=True,
+            message=f"已找到 {len(found)}/{len(expected_entries)} 個報表入口：{', '.join(found)}",
+        )
 
     def handle_action(self, page_id: str, action: str) -> GuiActionResult:
         try:
@@ -416,6 +455,9 @@ class SettingsMainWindow(QMainWindow):
         if action in {"測試啟動 POS", "連接已開啟 POS"}:
             return self.test_pos_connection()
 
+        if action == "測報表入口":
+            return self.probe_report_entries()
+
         if action in {"探測 POS 畫面元件", "匯出 UI 探測報告", "匯出 UI Probe JSON"}:
             return GuiActionResult(
                 ok=False,
@@ -436,6 +478,14 @@ class SettingsMainWindow(QMainWindow):
                 error_code="GOOGLE_DRIVE_OAUTH_NOT_CONFIGURED",
                 message="已讀取 Drive folder ID 設定；真實 Google Drive OAuth / 上傳尚未在此 MVP 操作。",
             )
+
+        if action == "只啟用 R01 測試":
+            self._set_only_report_enabled("R01")
+            return GuiActionResult(ok=True, message="已只啟用 R01。接著按「立即 Dry-run」即可只展開一份 R01。")
+
+        if action == "啟用全部報表":
+            self._set_all_reports_enabled()
+            return GuiActionResult(ok=True, message="已啟用全部報表任務。")
 
         if action == "立即執行選取任務":
             return GuiActionResult(
@@ -707,6 +757,20 @@ class SettingsMainWindow(QMainWindow):
                 report.drive_folder_id = drive_folder_id.text()
             if upload_enabled is not None:
                 report.upload_enabled = upload_enabled.isChecked()
+
+    def _set_only_report_enabled(self, report_id: str) -> None:
+        for report in self.config.reports:
+            report.enabled = report.id == report_id
+            checkbox = self.findChild(QCheckBox, f"report_{report.id}_enabled")
+            if checkbox is not None:
+                checkbox.setChecked(report.enabled)
+
+    def _set_all_reports_enabled(self) -> None:
+        for report in self.config.reports:
+            report.enabled = True
+            checkbox = self.findChild(QCheckBox, f"report_{report.id}_enabled")
+            if checkbox is not None:
+                checkbox.setChecked(True)
 
 
 def launch_settings_gui(config: ProjectConfig, *, settings_path: Path | None = None) -> int:

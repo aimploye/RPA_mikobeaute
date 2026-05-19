@@ -1,13 +1,20 @@
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QHeaderView,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -34,6 +41,16 @@ class GuiActionResult(BaseModel):
     ok: bool
     error_code: str | None = None
     message: str
+
+
+@dataclass(frozen=True)
+class SettingFieldSpec:
+    label: str
+    path: str
+    widget: Literal["text", "bool", "int", "combo", "list"]
+    options: tuple[str, ...] = ()
+    minimum: int = 0
+    maximum: int = 9999
 
 
 def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
@@ -112,12 +129,22 @@ class SettingsMainWindow(QMainWindow):
         self.last_action_result: GuiActionResult | None = None
         self.last_dry_run_payload: dict[str, Any] | None = None
         self._drive_target_table: QTableWidget | None = None
+        self._branches_table: QTableWidget | None = None
+        self._reports_table: QTableWidget | None = None
+        self._setting_editors: dict[str, QLineEdit | QCheckBox | QSpinBox | QComboBox] = {}
         self.setWindowTitle("POSReportBot 設定中心")
         self.resize(1100, 720)
 
         tabs = QTabWidget()
         for page in build_settings_pages(config):
-            widget = self._build_drive_page_widget() if page.page_id == "drive" else self._build_page_widget(page)
+            if page.page_id == "drive":
+                widget = self._build_drive_page_widget()
+            elif page.page_id == "branches":
+                widget = self._build_branches_page_widget(page)
+            elif page.page_id == "reports":
+                widget = self._build_reports_page_widget(page)
+            else:
+                widget = self._build_page_widget(page)
             tabs.addTab(widget, page.title)
         self.setCentralWidget(tabs)
         self.statusBar().showMessage("就緒")
@@ -139,11 +166,11 @@ class SettingsMainWindow(QMainWindow):
         self._refresh_drive_target_table()
 
     def save_settings(self, path: Path) -> Path:
-        self._sync_drive_target_table_to_config()
+        self._sync_gui_to_config()
         return save_project_config(self.config, path)
 
     def trigger_dry_run(self, *, today: date | None = None) -> dict[str, Any]:
-        self._sync_drive_target_table_to_config()
+        self._sync_gui_to_config()
         return build_dry_run_plan(self.config, today=today).to_payload()
 
     def fill_all_drive_targets_for_testing(self, *, prefix: str) -> None:
@@ -191,8 +218,19 @@ class SettingsMainWindow(QMainWindow):
         title.setObjectName(f"{page.page_id}_title")
         layout.addWidget(title)
 
-        for field in page.fields:
-            layout.addWidget(QLabel(field))
+        field_specs = self._field_specs_for_page(page.page_id)
+        if field_specs:
+            form = QFormLayout()
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            form.setLabelAlignment(form.labelAlignment())
+            for spec in field_specs:
+                editor = self._create_setting_editor(spec)
+                form.addRow(spec.label, editor)
+            layout.addLayout(form)
+        else:
+            for field in page.fields:
+                layout.addWidget(QLabel(field))
+
         for action in page.actions:
             button = QPushButton(action)
             button.setObjectName(f"{page.page_id}_{action}")
@@ -203,10 +241,100 @@ class SettingsMainWindow(QMainWindow):
         layout.addStretch()
         return widget
 
+    def _build_branches_page_widget(self, page: SettingsPageContract) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        title = QLabel(f"{page.title} - {page.badge}")
+        title.setObjectName(f"{page.page_id}_title")
+        layout.addWidget(title)
+
+        table = QTableWidget()
+        table.setObjectName("branches_table")
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels(["啟用", "分館代號", "POS 代碼", "POS 顯示文字", "顯示名稱", "備註", "Drive folder ID"])
+        table.setRowCount(len(self.config.branches))
+        self._branches_table = table
+        for row_index, branch in enumerate(self.config.branches):
+            enabled = QCheckBox()
+            enabled.setObjectName(f"branch_{branch.code}_enabled")
+            enabled.setChecked(branch.enabled)
+            table.setCellWidget(row_index, 0, enabled)
+            table.setItem(row_index, 1, QTableWidgetItem(branch.code))
+            table.setCellWidget(row_index, 2, self._table_line_edit(f"branch_{branch.code}_pos_code", branch.pos_code))
+            table.setCellWidget(row_index, 3, self._table_line_edit(f"branch_{branch.code}_pos_text", branch.pos_text))
+            table.setCellWidget(row_index, 4, self._table_line_edit(f"branch_{branch.code}_display_name", branch.display_name))
+            table.setCellWidget(row_index, 5, self._table_line_edit(f"branch_{branch.code}_note", branch.note))
+            table.setCellWidget(row_index, 6, self._table_line_edit(f"branch_{branch.code}_drive_folder_id", branch.drive_folder_id))
+        self._stretch_table(table, stretch_columns={3, 4, 5, 6})
+        layout.addWidget(table)
+        layout.addStretch()
+        return widget
+
+    def _build_reports_page_widget(self, page: SettingsPageContract) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        title = QLabel(f"{page.title} - {page.badge}")
+        title.setObjectName(f"{page.page_id}_title")
+        layout.addWidget(title)
+
+        table = QTableWidget()
+        table.setObjectName("reports_table")
+        table.setColumnCount(11)
+        table.setHorizontalHeaderLabels(
+            ["啟用", "任務代號", "任務名稱", "頻率", "報表入口", "分館模式", "起日規則", "迄日規則", "輸出檔名", "Drive folder ID", "上傳"]
+        )
+        table.setRowCount(len(self.config.reports))
+        self._reports_table = table
+        for row_index, report in enumerate(self.config.reports):
+            enabled = QCheckBox()
+            enabled.setObjectName(f"report_{report.id}_enabled")
+            enabled.setChecked(report.enabled)
+            table.setCellWidget(row_index, 0, enabled)
+            table.setItem(row_index, 1, QTableWidgetItem(report.id))
+            table.setCellWidget(row_index, 2, self._table_line_edit(f"report_{report.id}_name", report.name))
+            table.setCellWidget(row_index, 3, self._table_combo(f"report_{report.id}_frequency", ("daily", "weekly"), report.frequency))
+            table.setCellWidget(row_index, 4, self._table_line_edit(f"report_{report.id}_report_menu_text", report.report_menu_text))
+            table.setCellWidget(
+                row_index,
+                5,
+                self._table_combo(f"report_{report.id}_branch_mode", ("all", "each_branch", "multi_select", "single"), report.branch_mode),
+            )
+            table.setCellWidget(row_index, 6, self._table_line_edit(f"report_{report.id}_date_start", report.date_range.start))
+            table.setCellWidget(row_index, 7, self._table_line_edit(f"report_{report.id}_date_end", report.date_range.end))
+            table.setCellWidget(row_index, 8, self._table_line_edit(f"report_{report.id}_output_filename", report.output_filename))
+            table.setCellWidget(row_index, 9, self._table_line_edit(f"report_{report.id}_drive_folder_id", report.drive_folder_id))
+            upload_enabled = QCheckBox()
+            upload_enabled.setObjectName(f"report_{report.id}_upload_enabled")
+            upload_enabled.setChecked(report.upload_enabled)
+            table.setCellWidget(row_index, 10, upload_enabled)
+        self._stretch_table(table, stretch_columns={2, 4, 8, 9})
+        layout.addWidget(table)
+
+        actions = QWidget()
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        for action in page.actions:
+            button = QPushButton(action)
+            button.setObjectName(f"{page.page_id}_{action}")
+            button.clicked.connect(
+                lambda _checked=False, page_id=page.page_id, action=action: self.handle_action(page_id, action)
+            )
+            actions_layout.addWidget(button)
+        actions_layout.addStretch()
+        layout.addWidget(actions)
+        return widget
+
     def _build_drive_page_widget(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.addWidget(QLabel("Google Drive folder ID / URL"))
+
+        drive_specs = self._field_specs_for_page("drive")
+        drive_form = QFormLayout()
+        drive_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        for spec in drive_specs:
+            drive_form.addRow(spec.label, self._create_setting_editor(spec))
+        layout.addLayout(drive_form)
+        layout.addWidget(QLabel("18 個輸出項目的 Google Drive folder ID / URL"))
 
         table = QTableWidget()
         table.setObjectName("drive_target_table")
@@ -214,13 +342,23 @@ class SettingsMainWindow(QMainWindow):
         table.setHorizontalHeaderLabels(["輸出項目", "任務代號", "任務名稱", "分館", "Folder ID / URL"])
         layout.addWidget(table)
         self._drive_target_table = table
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self._refresh_drive_target_table()
 
+        actions = QWidget()
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
         for action in ["儲存設定", "連接 Google Drive", "測試列出使用者資訊", "測試指定 folder ID"]:
             button = QPushButton(action)
             button.setObjectName(f"drive_{action}")
             button.clicked.connect(lambda _checked=False, action=action: self.handle_action("drive", action))
-            layout.addWidget(button)
+            actions_layout.addWidget(button)
+        actions_layout.addStretch()
+        layout.addWidget(actions)
         return widget
 
     def _refresh_drive_target_table(self) -> None:
@@ -254,6 +392,8 @@ class SettingsMainWindow(QMainWindow):
         apply_drive_target_values(self.config, values)
 
     def _dispatch_action(self, page_id: str, action: str) -> GuiActionResult:
+        self._sync_gui_to_config()
+
         if action == "儲存設定":
             saved_path = self.save_settings(self.settings_path)
             return GuiActionResult(ok=True, message=f"設定已儲存：{saved_path}")
@@ -362,6 +502,211 @@ class SettingsMainWindow(QMainWindow):
             probe_path.unlink()
             checked += 1
         return GuiActionResult(ok=True, message=f"資料夾權限測試完成：{checked} 個資料夾可寫入。")
+
+    def _sync_gui_to_config(self) -> None:
+        self._sync_setting_editors_to_config()
+        self._sync_branch_table_to_config()
+        self._sync_report_table_to_config()
+        self._sync_drive_target_table_to_config()
+
+    def _field_specs_for_page(self, page_id: str) -> list[SettingFieldSpec]:
+        specs_by_page: dict[str, list[SettingFieldSpec]] = {
+            "basic": [
+                SettingFieldSpec("工作目錄", "app.work_dir", "text"),
+                SettingFieldSpec("下載暫存資料夾", "app.downloads_dir", "text"),
+                SettingFieldSpec("輸出資料夾", "app.output_dir", "text"),
+                SettingFieldSpec("日誌資料夾", "app.logs_dir", "text"),
+                SettingFieldSpec("截圖資料夾", "app.screenshots_dir", "text"),
+                SettingFieldSpec("state 資料夾", "app.state_dir", "text"),
+            ],
+            "pos": [
+                SettingFieldSpec("POS exe 路徑", "pos.executable_path", "text"),
+                SettingFieldSpec("啟動參數", "pos.launch_args", "text"),
+                SettingFieldSpec("工作目錄", "pos.working_dir", "text"),
+                SettingFieldSpec("視窗標題包含", "pos.window_title_contains", "text"),
+                SettingFieldSpec("視窗標題 regex", "pos.window_title_regex", "text"),
+                SettingFieldSpec("automation backend", "pos.backend", "combo", ("auto", "uia", "win32")),
+                SettingFieldSpec("啟動等待秒數", "pos.startup_wait_seconds", "int", minimum=1, maximum=600),
+                SettingFieldSpec("以系統管理員啟動", "pos.run_as_admin", "bool"),
+            ],
+            "login": [
+                SettingFieldSpec("是否需要登入", "login.required", "bool"),
+                SettingFieldSpec("帳號", "login.username", "text"),
+                SettingFieldSpec("分店/公司代號", "login.company_code", "text"),
+                SettingFieldSpec("登入按鈕文字", "login.login_button_text", "text"),
+                SettingFieldSpec("登入成功辨識文字", "login.login_success_text", "text"),
+                SettingFieldSpec("登入失敗辨識文字", "login.login_failure_text", "text"),
+                SettingFieldSpec("登入逾時秒數", "login.timeout_seconds", "int", minimum=1, maximum=600),
+            ],
+            "drive": [
+                SettingFieldSpec("OAuth client 設定方式", "google_drive.auth_mode", "text"),
+                SettingFieldSpec("OAuth client secret 路徑", "google_drive.client_secret_path", "text"),
+            ],
+            "email": [
+                SettingFieldSpec("啟用通知", "email.enabled", "bool"),
+                SettingFieldSpec("SMTP host", "email.smtp_host", "text"),
+                SettingFieldSpec("SMTP port", "email.smtp_port", "int", minimum=1, maximum=65535),
+                SettingFieldSpec("TLS/SSL", "email.use_tls", "bool"),
+                SettingFieldSpec("SMTP username", "email.username", "text"),
+                SettingFieldSpec("收件人", "email.recipients", "list"),
+                SettingFieldSpec("CC", "email.cc", "list"),
+                SettingFieldSpec("失敗通知", "email.notify_on_failure", "bool"),
+                SettingFieldSpec("成功摘要通知", "email.notify_on_success_summary", "bool"),
+            ],
+            "schedule": [
+                SettingFieldSpec("啟用每日排程", "scheduler.enabled", "bool"),
+                SettingFieldSpec("每日時間", "scheduler.daily_time", "text"),
+                SettingFieldSpec("啟用每週任務", "scheduler.weekly_enabled", "bool"),
+                SettingFieldSpec("每週日", "scheduler.weekly_day", "text"),
+                SettingFieldSpec("每週時間", "scheduler.weekly_time", "text"),
+                SettingFieldSpec("失敗重試次數", "scheduler.retry_count", "int", minimum=0, maximum=20),
+                SettingFieldSpec("重試間隔秒數", "scheduler.retry_interval_seconds", "int", minimum=1, maximum=3600),
+            ],
+        }
+        return specs_by_page.get(page_id, [])
+
+    def _create_setting_editor(self, spec: SettingFieldSpec) -> QLineEdit | QCheckBox | QSpinBox | QComboBox:
+        value = self._get_config_value(spec.path)
+        object_name = self._editor_object_name(spec.path)
+
+        if spec.widget == "bool":
+            checkbox = QCheckBox()
+            checkbox.setObjectName(object_name)
+            checkbox.setChecked(bool(value))
+            self._setting_editors[spec.path] = checkbox
+            return checkbox
+        if spec.widget == "int":
+            spinbox = QSpinBox()
+            spinbox.setObjectName(object_name)
+            spinbox.setRange(spec.minimum, spec.maximum)
+            spinbox.setValue(int(value))
+            self._setting_editors[spec.path] = spinbox
+            return spinbox
+        if spec.widget == "combo":
+            combo = QComboBox()
+            combo.setObjectName(object_name)
+            combo.addItems(list(spec.options))
+            combo.setCurrentText(str(value))
+            self._setting_editors[spec.path] = combo
+            return combo
+
+        editor = QLineEdit(self._display_value(value, spec.widget))
+        editor.setObjectName(object_name)
+        self._setting_editors[spec.path] = editor
+        return editor
+
+    def _sync_setting_editors_to_config(self) -> None:
+        specs = [spec for page_id in ["basic", "pos", "login", "drive", "email", "schedule"] for spec in self._field_specs_for_page(page_id)]
+        specs_by_path = {spec.path: spec for spec in specs}
+        for path, editor in self._setting_editors.items():
+            spec = specs_by_path[path]
+            if isinstance(editor, QCheckBox):
+                value: Any = editor.isChecked()
+            elif isinstance(editor, QSpinBox):
+                value = editor.value()
+            elif isinstance(editor, QComboBox):
+                value = editor.currentText()
+            else:
+                value = self._parse_text_value(editor.text(), spec.widget)
+            self._set_config_value(path, value)
+
+    def _get_config_value(self, path: str) -> Any:
+        section_name, field_name = path.split(".", maxsplit=1)
+        section = getattr(self.config, section_name)
+        return getattr(section, field_name)
+
+    def _set_config_value(self, path: str, value: Any) -> None:
+        section_name, field_name = path.split(".", maxsplit=1)
+        section = getattr(self.config, section_name)
+        setattr(section, field_name, value)
+
+    def _display_value(self, value: Any, widget: str) -> str:
+        if widget == "list" and isinstance(value, list):
+            return ", ".join(str(item) for item in value)
+        return str(value)
+
+    def _parse_text_value(self, value: str, widget: str) -> Any:
+        if widget == "list":
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    def _editor_object_name(self, path: str) -> str:
+        return f"setting_{path.replace('.', '_')}"
+
+    def _table_line_edit(self, object_name: str, value: str) -> QLineEdit:
+        editor = QLineEdit(value)
+        editor.setObjectName(object_name)
+        return editor
+
+    def _table_combo(self, object_name: str, options: tuple[str, ...], value: str) -> QComboBox:
+        editor = QComboBox()
+        editor.setObjectName(object_name)
+        editor.addItems(list(options))
+        editor.setCurrentText(value)
+        return editor
+
+    def _stretch_table(self, table: QTableWidget, *, stretch_columns: set[int]) -> None:
+        for column in range(table.columnCount()):
+            mode = QHeaderView.ResizeMode.Stretch if column in stretch_columns else QHeaderView.ResizeMode.ResizeToContents
+            table.horizontalHeader().setSectionResizeMode(column, mode)
+
+    def _sync_branch_table_to_config(self) -> None:
+        if self._branches_table is None:
+            return
+        for branch in self.config.branches:
+            enabled = self.findChild(QCheckBox, f"branch_{branch.code}_enabled")
+            pos_code = self.findChild(QLineEdit, f"branch_{branch.code}_pos_code")
+            pos_text = self.findChild(QLineEdit, f"branch_{branch.code}_pos_text")
+            display_name = self.findChild(QLineEdit, f"branch_{branch.code}_display_name")
+            note = self.findChild(QLineEdit, f"branch_{branch.code}_note")
+            drive_folder_id = self.findChild(QLineEdit, f"branch_{branch.code}_drive_folder_id")
+            if enabled is not None:
+                branch.enabled = enabled.isChecked()
+            if pos_code is not None:
+                branch.pos_code = pos_code.text()
+            if pos_text is not None:
+                branch.pos_text = pos_text.text()
+            if display_name is not None:
+                branch.display_name = display_name.text()
+            if note is not None:
+                branch.note = note.text()
+            if drive_folder_id is not None:
+                branch.drive_folder_id = drive_folder_id.text()
+
+    def _sync_report_table_to_config(self) -> None:
+        if self._reports_table is None:
+            return
+        for report in self.config.reports:
+            enabled = self.findChild(QCheckBox, f"report_{report.id}_enabled")
+            name = self.findChild(QLineEdit, f"report_{report.id}_name")
+            frequency = self.findChild(QComboBox, f"report_{report.id}_frequency")
+            report_menu_text = self.findChild(QLineEdit, f"report_{report.id}_report_menu_text")
+            branch_mode = self.findChild(QComboBox, f"report_{report.id}_branch_mode")
+            date_start = self.findChild(QLineEdit, f"report_{report.id}_date_start")
+            date_end = self.findChild(QLineEdit, f"report_{report.id}_date_end")
+            output_filename = self.findChild(QLineEdit, f"report_{report.id}_output_filename")
+            drive_folder_id = self.findChild(QLineEdit, f"report_{report.id}_drive_folder_id")
+            upload_enabled = self.findChild(QCheckBox, f"report_{report.id}_upload_enabled")
+            if enabled is not None:
+                report.enabled = enabled.isChecked()
+            if name is not None:
+                report.name = name.text()
+            if frequency is not None:
+                report.frequency = frequency.currentText()  # type: ignore[assignment]
+            if report_menu_text is not None:
+                report.report_menu_text = report_menu_text.text()
+            if branch_mode is not None:
+                report.branch_mode = branch_mode.currentText()  # type: ignore[assignment]
+            if date_start is not None:
+                report.date_range.start = date_start.text()
+            if date_end is not None:
+                report.date_range.end = date_end.text()
+            if output_filename is not None:
+                report.output_filename = output_filename.text()
+            if drive_folder_id is not None:
+                report.drive_folder_id = drive_folder_id.text()
+            if upload_enabled is not None:
+                report.upload_enabled = upload_enabled.isChecked()
 
 
 def launch_settings_gui(config: ProjectConfig, *, settings_path: Path | None = None) -> int:

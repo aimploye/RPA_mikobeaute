@@ -99,7 +99,36 @@ def test_pos_settings_page_uses_editable_fields_before_button_action() -> None:
 
     assert window.config.pos.executable_path == r"C:\SPA-POS\SPA-POS.exe"
     assert window.last_action_result is not None
-    assert window.last_action_result.error_code == "POS_REAL_MACHINE_REQUIRED"
+    assert window.last_action_result.error_code == "POS_EXECUTABLE_NOT_FOUND"
+    window.close()
+
+
+def test_start_pos_button_launches_existing_executable(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+    executable = tmp_path / "SPA-POS.exe"
+    executable.write_text("", encoding="utf-8")
+    launched = {}
+
+    def fake_popen(command, *, cwd=None):  # type: ignore[no-untyped-def]
+        launched["command"] = command
+        launched["cwd"] = cwd
+
+    monkeypatch.setattr(main_window.subprocess, "Popen", fake_popen)
+    executable_path = window.findChild(QLineEdit, "setting_pos_executable_path")
+    assert executable_path is not None
+    executable_path.setText(str(executable))
+    button = window.findChild(QPushButton, "pos_測試啟動 POS")
+    assert button is not None
+    button.click()
+
+    assert launched["command"] == [str(executable)]
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert "已送出 POS 啟動指令" in window.statusBar().currentMessage()
     window.close()
 
 
@@ -272,6 +301,47 @@ def test_connect_open_pos_button_uses_pywinauto_connection(monkeypatch) -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert "已連接已開啟 POS" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_probe_pos_controls_button_uses_open_pos_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+    fake_window = FakeControl("SPA-POS 主畫面", [FakeControl("統計報表")])
+
+    monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: fake_window)
+    button = window.findChild(QPushButton, "pos_探測 POS 畫面元件")
+    assert button is not None
+    button.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert window.last_ui_probe_report is not None
+    assert len(window.last_ui_probe_report.controls) == 2
+    assert "UI Probe 完成" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_export_ui_probe_button_writes_report_from_open_pos_window(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.screenshots_dir = str(tmp_path)
+    window = SettingsMainWindow(config)
+    fake_window = FakeControl("SPA-POS 主畫面", [FakeControl("統計報表")])
+
+    monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: fake_window)
+    button = window.findChild(QPushButton, "pos_匯出 UI 探測報告")
+    assert button is not None
+    button.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    reports = list(tmp_path.glob("ui_probe_*.json"))
+    assert len(reports) == 1
+    assert "UI 探測報告已匯出" in window.statusBar().currentMessage()
     window.close()
 
 

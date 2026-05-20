@@ -1,5 +1,8 @@
+import os
+import shlex
+import subprocess
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -128,6 +131,7 @@ class SettingsMainWindow(QMainWindow):
         self.settings_path = self._resolve_settings_path(settings_path)
         self.last_action_result: GuiActionResult | None = None
         self.last_dry_run_payload: dict[str, Any] | None = None
+        self.last_ui_probe_report: Any | None = None
         self._drive_target_table: QTableWidget | None = None
         self._branches_table: QTableWidget | None = None
         self._reports_table: QTableWidget | None = None
@@ -185,10 +189,26 @@ class SettingsMainWindow(QMainWindow):
                 error_code="POS_EXECUTABLE_NOT_CONFIGURED",
                 message="尚未設定 POS exe 路徑，無法測試啟動 POS。",
             )
+        executable_path = Path(self.config.pos.executable_path)
+        if not executable_path.exists():
+            return GuiActionResult(
+                ok=False,
+                error_code="POS_EXECUTABLE_NOT_FOUND",
+                message=f"找不到 POS exe 路徑：{executable_path}",
+            )
+
+        try:
+            self._launch_pos_executable(executable_path)
+        except OSError as exc:
+            return GuiActionResult(
+                ok=False,
+                error_code="POS_LAUNCH_FAILED",
+                message=f"POS 啟動失敗：{exc}",
+            )
+
         return GuiActionResult(
-            ok=False,
-            error_code="POS_REAL_MACHINE_REQUIRED",
-            message="POS 測試需要在安裝 SPA-POS 的 Windows 電腦上執行。",
+            ok=True,
+            message=f"已送出 POS 啟動指令：{executable_path}",
         )
 
     def connect_open_pos(self) -> GuiActionResult:
@@ -218,6 +238,40 @@ class SettingsMainWindow(QMainWindow):
         )
         write_probe_report(report, path)
         return GuiActionResult(ok=True, message=f"UI Probe report exported: {path}")
+
+    def probe_pos_controls(self) -> GuiActionResult:
+        window_result = self._connected_pos_window()
+        if isinstance(window_result, GuiActionResult):
+            return window_result
+
+        report = probe_window_controls(
+            window_result,
+            window_title=self.config.pos.window_title_contains,
+            backend=self.config.pos.backend,
+        )
+        self.last_ui_probe_report = report
+        return GuiActionResult(
+            ok=True,
+            message=f"UI Probe 完成：找到 {len(report.controls)} 個畫面元件。",
+        )
+
+    def export_connected_ui_probe_report(self) -> GuiActionResult:
+        window_result = self._connected_pos_window()
+        if isinstance(window_result, GuiActionResult):
+            return window_result
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = Path(self.config.app.screenshots_dir) / f"ui_probe_{timestamp}.json"
+        result = self.export_ui_probe_report(window_result, report_path)
+        if result.ok:
+            report = probe_window_controls(
+                window_result,
+                window_title=self.config.pos.window_title_contains,
+                backend=self.config.pos.backend,
+            )
+            self.last_ui_probe_report = report
+            return GuiActionResult(ok=True, message=f"UI 探測報告已匯出：{report_path}")
+        return result
 
     def probe_report_entries(self, window: Any | None = None) -> GuiActionResult:
         if window is None:
@@ -480,12 +534,11 @@ class SettingsMainWindow(QMainWindow):
         if action == "測報表入口":
             return self.probe_report_entries()
 
-        if action in {"探測 POS 畫面元件", "匯出 UI 探測報告", "匯出 UI Probe JSON"}:
-            return GuiActionResult(
-                ok=False,
-                error_code="POS_REAL_MACHINE_REQUIRED",
-                message="UI Probe 需要在安裝並開啟 SPA-POS 的 Windows 電腦上執行。",
-            )
+        if action == "探測 POS 畫面元件":
+            return self.probe_pos_controls()
+
+        if action in {"匯出 UI 探測報告", "匯出 UI Probe JSON"}:
+            return self.export_connected_ui_probe_report()
 
         if action == "測試資料夾權限":
             return self._test_folder_permissions()
@@ -564,6 +617,33 @@ class SettingsMainWindow(QMainWindow):
             return str(method())
         except Exception:
             return ""
+
+    def _connected_pos_window(self) -> Any | GuiActionResult:
+        try:
+            return connect_pos_window(
+                window_title_contains=self.config.pos.window_title_contains,
+                backend=self.config.pos.backend,
+            )
+        except UiProbeError as exc:
+            return GuiActionResult(
+                ok=False,
+                error_code="POS_WINDOW_NOT_FOUND",
+                message=f"找不到已開啟的 SPA-POS 視窗：{exc}",
+            )
+
+    def _launch_pos_executable(self, executable_path: Path) -> None:
+        if executable_path.suffix.lower() == ".appref-ms":
+            startfile = getattr(os, "startfile", None)
+            if startfile is None:
+                raise OSError("appref-ms 啟動只支援 Windows。")
+            startfile(str(executable_path))
+            return
+
+        command = [str(executable_path)]
+        if self.config.pos.launch_args:
+            command.extend(shlex.split(self.config.pos.launch_args, posix=False))
+        working_dir = self.config.pos.working_dir or None
+        subprocess.Popen(command, cwd=working_dir)
 
     def _test_folder_permissions(self) -> GuiActionResult:
         folder_paths = [

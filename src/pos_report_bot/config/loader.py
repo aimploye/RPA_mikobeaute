@@ -27,9 +27,9 @@ def load_project_config(app_config_path: Path) -> ProjectConfig:
     if "reports" in app_data and "branches" in app_data and "drive_targets" in app_data:
         return _load_consolidated_config(app_data)
 
-    reports_data = load_yaml(template_dir / "reports.template.yaml")
-    branches_data = load_yaml(template_dir / "branches.template.yaml")
-    drive_targets_data = load_yaml(template_dir / "drive_targets.template.yaml")
+    reports_data = load_yaml(_companion_config_path(template_dir, "reports"))
+    branches_data = load_yaml(_companion_config_path(template_dir, "branches"))
+    drive_targets_data = load_yaml(_companion_config_path(template_dir, "drive_targets"))
 
     target_items = drive_targets_data.get("drive_targets", {})
     if not isinstance(target_items, dict):
@@ -46,6 +46,14 @@ def load_project_config(app_config_path: Path) -> ProjectConfig:
             }
         ),
     )
+
+
+def _companion_config_path(config_dir: Path, name: str) -> Path:
+    for filename in (f"{name}.template.yaml", f"{name}.yaml"):
+        path = config_dir / filename
+        if path.exists():
+            return path
+    return config_dir / f"{name}.template.yaml"
 
 
 def _load_consolidated_config(data: dict[str, Any]) -> ProjectConfig:

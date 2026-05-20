@@ -31,6 +31,9 @@ Source: "..\config_templates\app.template.yaml"; DestDir: "C:\ProgramData\POSRep
 Source: "..\config_templates\reports.template.yaml"; DestDir: "C:\ProgramData\POSReportBot\config"; DestName: "reports.yaml"; Flags: onlyifdoesntexist
 Source: "..\config_templates\branches.template.yaml"; DestDir: "C:\ProgramData\POSReportBot\config"; DestName: "branches.yaml"; Flags: onlyifdoesntexist
 Source: "..\config_templates\drive_targets.template.yaml"; DestDir: "C:\ProgramData\POSReportBot\config"; DestName: "drive_targets.yaml"; Flags: onlyifdoesntexist
+Source: "..\config_templates\reports.template.yaml"; DestDir: "C:\ProgramData\POSReportBot\config"; DestName: "reports.template.yaml"; Flags: onlyifdoesntexist
+Source: "..\config_templates\branches.template.yaml"; DestDir: "C:\ProgramData\POSReportBot\config"; DestName: "branches.template.yaml"; Flags: onlyifdoesntexist
+Source: "..\config_templates\drive_targets.template.yaml"; DestDir: "C:\ProgramData\POSReportBot\config"; DestName: "drive_targets.template.yaml"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

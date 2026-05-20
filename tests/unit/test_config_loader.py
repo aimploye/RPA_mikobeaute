@@ -1,4 +1,5 @@
 from pathlib import Path
+from shutil import copyfile
 
 from pos_report_bot.config.loader import load_project_config
 
@@ -29,4 +30,23 @@ def test_drive_targets_are_loaded_without_secrets() -> None:
 
     assert "R01" in config.drive_targets.targets
     assert config.drive_targets.targets["R01"].folder_id_or_url == ""
+    assert config.drive_targets.targets["R06"].branches["N006"] == ""
+
+
+def test_load_project_config_from_installed_config_filenames(tmp_path: Path) -> None:
+    config_dir = tmp_path / "POSReportBot" / "config"
+    config_dir.mkdir(parents=True)
+    copyfile(ROOT / "config_templates" / "app.template.yaml", config_dir / "app.yaml")
+    copyfile(ROOT / "config_templates" / "reports.template.yaml", config_dir / "reports.yaml")
+    copyfile(ROOT / "config_templates" / "branches.template.yaml", config_dir / "branches.yaml")
+    copyfile(
+        ROOT / "config_templates" / "drive_targets.template.yaml",
+        config_dir / "drive_targets.yaml",
+    )
+
+    config = load_project_config(config_dir / "app.yaml")
+
+    assert config.app.name == "POSReportBot"
+    assert len(config.reports) == 13
+    assert len(config.branches) == 6
     assert config.drive_targets.targets["R06"].branches["N006"] == ""

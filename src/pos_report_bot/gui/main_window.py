@@ -239,10 +239,12 @@ class SettingsMainWindow(QMainWindow):
         write_probe_report(report, path)
         return GuiActionResult(ok=True, message=f"UI Probe report exported: {path}")
 
-    def probe_pos_controls(self) -> GuiActionResult:
-        window_result = self._connected_pos_window()
-        if isinstance(window_result, GuiActionResult):
-            return window_result
+    def probe_pos_controls(self, window: Any | None = None) -> GuiActionResult:
+        window_result = window
+        if window_result is None:
+            window_result = self._connected_pos_window()
+            if isinstance(window_result, GuiActionResult):
+                return window_result
 
         report = probe_window_controls(
             window_result,
@@ -274,7 +276,10 @@ class SettingsMainWindow(QMainWindow):
         return result
 
     def probe_report_entries(self, window: Any | None = None) -> GuiActionResult:
-        if window is None:
+        report = None
+        if window is None and self.last_ui_probe_report is not None:
+            report = self.last_ui_probe_report
+        elif window is None:
             try:
                 window = connect_pos_window(
                     window_title_contains=self.config.pos.window_title_contains,
@@ -287,17 +292,22 @@ class SettingsMainWindow(QMainWindow):
                     message=f"測報表入口需要已開啟的 SPA-POS 視窗：{exc}",
                 )
 
-        report = probe_window_controls(
-            window,
-            window_title=self.config.pos.window_title_contains,
-            backend=self.config.pos.backend,
-        )
+        if report is None:
+            report = probe_window_controls(
+                window,
+                window_title=self.config.pos.window_title_contains,
+                backend=self.config.pos.backend,
+            )
         expected_entries = sorted({item.report_menu_text for item in self.config.reports if item.enabled})
-        control_names = [control.name for control in report.controls if control.visible and control.name]
+        control_names = [control.name for control in report.controls if control.name]
         found = [
             entry
             for entry in expected_entries
-            if any(entry in control_name or control_name in entry for control_name in control_names)
+            if any(
+                self._normalized_menu_text(entry) in self._normalized_menu_text(control_name)
+                or self._normalized_menu_text(control_name) in self._normalized_menu_text(entry)
+                for control_name in control_names
+            )
         ]
         missing = [entry for entry in expected_entries if entry not in found]
 
@@ -644,6 +654,15 @@ class SettingsMainWindow(QMainWindow):
             command.extend(shlex.split(self.config.pos.launch_args, posix=False))
         working_dir = self.config.pos.working_dir or None
         subprocess.Popen(command, cwd=working_dir)
+
+    def _normalized_menu_text(self, value: str) -> str:
+        return (
+            value.replace(" ", "")
+            .replace("\u3000", "")
+            .replace("統計報表", "統計表")
+            .replace("查詢報表", "查詢表")
+            .strip()
+        )
 
     def _test_folder_permissions(self) -> GuiActionResult:
         folder_paths = [

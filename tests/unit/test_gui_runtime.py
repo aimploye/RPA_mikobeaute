@@ -10,6 +10,7 @@ from pos_report_bot.config.loader import load_project_config  # noqa: E402
 from pos_report_bot.drive.folder_id import parse_drive_folder_id  # noqa: E402
 import pos_report_bot.gui.main_window as main_window  # noqa: E402
 from pos_report_bot.gui.main_window import SettingsMainWindow  # noqa: E402
+from pos_report_bot.pos.ui_probe import ControlProbeRecord, UiProbeReport  # noqa: E402
 from tests.unit.test_ui_probe import FakeControl  # noqa: E402
 
 
@@ -377,6 +378,68 @@ def test_report_entry_probe_finds_expected_report_menu_names_with_mock_window() 
     )
 
     result = window.probe_report_entries(fake_window)
+
+    assert result.ok is True
+    assert "5/5" in result.message
+    window.close()
+
+
+def test_report_entry_probe_uses_cached_probe_report_and_normalized_names() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        if report.report_menu_text == "客戶來源與產值統計表":
+            report.report_menu_text = "客戶來源與產值統計報表"
+    window = SettingsMainWindow(config)
+    fake_window = FakeControl(
+        "SPA-POS",
+        [
+            FakeControl("課程服務明細表"),
+            FakeControl("商品銷售明細表"),
+            FakeControl("會員剩餘點數殘值統計表"),
+            FakeControl("預約紀錄查詢統計表"),
+            FakeControl("客戶來源與產值統計表"),
+        ],
+    )
+    probe_result = window.probe_pos_controls(fake_window)
+
+    result = window.probe_report_entries()
+
+    assert probe_result.ok is True
+    assert result.ok is True
+    assert "5/5" in result.message
+    window.close()
+
+
+def test_report_entry_probe_counts_collapsed_menu_items_from_probe_report() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+    window.last_ui_probe_report = UiProbeReport(
+        window_title="SPA-POS",
+        backend="uia",
+        controls=[
+            ControlProbeRecord(
+                control_type="MenuItem",
+                name=name,
+                automation_id="",
+                class_name="",
+                rectangle={"left": 0, "top": 0, "right": 0, "bottom": 0},
+                enabled=True,
+                visible=name != "課程服務明細表",
+                depth=3,
+            )
+            for name in [
+                "課程服務明細表",
+                "商品銷售明細表",
+                "會員剩餘點數殘值統計表",
+                "預約紀錄查詢統計表",
+                "客戶來源與產值統計表",
+            ]
+        ],
+    )
+
+    result = window.probe_report_entries()
 
     assert result.ok is True
     assert "5/5" in result.message

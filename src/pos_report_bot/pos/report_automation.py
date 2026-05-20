@@ -39,6 +39,8 @@ class ReportWindowAutomator:
         output_dir: Path,
         wait_after_click_seconds: float = 0.2,
         report_open_wait_seconds: float = 15.0,
+        report_generate_wait_seconds: float = 60.0,
+        export_format_wait_seconds: float = 5.0,
         warning_dismiss_limit: int = 10,
     ) -> None:
         self.window = window
@@ -46,6 +48,8 @@ class ReportWindowAutomator:
         self.output_dir = output_dir
         self.wait_after_click_seconds = wait_after_click_seconds
         self.report_open_wait_seconds = report_open_wait_seconds
+        self.report_generate_wait_seconds = report_generate_wait_seconds
+        self.export_format_wait_seconds = export_format_wait_seconds
         self.warning_dismiss_limit = warning_dismiss_limit
         self.actions: list[str] = []
 
@@ -58,8 +62,7 @@ class ReportWindowAutomator:
         self._apply_branch(output)
         self._apply_options(report)
         self._click_named("檢視報表", error_code="VIEW_REPORT_BUTTON_NOT_FOUND")
-        self._wait_after_action()
-        self._click_named("存檔 Excel", error_code="SAVE_EXCEL_BUTTON_NOT_FOUND")
+        self._export_report_to_excel()
         save_result = self.save_as_handler.save(output_path)
         self.actions.append(f"save_as:{save_result.output_path}")
 
@@ -219,6 +222,10 @@ class ReportWindowAutomator:
 
     def _date_input_controls(self) -> list[Any]:
         candidates = [control for control in self._all_controls() if self._is_date_input_control(control)]
+        start = self._first_control_with_automation_id(candidates, "cT_QueryBdate")
+        end = self._first_control_with_automation_id(candidates, "cT_QueryEdate")
+        if start is not None and end is not None:
+            return [start, end]
         return sorted(candidates, key=self._control_sort_key)
 
     def _is_date_input_control(self, control: Any) -> bool:
@@ -247,9 +254,83 @@ class ReportWindowAutomator:
         expected = _normalized_text(name)
         for control in self._all_controls():
             actual = _normalized_text(self._control_name(control))
-            if actual == expected or expected in actual or actual in expected:
+            if _control_text_matches(expected, actual):
                 return control
         return None
+
+    def _find_enabled_control(self, name: str) -> Any | None:
+        expected = _normalized_text(name)
+        for control in self._all_controls():
+            if not self._is_enabled(control):
+                continue
+            actual = _normalized_text(self._control_name(control))
+            if _control_text_matches(expected, actual):
+                return control
+        return None
+
+    def _first_control_with_automation_id(self, controls: list[Any], automation_id: str) -> Any | None:
+        for control in controls:
+            if self._control_automation_id(control) == automation_id:
+                return control
+        return None
+
+    def _export_report_to_excel(self) -> None:
+        export_control = self._wait_for_enabled_control("匯出", timeout_seconds=self.report_generate_wait_seconds)
+        if export_control is None:
+            raise ReportAutomationError(
+                "EXPORT_BUTTON_NOT_READY",
+                "報表已按下「檢視報表」，但工具列的「匯出」沒有啟用；不能假裝已下載。",
+            )
+        self._click(export_control, "匯出")
+        self._select_export_format_if_present()
+
+    def _wait_for_enabled_control(self, name: str, *, timeout_seconds: float) -> Any | None:
+        deadline = monotonic() + timeout_seconds
+        while monotonic() < deadline:
+            control = self._find_enabled_control(name)
+            if control is not None:
+                return control
+            sleep(0.5)
+        return self._find_enabled_control(name)
+
+    def _select_export_format_if_present(self) -> None:
+        deadline = monotonic() + self.export_format_wait_seconds
+        while monotonic() < deadline:
+            control = self._find_export_format_control()
+            if control is not None:
+                label = self._control_name(control) or "Excel"
+                self._click(control, f"匯出格式:{label}")
+                return
+            sleep(0.25)
+
+    def _find_export_format_control(self) -> Any | None:
+        for control in self._all_controls() + self._desktop_export_controls():
+            if not self._is_enabled(control):
+                continue
+            name = self._control_name(control)
+            normalized = _normalized_text(name).lower()
+            if not normalized:
+                continue
+            if "excel" in normalized or "xls" in normalized or "試算表" in normalized:
+                return control
+        return None
+
+    def _desktop_export_controls(self) -> list[Any]:
+        if not sys.platform.startswith("win"):
+            return []
+        try:
+            from pywinauto import Desktop
+        except ImportError:
+            return []
+
+        controls: list[Any] = []
+        try:
+            desktop = Desktop(backend="uia")
+            for control_type in ("MenuItem", "ListItem", "Button"):
+                controls.extend(list(desktop.descendants(control_type=control_type)))
+        except Exception:
+            return []
+        return controls
 
     def _all_controls(self) -> list[Any]:
         controls = [self.window]
@@ -342,6 +423,16 @@ class ReportWindowAutomator:
     def _control_class_name(self, control: Any) -> str:
         return str(_safe_call(control, "class_name", default=""))
 
+    def _control_automation_id(self, control: Any) -> str:
+        value = _safe_call(control, "automation_id", default="")
+        return str(value or getattr(control, "automation_id", ""))
+
+    def _is_enabled(self, control: Any) -> bool:
+        value = _safe_call(control, "is_enabled", default=None)
+        if value is not None:
+            return bool(value)
+        return bool(getattr(control, "enabled", True))
+
     def _wait_after_action(self) -> None:
         if self.wait_after_click_seconds > 0:
             sleep(self.wait_after_click_seconds)
@@ -358,13 +449,14 @@ def _safe_call(control: Any, method_name: str, *, default: Any) -> Any:
 
 
 def _normalized_text(value: str) -> str:
-    return (
-        value.replace(" ", "")
-        .replace("\u3000", "")
-        .replace("統計報表", "統計表")
-        .replace("查詢報表", "查詢表")
-        .strip()
-    )
+    compact = "".join(value.split()).replace("\u3000", "")
+    return compact.replace("統計報表", "統計表").replace("查詢報表", "查詢表").strip()
+
+
+def _control_text_matches(expected: str, actual: str) -> bool:
+    if not expected or not actual:
+        return False
+    return actual == expected or expected in actual or (len(actual) >= 2 and actual in expected)
 
 
 def _is_known_transient_pos_warning(value: str) -> bool:

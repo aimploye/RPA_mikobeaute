@@ -16,11 +16,15 @@ class FakePosControl:
         control_type: str = "Button",
         children: list["FakePosControl"] | None = None,
         class_name: str = "",
+        automation_id: str = "",
+        enabled: bool = True,
     ) -> None:
         self.name = name
         self.control_type = control_type
         self.children_controls = children or []
         self.control_class_name = class_name
+        self.automation_id = automation_id
+        self.enabled = enabled
         self.clicked = False
         self.text_value = ""
         self.toggle_state = 0
@@ -33,6 +37,9 @@ class FakePosControl:
 
     def class_name(self) -> str:
         return self.control_class_name
+
+    def is_enabled(self) -> bool:
+        return self.enabled
 
     def children(self) -> list["FakePosControl"]:
         return self.children_controls
@@ -60,6 +67,62 @@ class FakePosControl:
         self.toggle_state = 0 if self.toggle_state else 1
 
 
+class FakeReportViewerWindow(FakePosControl):
+    def __init__(self, *, use_real_probe_names: bool = False) -> None:
+        export = FakePosControl("匯出", "MenuItem", enabled=False)
+        run_report_name = "檢視\r\n報表" if use_real_probe_names else "檢視報表"
+        no_detail_name = "不列\r\n明細" if use_real_probe_names else "不列明細"
+        start_date = FakePosControl(
+            "",
+            "Edit",
+            automation_id="cT_QueryBdate",
+            class_name="WindowsForms10.EDIT.app.0.33c0d9d",
+        )
+        end_date = FakePosControl(
+            "",
+            "Edit",
+            automation_id="cT_QueryEdate",
+            class_name="WindowsForms10.EDIT.app.0.33c0d9d",
+        )
+        item_range = FakePosControl(
+            "至",
+            "Edit",
+            automation_id="cT_ItemList",
+            class_name="WindowsForms10.EDIT.app.0.33c0d9d",
+        )
+        super().__init__(
+            "SPA-POS",
+            children=[
+                FakePosControl("統計報表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+                FakePosControl("課程服務日期區間", "Text"),
+                item_range,
+                end_date,
+                start_date,
+                FakePosControl("顯示銷售分店", "CheckBox"),
+                FakePosControl(no_detail_name, "CheckBox", automation_id="K_NoItemList"),
+                FakePosControl(run_report_name, "Button", automation_id="B_RunReport"),
+                export,
+                FakePosControl("Excel", "MenuItem"),
+            ],
+        )
+        self.start_date = start_date
+        self.end_date = end_date
+        self.item_range = item_range
+        self.export = export
+
+    def descendants(self) -> list[FakePosControl]:
+        items = super().descendants()
+        for control in items:
+            if _clean(control.name) == "檢視報表" and control.clicked:
+                self.export.enabled = True
+        return items
+
+
+def _clean(value: str) -> str:
+    return "".join(value.split())
+
+
 class FakeMenuSelectWindow(FakePosControl):
     def __init__(self) -> None:
         super().__init__(
@@ -80,7 +143,8 @@ class FakeMenuSelectWindow(FakePosControl):
                 FakePosControl("顯示銷售分店", "CheckBox"),
                 FakePosControl("不列明細", "CheckBox"),
                 FakePosControl("檢視報表", "Button"),
-                FakePosControl("存檔 Excel", "Button"),
+                FakePosControl("匯出", "MenuItem"),
+                FakePosControl("Excel", "MenuItem"),
             ]
         )
 
@@ -112,7 +176,8 @@ class FakeWarningThenReportWindow(FakePosControl):
                     FakePosControl("顯示銷售分店", "CheckBox"),
                     FakePosControl("不列明細", "CheckBox"),
                     FakePosControl("檢視報表", "Button"),
-                    FakePosControl("存檔 Excel", "Button"),
+                    FakePosControl("匯出", "MenuItem"),
+                    FakePosControl("Excel", "MenuItem"),
                 ]
             )
         return True
@@ -134,7 +199,8 @@ def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: P
             FakePosControl("顯示退費", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("存檔 Excel", "Button"),
+            FakePosControl("匯出", "MenuItem"),
+            FakePosControl("Excel", "MenuItem"),
         ],
     )
     handler = MockSaveAsHandler()
@@ -154,7 +220,8 @@ def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: P
         "check:顯示退費",
         "uncheck:不列明細",
         "click:檢視報表",
-        "click:存檔 Excel",
+        "click:匯出",
+        "click:匯出格式:Excel",
         f"save_as:{tmp_path / output.output_filename}",
     ]
 
@@ -214,7 +281,8 @@ def test_report_automation_detects_custom_date_input_controls_by_class_name(tmp_
             FakePosControl("顯示銷售分店", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("存檔 Excel", "Button"),
+            FakePosControl("匯出", "MenuItem"),
+            FakePosControl("Excel", "MenuItem"),
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
@@ -224,6 +292,30 @@ def test_report_automation_detects_custom_date_input_controls_by_class_name(tmp_
     assert result.ok is True
     assert start_date.text_value == output.start_date
     assert end_date.text_value == output.end_date
+
+
+def test_report_automation_uses_real_r01_probe_control_names_and_report_viewer_export(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
+    report = next(item for item in config.reports if item.id == "R01")
+    window = FakeReportViewerWindow(use_real_probe_names=True)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+
+    result = automator.download_report(output, report)
+
+    assert result.ok is True
+    assert window.start_date.text_value == output.start_date
+    assert window.end_date.text_value == output.end_date
+    assert window.item_range.text_value == ""
+    assert window.export.clicked is True
+    assert "uncheck:不列明細" in result.actions
+    assert "click:檢視報表" in result.actions
+    assert "click:匯出" in result.actions
 
 
 def test_report_automation_fails_when_report_screen_does_not_open(tmp_path: Path) -> None:

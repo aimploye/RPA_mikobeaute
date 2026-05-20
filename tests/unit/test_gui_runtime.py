@@ -552,7 +552,8 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
             FakePosControl("顯示銷售分店", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("存檔 Excel", "Button"),
+            FakePosControl("匯出", "MenuItem"),
+            FakePosControl("Excel", "MenuItem"),
         ],
     )
     monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: fake_window)

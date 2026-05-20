@@ -154,7 +154,8 @@ def test_run_task_cli_executes_single_pos_report_with_real_automation_path(
             FakePosControl("顯示銷售分店", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("存檔 Excel", "Button"),
+            FakePosControl("匯出", "MenuItem"),
+            FakePosControl("Excel", "MenuItem"),
         ],
     )
 

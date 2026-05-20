@@ -218,7 +218,30 @@ class ReportWindowAutomator:
             return []
 
     def _date_input_controls(self) -> list[Any]:
-        return [control for control in self._all_controls() if self._control_type(control).lower() in {"edit", "text"}]
+        candidates = [control for control in self._all_controls() if self._is_date_input_control(control)]
+        return sorted(candidates, key=self._control_sort_key)
+
+    def _is_date_input_control(self, control: Any) -> bool:
+        control_type = self._control_type(control).lower()
+        class_name = self._control_class_name(control).lower()
+        name = self._control_name(control)
+        if "日期區間" in name:
+            return False
+        if control_type == "edit" and self._can_set_text(control):
+            return True
+        if any(token in class_name for token in ("date", "datetime", "dtpicker", "tdbdate", "mask", "edit", "textbox")):
+            return self._can_set_text(control)
+        return False
+
+    def _can_set_text(self, control: Any) -> bool:
+        return hasattr(control, "set_edit_text") or hasattr(control, "type_keys")
+
+    def _control_sort_key(self, control: Any) -> tuple[int, int]:
+        rect = _safe_call(control, "rectangle", default=None)
+        return (
+            int(getattr(rect, "top", 0)) if rect is not None else 0,
+            int(getattr(rect, "left", 0)) if rect is not None else 0,
+        )
 
     def _find_control(self, name: str) -> Any | None:
         expected = _normalized_text(name)
@@ -275,6 +298,8 @@ class ReportWindowAutomator:
             control.set_edit_text(value)
             return
         if hasattr(control, "type_keys"):
+            if hasattr(control, "click_input"):
+                control.click_input()
             control.type_keys("^a{BACKSPACE}" + value, with_spaces=True)
             return
         raise ReportAutomationError("CONTROL_NOT_EDITABLE", f"控制項無法輸入文字：{self._control_name(control)}")
@@ -313,6 +338,9 @@ class ReportWindowAutomator:
                 default=_safe_call(control, "control_type", default=""),
             )
         )
+
+    def _control_class_name(self, control: Any) -> str:
+        return str(_safe_call(control, "class_name", default=""))
 
     def _wait_after_action(self) -> None:
         if self.wait_after_click_seconds > 0:

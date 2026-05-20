@@ -10,10 +10,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakePosControl:
-    def __init__(self, name: str, control_type: str = "Button", children: list["FakePosControl"] | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        control_type: str = "Button",
+        children: list["FakePosControl"] | None = None,
+        class_name: str = "",
+    ) -> None:
         self.name = name
         self.control_type = control_type
         self.children_controls = children or []
+        self.control_class_name = class_name
         self.clicked = False
         self.text_value = ""
         self.toggle_state = 0
@@ -23,6 +30,9 @@ class FakePosControl:
 
     def friendly_class_name(self) -> str:
         return self.control_type
+
+    def class_name(self) -> str:
+        return self.control_class_name
 
     def children(self) -> list["FakePosControl"]:
         return self.children_controls
@@ -38,6 +48,9 @@ class FakePosControl:
         self.clicked = True
 
     def set_edit_text(self, value: str) -> None:
+        self.text_value = value
+
+    def type_keys(self, value: str, with_spaces: bool = False) -> None:
         self.text_value = value
 
     def get_toggle_state(self) -> int:
@@ -182,6 +195,35 @@ def test_report_automation_dismisses_transient_pos_warnings_until_report_screen_
         "dismiss_warning:錯誤警告",
     ]
     assert window.pending_warnings == 0
+
+
+def test_report_automation_detects_custom_date_input_controls_by_class_name(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
+    report = next(item for item in config.reports if item.id == "R01")
+    start_date = FakePosControl("", "Pane", class_name="TDBDate")
+    end_date = FakePosControl("", "Pane", class_name="TDBDate")
+    window = FakePosControl(
+        "SPA-POS",
+        children=[
+            FakePosControl("統計報表", "MenuItem"),
+            FakePosControl("課程服務明細表", "MenuItem"),
+            FakePosControl("課程服務日期區間", "Text"),
+            start_date,
+            end_date,
+            FakePosControl("顯示銷售分店", "CheckBox"),
+            FakePosControl("不列明細", "CheckBox"),
+            FakePosControl("檢視報表", "Button"),
+            FakePosControl("存檔 Excel", "Button"),
+        ],
+    )
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+
+    result = automator.download_report(output, report)
+
+    assert result.ok is True
+    assert start_date.text_value == output.start_date
+    assert end_date.text_value == output.end_date
 
 
 def test_report_automation_fails_when_report_screen_does_not_open(tmp_path: Path) -> None:

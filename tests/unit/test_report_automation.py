@@ -47,6 +47,31 @@ class FakePosControl:
         self.toggle_state = 0 if self.toggle_state else 1
 
 
+class FakeMenuSelectWindow(FakePosControl):
+    def __init__(self) -> None:
+        super().__init__(
+            "SPA-POS",
+            children=[
+                FakePosControl("統計報表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+            ],
+        )
+        self.menu_select_calls: list[str] = []
+
+    def menu_select(self, menu_path: str) -> None:
+        self.menu_select_calls.append(menu_path)
+        self.children_controls.extend(
+            [
+                FakePosControl("起日", "Edit"),
+                FakePosControl("迄日", "Edit"),
+                FakePosControl("顯示銷售分店", "CheckBox"),
+                FakePosControl("不列明細", "CheckBox"),
+                FakePosControl("檢視報表", "Button"),
+                FakePosControl("存檔 Excel", "Button"),
+            ]
+        )
+
+
 def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R02")
@@ -88,7 +113,21 @@ def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: P
     ]
 
 
-def test_report_automation_fails_when_report_window_controls_are_missing(tmp_path: Path) -> None:
+def test_report_automation_uses_menu_select_before_hidden_menu_clicks(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
+    report = next(item for item in config.reports if item.id == "R01")
+    window = FakeMenuSelectWindow()
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+
+    result = automator.download_report(output, report)
+
+    assert result.ok is True
+    assert window.menu_select_calls == ["統計報表->課程服務明細表"]
+    assert result.actions[0] == "menu_select:統計報表->課程服務明細表"
+
+
+def test_report_automation_fails_when_report_screen_does_not_open(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -104,6 +143,6 @@ def test_report_automation_fails_when_report_window_controls_are_missing(tmp_pat
     try:
         automator.download_report(output, report)
     except ReportAutomationError as exc:
-        assert exc.error_code == "DATE_FIELDS_NOT_FOUND"
+        assert exc.error_code == "REPORT_SCREEN_NOT_OPENED"
     else:
-        raise AssertionError("missing report controls must fail instead of pretending success")
+        raise AssertionError("menu click without screen transition must fail instead of pretending success")

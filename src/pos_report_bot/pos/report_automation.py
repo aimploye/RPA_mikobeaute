@@ -48,8 +48,7 @@ class ReportWindowAutomator:
         self.actions = []
         output_path = self.output_dir / output.output_filename
 
-        self._click_named("統計報表", error_code="REPORT_ROOT_MENU_NOT_FOUND")
-        self._click_named(report.report_menu_text, error_code="REPORT_MENU_NOT_FOUND")
+        self._open_report_screen(report.report_menu_text)
         self._set_date_range(output.start_date, output.end_date)
         self._apply_branch(output)
         self._apply_options(report)
@@ -77,8 +76,20 @@ class ReportWindowAutomator:
             message=save_result.message,
         )
 
+    def _open_report_screen(self, report_menu_text: str) -> None:
+        if self._try_menu_select("統計報表", report_menu_text) and self._has_report_screen_inputs():
+            return
+
+        self._click_named("統計報表", error_code="REPORT_ROOT_MENU_NOT_FOUND")
+        self._click_named(report_menu_text, error_code="REPORT_MENU_NOT_FOUND")
+        if not self._has_report_screen_inputs():
+            raise ReportAutomationError(
+                "REPORT_SCREEN_NOT_OPENED",
+                f"已嘗試開啟「{report_menu_text}」，但 POS 畫面沒有出現報表日期欄位；不能繼續假裝已進入報表。",
+            )
+
     def _set_date_range(self, start_date: str, end_date: str) -> None:
-        edits = [control for control in self._all_controls() if self._control_type(control).lower() in {"edit", "text"}]
+        edits = self._date_input_controls()
         if len(edits) < 2:
             raise ReportAutomationError("DATE_FIELDS_NOT_FOUND", "找不到足夠的日期輸入欄位，不能假裝已填日期。")
 
@@ -125,6 +136,26 @@ class ReportWindowAutomator:
             raise ReportAutomationError(error_code, f"找不到控制項：{name}")
         self._click(control, name)
 
+    def _try_menu_select(self, root_menu_text: str, report_menu_text: str) -> bool:
+        menu_path = f"{root_menu_text}->{report_menu_text}"
+        menu_select = getattr(self.window, "menu_select", None)
+        if menu_select is None:
+            return False
+        try:
+            self._focus_window()
+            menu_select(menu_path)
+            self.actions.append(f"menu_select:{menu_path}")
+            self._wait_after_action()
+            return True
+        except Exception:
+            return False
+
+    def _has_report_screen_inputs(self) -> bool:
+        return len(self._date_input_controls()) >= 2
+
+    def _date_input_controls(self) -> list[Any]:
+        return [control for control in self._all_controls() if self._control_type(control).lower() in {"edit", "text"}]
+
     def _find_control(self, name: str) -> Any | None:
         expected = _normalized_text(name)
         for control in self._all_controls():
@@ -149,14 +180,31 @@ class ReportWindowAutomator:
         return controls
 
     def _click(self, control: Any, action_name: str) -> None:
+        self._focus_window()
+        invoked = False
+        if hasattr(control, "invoke"):
+            try:
+                control.invoke()
+                invoked = True
+            except Exception:
+                invoked = False
         if hasattr(control, "click_input"):
-            control.click_input()
+            if not invoked:
+                control.click_input()
         elif hasattr(control, "click"):
-            control.click()
-        else:
+            if not invoked:
+                control.click()
+        elif not invoked:
             raise ReportAutomationError("CONTROL_NOT_CLICKABLE", f"控制項無法點擊：{action_name}")
         self.actions.append(f"click:{action_name}")
         self._wait_after_action()
+
+    def _focus_window(self) -> None:
+        if hasattr(self.window, "set_focus"):
+            try:
+                self.window.set_focus()
+            except Exception:
+                return
 
     def _set_text(self, control: Any, value: str) -> None:
         if hasattr(control, "set_edit_text"):

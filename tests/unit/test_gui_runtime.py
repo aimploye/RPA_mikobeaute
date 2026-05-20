@@ -448,6 +448,70 @@ def test_report_entry_probe_counts_collapsed_menu_items_from_probe_report() -> N
     window.close()
 
 
+def test_report_entry_probe_falls_back_to_latest_saved_ui_probe_report(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.screenshots_dir = str(tmp_path)
+    saved_report = UiProbeReport(
+        window_title="SPA-POS",
+        backend="auto",
+        controls=[
+            ControlProbeRecord(
+                control_type="MenuItem",
+                name=name,
+                automation_id="",
+                class_name="",
+                rectangle={"left": 0, "top": 0, "right": 0, "bottom": 0},
+                enabled=True,
+                visible=False,
+                depth=3,
+            )
+            for name in [
+                "課程服務明細表",
+                "商品銷售明細表",
+                "會員剩餘點數殘值統計表",
+                "預約紀錄查詢統計表",
+                "客戶來源與產值統計表",
+            ]
+        ],
+    )
+    (tmp_path / "ui_probe_20260520_204846.json").write_text(
+        saved_report.model_dump_json(),
+        encoding="utf-8",
+    )
+    window = SettingsMainWindow(config)
+
+    result = window.probe_report_entries(FakeControl("SPA-POS", [FakeControl("主畫面")]))
+
+    assert result.ok is True
+    assert "5/5" in result.message
+    window.close()
+
+
+def test_report_entry_probe_clicks_statistics_menu_before_live_probe() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+    stats_menu = FakePosControl("統計報表", "MenuItem")
+    fake_window = FakePosControl(
+        "SPA-POS",
+        children=[
+            stats_menu,
+            FakePosControl("商品銷售明細表", "MenuItem"),
+            FakePosControl("課程服務明細表", "MenuItem"),
+            FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
+            FakePosControl("客戶來源與產值統計表", "MenuItem"),
+            FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+        ],
+    )
+
+    result = window.probe_report_entries(fake_window)
+
+    assert result.ok is True
+    assert stats_menu.clicked is True
+    window.close()
+
+
 def test_report_page_can_enable_only_r01_for_single_report_dry_run() -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")

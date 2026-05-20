@@ -30,7 +30,7 @@ from pos_report_bot.config.writer import save_project_config
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
 from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
 from pos_report_bot.pos.save_as_handler import OverwritePolicy, WindowsSaveAsHandler
-from pos_report_bot.pos.ui_probe import UiProbeError, connect_pos_window, probe_window_controls, write_probe_report
+from pos_report_bot.pos.ui_probe import UiProbeError, UiProbeReport, connect_pos_window, probe_window_controls, write_probe_report
 from pos_report_bot.reports.planner import build_dry_run_plan
 
 
@@ -295,22 +295,24 @@ class SettingsMainWindow(QMainWindow):
                 )
 
         if report is None:
+            self._open_report_root_menu_for_probe(window)
             report = probe_window_controls(
                 window,
                 window_title=self.config.pos.window_title_contains,
                 backend=self.config.pos.backend,
             )
+            self.last_ui_probe_report = report
         expected_entries = sorted({item.report_menu_text for item in self.config.reports if item.enabled})
-        control_names = [control.name for control in report.controls if control.name]
-        found = [
-            entry
-            for entry in expected_entries
-            if any(
-                self._normalized_menu_text(entry) in self._normalized_menu_text(control_name)
-                or self._normalized_menu_text(control_name) in self._normalized_menu_text(entry)
-                for control_name in control_names
-            )
-        ]
+        found = self._match_report_entries(expected_entries, report)
+
+        if len(found) < len(expected_entries):
+            fallback_report = self._latest_saved_ui_probe_report()
+            if fallback_report is not None:
+                fallback_found = self._match_report_entries(expected_entries, fallback_report)
+                if len(fallback_found) > len(found):
+                    report = fallback_report
+                    found = fallback_found
+
         missing = [entry for entry in expected_entries if entry not in found]
 
         if missing:
@@ -704,6 +706,95 @@ class SettingsMainWindow(QMainWindow):
             .replace("查詢報表", "查詢表")
             .strip()
         )
+
+    def _match_report_entries(self, expected_entries: list[str], report: UiProbeReport) -> list[str]:
+        control_names = [control.name for control in report.controls if control.name]
+        return [
+            entry
+            for entry in expected_entries
+            if any(
+                self._normalized_menu_text(entry) in self._normalized_menu_text(control_name)
+                or self._normalized_menu_text(control_name) in self._normalized_menu_text(entry)
+                for control_name in control_names
+            )
+        ]
+
+    def _open_report_root_menu_for_probe(self, window: Any) -> None:
+        control = self._find_probe_control(window, "統計報表")
+        if control is None:
+            return
+        try:
+            if hasattr(control, "click_input"):
+                control.click_input()
+            elif hasattr(control, "click"):
+                control.click()
+        except Exception:
+            return
+
+    def _find_probe_control(self, root: Any, name: str) -> Any | None:
+        expected = self._normalized_menu_text(name)
+        for control in self._walk_probe_controls(root):
+            control_name = self._probe_control_name(control)
+            if self._normalized_menu_text(control_name) == expected:
+                return control
+        return None
+
+    def _walk_probe_controls(self, root: Any) -> list[Any]:
+        controls = [root]
+        descendants = self._safe_probe_call(root, "descendants", default=None)
+        if isinstance(descendants, list):
+            return controls + descendants
+        children = self._safe_probe_call(root, "children", default=[])
+        for child in children:
+            controls.extend(self._walk_probe_controls(child))
+        return controls
+
+    def _probe_control_name(self, control: Any) -> str:
+        value = self._safe_probe_call(control, "window_text", default="")
+        if value:
+            return str(value)
+        texts = self._safe_probe_call(control, "texts", default=[])
+        if texts:
+            return str(texts[0])
+        return ""
+
+    def _safe_probe_call(self, control: Any, method_name: str, *, default: Any) -> Any:
+        method = getattr(control, method_name, None)
+        if method is None:
+            return default
+        try:
+            return method()
+        except Exception:
+            return default
+
+    def _latest_saved_ui_probe_report(self) -> UiProbeReport | None:
+        candidates: list[Path] = []
+        for directory in self._ui_probe_search_dirs():
+            if directory.exists() and directory.is_dir():
+                candidates.extend(directory.glob("ui_probe_*.json"))
+        if not candidates:
+            return None
+
+        latest = max(candidates, key=lambda path: path.stat().st_mtime)
+        try:
+            return UiProbeReport.model_validate_json(latest.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _ui_probe_search_dirs(self) -> list[Path]:
+        paths = [
+            Path(self.config.app.screenshots_dir),
+            Path(self.config.app.downloads_dir),
+            Path.cwd(),
+        ]
+        home = Path.home()
+        paths.extend(
+            [
+                home / "Downloads",
+                home / "Download",
+            ]
+        )
+        return paths
 
     def _test_folder_permissions(self) -> GuiActionResult:
         folder_paths = [

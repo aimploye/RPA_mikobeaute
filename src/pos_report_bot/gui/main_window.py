@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
+from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
+from pos_report_bot.pos.save_as_handler import OverwritePolicy, WindowsSaveAsHandler
 from pos_report_bot.pos.ui_probe import UiProbeError, connect_pos_window, probe_window_controls, write_probe_report
 from pos_report_bot.reports.planner import build_dry_run_plan
 
@@ -566,18 +568,14 @@ class SettingsMainWindow(QMainWindow):
 
         if action == "只啟用 R01 測試":
             self._set_only_report_enabled("R01")
-            return GuiActionResult(ok=True, message="已只啟用 R01。接著按「立即 Dry-run」即可只展開一份 R01。")
+            return GuiActionResult(ok=True, message="已只啟用 R01。接著可按「立即 Dry-run」或「立即執行選取任務」。")
 
         if action == "啟用全部報表":
             self._set_all_reports_enabled()
             return GuiActionResult(ok=True, message="已啟用全部報表任務。")
 
         if action == "立即執行選取任務":
-            return GuiActionResult(
-                ok=False,
-                error_code="PENDING_REAL_POS_VALIDATION",
-                message="實機 POS 自動化尚未驗證，目前只能執行 Dry-run。",
-            )
+            return self.execute_enabled_reports()
 
         if page_id == "email":
             return GuiActionResult(
@@ -602,6 +600,49 @@ class SettingsMainWindow(QMainWindow):
         self.last_action_result = result
         self.statusBar().showMessage(result.message)
         return result
+
+    def execute_enabled_reports(self) -> GuiActionResult:
+        self._sync_gui_to_config()
+        plan = build_dry_run_plan(self.config)
+        if not plan.outputs:
+            return GuiActionResult(ok=False, error_code="NO_ENABLED_REPORTS", message="沒有啟用中的報表任務。")
+
+        try:
+            window = connect_pos_window(
+                window_title_contains=self.config.pos.window_title_contains,
+                backend=self.config.pos.backend,
+            )
+            save_as_handler = WindowsSaveAsHandler(
+                dialog_title_contains=self.config.save_as.dialog_title_contains,
+                save_button_text=self.config.save_as.save_button_text,
+                default_extension=self.config.save_as.default_extension,
+                overwrite_policy=OverwritePolicy(self.config.save_as.overwrite_policy),
+                wait_timeout_seconds=self.config.save_as.wait_timeout_seconds,
+                stable_seconds=self.config.save_as.stable_seconds,
+            )
+            automator = ReportWindowAutomator(
+                window,
+                save_as_handler=save_as_handler,
+                output_dir=Path(self.config.app.downloads_dir),
+            )
+            for output in plan.outputs:
+                report = next(item for item in self.config.reports if item.id == output.task_id)
+                result = automator.download_report(output, report)
+                if not result.ok:
+                    return GuiActionResult(
+                        ok=False,
+                        error_code=result.error_code or "REPORT_DOWNLOAD_FAILED",
+                        message=f"{output.task_id} 下載失敗：{result.message}",
+                    )
+        except UiProbeError as exc:
+            return GuiActionResult(ok=False, error_code="POS_CONNECTION_FAILED", message=f"連接 POS 失敗：{exc}")
+        except ReportAutomationError as exc:
+            return GuiActionResult(ok=False, error_code=exc.error_code, message=exc.message)
+
+        return GuiActionResult(
+            ok=True,
+            message=f"已完成 {len(plan.outputs)} 個 POS 報表下載；Google Drive 上傳仍需另外驗證 OAuth。",
+        )
 
     def _resolve_settings_path(self, settings_path: Path | None) -> Path:
         if settings_path is not None and "config_templates" not in settings_path.parts:

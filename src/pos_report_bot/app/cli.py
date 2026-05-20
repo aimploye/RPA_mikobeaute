@@ -9,6 +9,9 @@ from typing import Sequence
 from pos_report_bot.config.loader import load_project_config
 from pos_report_bot.core.summary import build_dry_run_summary, write_run_summary
 from pos_report_bot.gui.main_window import launch_settings_gui
+from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
+from pos_report_bot.pos.save_as_handler import OverwritePolicy, WindowsSaveAsHandler
+from pos_report_bot.pos.ui_probe import UiProbeError, connect_pos_window
 from pos_report_bot.reports.planner import build_dry_run_plan
 
 
@@ -36,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pos_report_bot")
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--dry-run", action="store_true", help="展開報表任務但不操作 POS")
+    parser.add_argument("--run-task", help="在已開啟的 SPA-POS 上執行單一報表任務，例如 R01")
     parser.add_argument("--gui", action="store_true", help="啟動 PySide6 設定中心")
     parser.add_argument("--today", help="測試用日期，格式 YYYY-MM-DD")
     parser.add_argument("--write-summary", action="store_true", help="將 dry-run 結果寫成 run_summary JSON")
@@ -51,6 +55,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.gui or not raw_args:
         config = load_project_config(args.config)
         return launch_settings_gui(config, settings_path=args.config)
+
+    if args.run_task:
+        return _run_single_pos_task(args.config, args.run_task, today=args.today)
 
     if not args.dry_run:
         parser.print_help()
@@ -74,3 +81,65 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
+
+
+def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None = None) -> int:
+    run_date = date.fromisoformat(today) if today else None
+    config = load_project_config(config_path)
+    plan = build_dry_run_plan(config, today=run_date)
+    output = next((item for item in plan.outputs if item.task_id == task_id), None)
+    report = next((item for item in config.reports if item.id == task_id), None)
+    if output is None or report is None:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "task_id": task_id,
+                    "error_code": "TASK_NOT_FOUND",
+                    "message": f"找不到任務：{task_id}",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
+
+    try:
+        window = connect_pos_window(
+            window_title_contains=config.pos.window_title_contains,
+            backend=config.pos.backend,
+        )
+        handler = WindowsSaveAsHandler(
+            dialog_title_contains=config.save_as.dialog_title_contains,
+            save_button_text=config.save_as.save_button_text,
+            default_extension=config.save_as.default_extension,
+            overwrite_policy=OverwritePolicy(config.save_as.overwrite_policy),
+            wait_timeout_seconds=config.save_as.wait_timeout_seconds,
+            stable_seconds=config.save_as.stable_seconds,
+        )
+        result = ReportWindowAutomator(
+            window,
+            save_as_handler=handler,
+            output_dir=Path(config.app.downloads_dir),
+        ).download_report(output, report)
+    except UiProbeError as exc:
+        payload = {
+            "ok": False,
+            "task_id": task_id,
+            "error_code": "POS_CONNECTION_FAILED",
+            "message": str(exc),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1
+    except ReportAutomationError as exc:
+        payload = {
+            "ok": False,
+            "task_id": task_id,
+            "error_code": exc.error_code,
+            "message": exc.message,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1
+
+    print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+    return 0 if result.ok else 1

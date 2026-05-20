@@ -10,7 +10,9 @@ from pos_report_bot.config.loader import load_project_config  # noqa: E402
 from pos_report_bot.drive.folder_id import parse_drive_folder_id  # noqa: E402
 import pos_report_bot.gui.main_window as main_window  # noqa: E402
 from pos_report_bot.gui.main_window import SettingsMainWindow  # noqa: E402
+from pos_report_bot.pos.save_as_handler import MockSaveAsHandler  # noqa: E402
 from pos_report_bot.pos.ui_probe import ControlProbeRecord, UiProbeReport  # noqa: E402
+from tests.unit.test_report_automation import FakePosControl  # noqa: E402
 from tests.unit.test_ui_probe import FakeControl  # noqa: E402
 
 
@@ -466,6 +468,44 @@ def test_report_page_can_enable_only_r01_for_single_report_dry_run() -> None:
     r02_enabled = window.findChild(QCheckBox, "report_R02_enabled")
     assert r01_enabled is not None and r01_enabled.isChecked()
     assert r02_enabled is not None and not r02_enabled.isChecked()
+    window.close()
+
+
+def test_dashboard_execute_enabled_reports_runs_real_automation_path(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.downloads_dir = str(tmp_path)
+    window = SettingsMainWindow(config)
+    fake_window = FakePosControl(
+        "SPA-POS",
+        children=[
+            FakePosControl("統計報表", "MenuItem"),
+            FakePosControl("課程服務明細表", "MenuItem"),
+            FakePosControl("起日", "Edit"),
+            FakePosControl("迄日", "Edit"),
+            FakePosControl("顯示銷售分店", "CheckBox"),
+            FakePosControl("不列明細", "CheckBox"),
+            FakePosControl("檢視報表", "Button"),
+            FakePosControl("存檔 Excel", "Button"),
+        ],
+    )
+    monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: fake_window)
+    monkeypatch.setattr(main_window, "WindowsSaveAsHandler", lambda **_kwargs: MockSaveAsHandler())
+
+    only_r01 = window.findChild(QPushButton, "reports_只啟用 R01 測試")
+    execute = window.findChild(QPushButton, "dashboard_立即執行選取任務")
+    assert only_r01 is not None
+    assert execute is not None
+
+    only_r01.click()
+    execute.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert "已完成 1 個 POS 報表下載" in window.statusBar().currentMessage()
+    assert len(list(tmp_path.glob("R01_*.xls"))) == 1
     window.close()
 
 

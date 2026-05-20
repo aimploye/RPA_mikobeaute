@@ -1,5 +1,6 @@
 from pathlib import Path
-from time import sleep
+import sys
+from time import monotonic, sleep
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
@@ -37,11 +38,15 @@ class ReportWindowAutomator:
         save_as_handler: SaveAsHandler,
         output_dir: Path,
         wait_after_click_seconds: float = 0.2,
+        report_open_wait_seconds: float = 15.0,
+        warning_dismiss_limit: int = 10,
     ) -> None:
         self.window = window
         self.save_as_handler = save_as_handler
         self.output_dir = output_dir
         self.wait_after_click_seconds = wait_after_click_seconds
+        self.report_open_wait_seconds = report_open_wait_seconds
+        self.warning_dismiss_limit = warning_dismiss_limit
         self.actions: list[str] = []
 
     def download_report(self, output: PlannedOutput, report: ReportConfig) -> ReportDownloadResult:
@@ -77,12 +82,12 @@ class ReportWindowAutomator:
         )
 
     def _open_report_screen(self, report_menu_text: str) -> None:
-        if self._try_menu_select("統計報表", report_menu_text) and self._has_report_screen_inputs():
+        if self._try_menu_select("統計報表", report_menu_text) and self._wait_for_report_screen_inputs():
             return
 
         self._click_named("統計報表", error_code="REPORT_ROOT_MENU_NOT_FOUND")
         self._click_named(report_menu_text, error_code="REPORT_MENU_NOT_FOUND")
-        if not self._has_report_screen_inputs():
+        if not self._wait_for_report_screen_inputs():
             raise ReportAutomationError(
                 "REPORT_SCREEN_NOT_OPENED",
                 f"已嘗試開啟「{report_menu_text}」，但 POS 畫面沒有出現報表日期欄位；不能繼續假裝已進入報表。",
@@ -152,6 +157,65 @@ class ReportWindowAutomator:
 
     def _has_report_screen_inputs(self) -> bool:
         return len(self._date_input_controls()) >= 2
+
+    def _wait_for_report_screen_inputs(self) -> bool:
+        deadline = monotonic() + self.report_open_wait_seconds
+        dismissed = 0
+        while monotonic() < deadline:
+            if self._has_report_screen_inputs():
+                return True
+            if dismissed < self.warning_dismiss_limit and self._dismiss_transient_pos_warning():
+                dismissed += 1
+                self.actions.append("dismiss_warning:錯誤警告")
+                continue
+            sleep(0.5)
+        return self._has_report_screen_inputs()
+
+    def _dismiss_transient_pos_warning(self) -> bool:
+        test_hook = getattr(self.window, "dismiss_pos_warning", None)
+        if test_hook is not None:
+            return bool(test_hook())
+        if not sys.platform.startswith("win"):
+            return False
+
+        try:
+            from pywinauto import Desktop  # type: ignore[import-untyped]
+        except ImportError:
+            return False
+
+        try:
+            desktop = Desktop(backend="uia")
+            dialogs = desktop.windows(title="錯誤警告")
+        except Exception:
+            return False
+
+        for dialog in dialogs:
+            text = self._dialog_text(dialog)
+            if not _is_known_transient_pos_warning(text):
+                continue
+            for button in self._dialog_buttons(dialog):
+                if "確定" in self._control_name(button):
+                    try:
+                        button.click_input()
+                        return True
+                    except Exception:
+                        return False
+        return False
+
+    def _dialog_text(self, dialog: Any) -> str:
+        parts = [self._control_name(dialog)]
+        descendants = _safe_call(dialog, "descendants", default=[])
+        for control in descendants:
+            name = self._control_name(control)
+            if name:
+                parts.append(name)
+        return " ".join(parts)
+
+    def _dialog_buttons(self, dialog: Any) -> list[Any]:
+        try:
+            return list(dialog.descendants(control_type="Button"))
+        except Exception:
+            return []
 
     def _date_input_controls(self) -> list[Any]:
         return [control for control in self._all_controls() if self._control_type(control).lower() in {"edit", "text"}]
@@ -272,4 +336,12 @@ def _normalized_text(value: str) -> str:
         .replace("統計報表", "統計表")
         .replace("查詢報表", "查詢表")
         .strip()
+    )
+
+
+def _is_known_transient_pos_warning(value: str) -> bool:
+    return (
+        "錯誤警告" in value
+        and "無法連結資料主機" in value
+        and ("網路或主機" in value or "正常使用" in value)
     )

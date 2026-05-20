@@ -72,6 +72,39 @@ class FakeMenuSelectWindow(FakePosControl):
         )
 
 
+class FakeWarningThenReportWindow(FakePosControl):
+    def __init__(self) -> None:
+        super().__init__(
+            "SPA-POS",
+            children=[
+                FakePosControl("統計報表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+            ],
+        )
+        self.pending_warnings = 3
+        self.menu_select_calls: list[str] = []
+
+    def menu_select(self, menu_path: str) -> None:
+        self.menu_select_calls.append(menu_path)
+
+    def dismiss_pos_warning(self) -> bool:
+        if self.pending_warnings <= 0:
+            return False
+        self.pending_warnings -= 1
+        if self.pending_warnings == 0:
+            self.children_controls.extend(
+                [
+                    FakePosControl("起日", "Edit"),
+                    FakePosControl("迄日", "Edit"),
+                    FakePosControl("顯示銷售分店", "CheckBox"),
+                    FakePosControl("不列明細", "CheckBox"),
+                    FakePosControl("檢視報表", "Button"),
+                    FakePosControl("存檔 Excel", "Button"),
+                ]
+            )
+        return True
+
+
 def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R02")
@@ -125,6 +158,30 @@ def test_report_automation_uses_menu_select_before_hidden_menu_clicks(tmp_path: 
     assert result.ok is True
     assert window.menu_select_calls == ["統計報表->課程服務明細表"]
     assert result.actions[0] == "menu_select:統計報表->課程服務明細表"
+
+
+def test_report_automation_dismisses_transient_pos_warnings_until_report_screen_opens(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
+    report = next(item for item in config.reports if item.id == "R01")
+    window = FakeWarningThenReportWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=1,
+    )
+
+    result = automator.download_report(output, report)
+
+    assert result.ok is True
+    assert result.actions[:4] == [
+        "menu_select:統計報表->課程服務明細表",
+        "dismiss_warning:錯誤警告",
+        "dismiss_warning:錯誤警告",
+        "dismiss_warning:錯誤警告",
+    ]
+    assert window.pending_warnings == 0
 
 
 def test_report_automation_fails_when_report_screen_does_not_open(tmp_path: Path) -> None:

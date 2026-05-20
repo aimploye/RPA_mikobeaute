@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QLineEdit, QPushButton, Q
 
 from pos_report_bot.config.loader import load_project_config  # noqa: E402
 from pos_report_bot.drive.folder_id import parse_drive_folder_id  # noqa: E402
+import pos_report_bot.gui.main_window as main_window  # noqa: E402
 from pos_report_bot.gui.main_window import SettingsMainWindow  # noqa: E402
 from tests.unit.test_ui_probe import FakeControl  # noqa: E402
 
@@ -250,6 +251,27 @@ def test_pos_test_button_returns_visible_friendly_error() -> None:
     assert window.last_action_result.ok is False
     assert window.last_action_result.error_code == "POS_EXECUTABLE_NOT_CONFIGURED"
     assert "POS exe 路徑" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_connect_open_pos_button_uses_pywinauto_connection(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    def fake_connect_pos_window(*, window_title_contains: str, backend: str) -> FakeControl:
+        assert window_title_contains == "SPA-POS"
+        assert backend == "auto"
+        return FakeControl("SPA-POS 主畫面")
+
+    monkeypatch.setattr(main_window, "connect_pos_window", fake_connect_pos_window)
+    button = window.findChild(QPushButton, "pos_連接已開啟 POS")
+    assert button is not None
+    button.click()
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert "已連接已開啟 POS" in window.statusBar().currentMessage()
     window.close()
 
 

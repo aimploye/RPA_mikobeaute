@@ -191,6 +191,25 @@ class SettingsMainWindow(QMainWindow):
             message="POS 測試需要在安裝 SPA-POS 的 Windows 電腦上執行。",
         )
 
+    def connect_open_pos(self) -> GuiActionResult:
+        try:
+            window = connect_pos_window(
+                window_title_contains=self.config.pos.window_title_contains,
+                backend=self.config.pos.backend,
+            )
+        except UiProbeError as exc:
+            return GuiActionResult(
+                ok=False,
+                error_code="POS_WINDOW_NOT_FOUND",
+                message=f"找不到已開啟的 SPA-POS 視窗：{exc}",
+            )
+
+        title = self._window_title(window)
+        return GuiActionResult(
+            ok=True,
+            message=f"已連接已開啟 POS：{title or self.config.pos.window_title_contains}",
+        )
+
     def export_ui_probe_report(self, window: Any, path: Path) -> GuiActionResult:
         report = probe_window_controls(
             window,
@@ -452,8 +471,11 @@ class SettingsMainWindow(QMainWindow):
         if action == "停止":
             return GuiActionResult(ok=True, message="目前沒有執行中的任務。")
 
-        if action in {"測試啟動 POS", "連接已開啟 POS"}:
+        if action == "測試啟動 POS":
             return self.test_pos_connection()
+
+        if action == "連接已開啟 POS":
+            return self.connect_open_pos()
 
         if action == "測報表入口":
             return self.probe_report_entries()
@@ -533,6 +555,15 @@ class SettingsMainWindow(QMainWindow):
         }
         folder = folder_by_action.get(action, self.config.app.work_dir)
         return GuiActionResult(ok=True, message=f"{action}：{folder}")
+
+    def _window_title(self, window: Any) -> str:
+        method = getattr(window, "window_text", None)
+        if method is None:
+            return ""
+        try:
+            return str(method())
+        except Exception:
+            return ""
 
     def _test_folder_permissions(self) -> GuiActionResult:
         folder_paths = [

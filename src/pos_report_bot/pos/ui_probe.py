@@ -27,6 +27,10 @@ class UiProbeReport(BaseModel):
     controls: list[ControlProbeRecord] = Field(default_factory=list)
 
 
+def actual_window_backend(window: Any, fallback: str) -> str:
+    return str(getattr(window, "_pos_report_bot_backend", fallback) or fallback)
+
+
 def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str = "auto") -> Any:
     if not sys.platform.startswith("win"):
         raise UiProbeError("POS UI probe requires Windows and a running SPA-POS window.")
@@ -42,7 +46,12 @@ def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str =
     for candidate_backend in backends:
         try:
             app = Application(backend=candidate_backend).connect(title_re=title_re)
-            return app.top_window()
+            window = app.top_window()
+            try:
+                setattr(window, "_pos_report_bot_backend", candidate_backend)
+            except Exception:
+                pass
+            return window
         except Exception as exc:  # pragma: no cover - real Windows probe only
             errors.append(f"{candidate_backend}: {exc}")
 
@@ -55,7 +64,7 @@ def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str =
 def probe_window_controls(window: Any, *, window_title: str, backend: str) -> UiProbeReport:
     records: list[ControlProbeRecord] = []
     _collect_control_records(window, depth=0, records=records)
-    return UiProbeReport(window_title=window_title, backend=backend, controls=records)
+    return UiProbeReport(window_title=window_title, backend=actual_window_backend(window, backend), controls=records)
 
 
 def write_probe_report(report: UiProbeReport, path: Path) -> Path:

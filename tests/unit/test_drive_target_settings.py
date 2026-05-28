@@ -14,12 +14,12 @@ from pos_report_bot.reports.planner import build_dry_run_plan
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_build_drive_target_rows_lists_all_18_outputs() -> None:
+def test_build_drive_target_rows_lists_all_enabled_outputs() -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
 
     rows = build_drive_target_rows(config)
 
-    assert len(rows) == 18
+    assert len(rows) == 17
     assert rows[0].target_key == "R01"
     assert rows[0].task_id == "R01"
     assert rows[0].branch_code is None
@@ -47,7 +47,7 @@ def test_apply_drive_target_values_persists_and_removes_missing_targets(tmp_path
     plan = build_dry_run_plan(reloaded, today=date(2026, 5, 13))
     payload = plan.to_payload()
 
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 17
     assert payload["counts"]["missing_drive_targets"] == 0
     assert all(output.drive_target_status == "configured" for output in plan.outputs)
     assert next(

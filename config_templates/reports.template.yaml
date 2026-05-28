@@ -34,7 +34,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
+      check: ["顯示分店碼", "顯示客代與電話", "顯示退費"]
       uncheck: ["不列明細"]
       other_conditions: []
     max_wait_seconds: 300
@@ -55,7 +55,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
+      check: ["顯示分店碼", "顯示客代與電話", "顯示退費", "僅含新客"]
       uncheck: ["不列明細"]
       other_conditions: []
     max_wait_seconds: 300
@@ -76,49 +76,28 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
+      check: ["顯示分店碼", "顯示客代與電話", "顯示退費"]
       uncheck: ["不列明細"]
       other_conditions: ["二次篩選"]
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"
 
-  - id: "R05A"
+  - id: "R05"
     enabled: true
     frequency: "daily"
-    name: "諮詢師商品明細 僅新客"
-    handler: "product_sales_detail"
-    report_menu_text: "商品銷售明細表"
-    branch_mode: "all"
-    date_range:
-      start: "{month_start}"
-      end: "{yesterday}"
-    output_filename: "R05A_諮詢師商品明細_僅新客_{start}_{end}.xls"
-    drive_folder_id: ""
-    upload_enabled: true
-    options:
-      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
-      uncheck: ["不列明細"]
-      other_conditions: []
-    max_wait_seconds: 300
-    retry_count: 1
-    real_pos_validation_status: "pending_real_pos_validation"
-
-  - id: "R05B"
-    enabled: true
-    frequency: "daily"
-    name: "諮詢師課程明細 僅新客"
+    name: "諮詢師課程明細 二次篩選"
     handler: "course_service_detail"
     report_menu_text: "課程服務明細表"
     branch_mode: "all"
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R05B_諮詢師課程明細_僅新客_{start}_{end}.xls"
+    output_filename: "R05_諮詢師課程明細_二次篩選_{start}_{end}.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
+      check: ["顯示銷售分店"]
       uncheck: ["不列明細"]
       other_conditions: ["二次篩選"]
     max_wait_seconds: 300
@@ -127,15 +106,15 @@ reports:
 
   - id: "R06"
     enabled: true
-    frequency: "weekly"
-    name: "每週 會員剩餘點數殘值統計表"
+    frequency: "daily"
+    name: "每日 會員剩餘點數殘值統計表"
     handler: "member_remaining_points"
     report_menu_text: "會員剩餘點數殘值統計表"
     branch_mode: "each_branch"
     date_range:
       start: "2024/01/01"
       end: "{yesterday}"
-    output_filename: "R06_{branch_code}_會員剩餘點數殘值統計表_{end}.xls"
+    output_filename: "R06_{branch_name}_會員剩餘點數殘值統計表_{end}.xls"
     upload_enabled: true
     branch_drive_folder_ids:
       N001: ""
@@ -145,7 +124,7 @@ reports:
       N005: ""
       N006: ""
     options:
-      check: ["清單顯示"]
+      check: ["清單檢視"]
       uncheck: []
       other_conditions: []
     max_wait_seconds: 600
@@ -166,7 +145,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示分館"]
+      check: []
       uncheck: []
       other_conditions: []
     max_wait_seconds: 300
@@ -187,7 +166,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示分館"]
+      check: []
       uncheck: []
       other_conditions: []
     max_wait_seconds: 300
@@ -209,7 +188,7 @@ reports:
     upload_enabled: true
     variant: "gender_age"
     options:
-      check: ["顯示備註"]
+      check: []
       uncheck: []
       other_conditions: ["顯示性別年齡"]
     max_wait_seconds: 300
@@ -231,7 +210,7 @@ reports:
     upload_enabled: true
     variant: "service_staff"
     options:
-      check: ["顯示備註"]
+      check: []
       uncheck: []
       other_conditions: ["顯示服務人員"]
     max_wait_seconds: 300
@@ -252,7 +231,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示銷售分店", "顯示銷售分攤金額", "顯示退費", "僅含新客"]
+      check: ["顯示分店碼", "銷售分攤金額", "顯示退費", "僅含新客"]
       uncheck: ["不列明細"]
       other_conditions: []
     max_wait_seconds: 300
@@ -273,7 +252,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示銷售分店", "顯示銷售分攤金額", "顯示退費"]
+      check: ["顯示分店碼", "銷售分攤金額", "顯示退費"]
       uncheck: ["不列明細"]
       other_conditions: ["二次篩選"]
     max_wait_seconds: 300

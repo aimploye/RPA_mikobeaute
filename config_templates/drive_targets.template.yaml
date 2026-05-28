@@ -11,9 +11,7 @@ drive_targets:
     folder_id_or_url: ""
   R04:
     folder_id_or_url: ""
-  R05A:
-    folder_id_or_url: ""
-  R05B:
+  R05:
     folder_id_or_url: ""
   R06:
     branches:

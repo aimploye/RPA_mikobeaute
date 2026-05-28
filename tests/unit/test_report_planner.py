@@ -14,9 +14,9 @@ def test_dry_run_expands_r01_to_r12_with_r06_branch_outputs() -> None:
     plan = build_dry_run_plan(config, today=date(2026, 5, 13))
 
     task_ids = {output.task_id for output in plan.outputs}
-    assert {"R01", "R02", "R03", "R04", "R05A", "R05B", "R06", "R07", "R08", "R09", "R10", "R11", "R12"} == task_ids
+    assert {"R01", "R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09", "R10", "R11", "R12"} == task_ids
     assert len([output for output in plan.outputs if output.task_id == "R06"]) == 6
-    assert len(plan.outputs) == 18
+    assert len(plan.outputs) == 17
 
 
 def test_dry_run_output_contains_dates_filename_drive_target_and_status() -> None:
@@ -37,7 +37,7 @@ def test_dry_run_output_contains_dates_filename_drive_target_and_status() -> Non
 
     assert r06_n003.start_date == "2024/01/01"
     assert r06_n003.end_date == "2026/05/12"
-    assert r06_n003.output_filename == "R06_N003_會員剩餘點數殘值統計表_20260512.xls"
+    assert r06_n003.output_filename == "R06_忠孝7樓_會員剩餘點數殘值統計表_20260512.xls"
     assert r06_n003.branch_display_name == "忠孝7F"
     assert r06_n003.drive_folder_id is None
     assert r06_n003.drive_target_status == "missing"

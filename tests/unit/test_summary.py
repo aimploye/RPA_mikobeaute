@@ -72,8 +72,8 @@ def test_build_dry_run_summary_marks_missing_drive_targets_failed() -> None:
             ),
             PlannedOutput(
                 task_id="R06",
-                task_name="每週 會員剩餘點數殘值統計表",
-                frequency="weekly",
+                task_name="每日 會員剩餘點數殘值統計表",
+                frequency="daily",
                 handler="member_remaining_points",
                 report_menu_text="會員剩餘點數殘值統計表",
                 branch_mode="each_branch",

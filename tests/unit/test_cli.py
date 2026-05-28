@@ -4,7 +4,11 @@ import sys
 from pathlib import Path
 
 from pos_report_bot.app import cli
-from pos_report_bot.pos.save_as_handler import MockSaveAsHandler
+from pos_report_bot.pos.save_as_handler import (
+    DesktopWindowProbeRecord,
+    MockSaveAsHandler,
+    SaveAsDialogTimeoutError,
+)
 from tests.unit.test_report_automation import FakePosControl
 
 
@@ -33,8 +37,8 @@ def test_dry_run_cli_outputs_json_plan() -> None:
 
     assert payload["mode"] == "dry_run"
     assert payload["status"] == "success"
-    assert payload["counts"]["outputs"] == 18
-    assert payload["counts"]["missing_drive_targets"] == 18
+    assert payload["counts"]["outputs"] == 17
+    assert payload["counts"]["missing_drive_targets"] == 17
     assert any(
         output["task_id"] == "R06" and output["branch_code"] == "N006"
         for output in payload["outputs"]
@@ -68,7 +72,7 @@ def test_dry_run_cli_can_write_summary(tmp_path: Path) -> None:
 
     assert summary_path.parent == tmp_path
     assert summary["status"] == "failed"
-    assert len(summary["outputs"]) == 18
+    assert len(summary["outputs"]) == 17
     assert summary["outputs"][0]["error_code"] == "DRIVE_FOLDER_ID_MISSING"
 
 
@@ -146,6 +150,7 @@ def test_run_task_cli_executes_single_pos_report_with_real_automation_path(
 ) -> None:
     window = FakePosControl(
         "SPA-POS",
+        "Window",
         children=[
             FakePosControl("統計報表", "MenuItem"),
             FakePosControl("課程服務明細表", "MenuItem"),
@@ -184,3 +189,208 @@ def test_run_task_cli_executes_single_pos_report_with_real_automation_path(
     assert Path(payload["output_path"]).exists()
     assert "click:統計報表" in payload["actions"]
     assert "click:課程服務明細表" in payload["actions"]
+
+
+def test_probe_export_controls_cli_outputs_targeted_report(monkeypatch, capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    window = FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[
+            FakePosControl("匯出", "Button", automation_id="ReportViewerExport"),
+            FakePosControl("Excel", "MenuItem"),
+            FakePosControl("一般文字", "Text"),
+        ],
+    )
+    output_path = tmp_path / "export_probe.json"
+
+    monkeypatch.setattr(cli, "connect_pos_window", lambda **_kwargs: window)
+
+    exit_code = cli.main(
+        [
+            "--probe-export-controls",
+            "--probe-output",
+            str(output_path),
+            "--config",
+            str(ROOT / "config_templates" / "app.template.yaml"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["output_path"] == str(output_path)
+    assert written["counts"]["controls"] == 2
+    assert any(control["likely_export"] for control in written["controls"])
+    assert any(control["likely_excel"] for control in written["controls"])
+
+
+def test_probe_save_as_dialog_cli_outputs_dialog_report(monkeypatch, capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    class FakeSaveAsHandler:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def probe_dialog(self, *, max_depth: int) -> object:
+            assert max_depth == 6
+
+            class FakeControl:
+                def model_dump(self, *, mode: str) -> dict[str, object]:
+                    assert mode == "json"
+                    return {
+                        "control_type": "Edit",
+                        "name": "",
+                        "automation_id": "",
+                        "class_name": "",
+                        "rectangle": {"left": 10, "top": 10, "right": 200, "bottom": 32},
+                        "enabled": True,
+                        "visible": True,
+                        "depth": 1,
+                        "likely_filename": True,
+                        "likely_save_button": False,
+                    }
+
+            class FakeReport:
+                controls = [FakeControl()]
+
+            return FakeReport()
+
+    monkeypatch.setattr(cli, "WindowsSaveAsHandler", FakeSaveAsHandler)
+    output_path = tmp_path / "save_as_probe.json"
+
+    exit_code = cli.main(
+        [
+            "--probe-save-as-dialog",
+            "--probe-depth",
+            "6",
+            "--probe-output",
+            str(output_path),
+            "--config",
+            str(ROOT / "config_templates" / "app.template.yaml"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["output_path"] == str(output_path)
+    assert written["counts"]["controls"] == 1
+    assert written["controls"][0]["likely_filename"] is True
+
+
+def test_probe_save_as_dialog_cli_writes_error_payload_to_output(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    class FailingSaveAsHandler:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def probe_dialog(self, *, max_depth: int) -> object:
+            raise TimeoutError(f"等待另存新檔視窗逾時 depth {max_depth}")
+
+    monkeypatch.setattr(cli, "WindowsSaveAsHandler", FailingSaveAsHandler)
+    output_path = tmp_path / "save_as_probe_error.json"
+
+    exit_code = cli.main(
+        [
+            "--probe-save-as-dialog",
+            "--probe-depth",
+            "8",
+            "--probe-output",
+            str(output_path),
+            "--config",
+            str(ROOT / "config_templates" / "app.template.yaml"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    raw_output = output_path.read_text(encoding="utf-8")
+    written = json.loads(raw_output)
+
+    assert exit_code == 1
+    assert payload["ok"] is False
+    assert written["ok"] is False
+    assert written["error_code"] == "SAVE_AS_DIALOG_PROBE_FAILED"
+    assert "\\u7b49\\u5f85" in raw_output
+    assert written["output_path"] == str(output_path)
+
+
+def test_probe_save_as_dialog_cli_writes_timeout_window_diagnostics(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    class TimeoutSaveAsHandler:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def probe_dialog(self, *, max_depth: int) -> object:
+            raise SaveAsDialogTimeoutError(
+                "等待另存新檔視窗逾時",
+                observed_windows=[
+                    DesktopWindowProbeRecord(
+                        backend="uia",
+                        title="正在匯出，請稍後",
+                        control_type="Window",
+                        class_name="#32770",
+                        rectangle={"left": 10, "top": 20, "right": 300, "bottom": 160},
+                        enabled=True,
+                        visible=True,
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(cli, "WindowsSaveAsHandler", TimeoutSaveAsHandler)
+    output_path = tmp_path / "save_as_probe_timeout.json"
+
+    exit_code = cli.main(
+        [
+            "--probe-save-as-dialog",
+            "--probe-output",
+            str(output_path),
+            "--config",
+            str(ROOT / "config_templates" / "app.template.yaml"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 1
+    assert payload["error_code"] == "SAVE_AS_DIALOG_PROBE_FAILED"
+    assert written["observed_windows"][0]["title"] == "正在匯出，請稍後"
+
+
+def test_probe_save_as_dialog_cli_writes_keyboard_interrupt_payload(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    class InterruptedSaveAsHandler:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def probe_dialog(self, *, max_depth: int) -> object:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "WindowsSaveAsHandler", InterruptedSaveAsHandler)
+    output_path = tmp_path / "save_as_probe_interrupted.json"
+
+    exit_code = cli.main(
+        [
+            "--probe-save-as-dialog",
+            "--probe-depth",
+            "8",
+            "--probe-output",
+            str(output_path),
+            "--config",
+            str(ROOT / "config_templates" / "app.template.yaml"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 130
+    assert payload["ok"] is False
+    assert written["error_code"] == "PROBE_INTERRUPTED"
+    assert written["output_path"] == str(output_path)

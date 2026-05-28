@@ -1,6 +1,6 @@
 from enum import StrEnum
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 from pydantic import BaseModel
 
@@ -24,9 +24,31 @@ class FileValidationResult(BaseModel):
 def validate_file(
     path: Path,
     *,
+    wait_timeout_seconds: float = 0.0,
     stable_checks: int = 2,
     stable_interval_seconds: float = 1.0,
 ) -> FileValidationResult:
+    deadline = monotonic() + max(wait_timeout_seconds, 0.0)
+    while True:
+        missing_result = _missing_or_empty_result(path)
+        if missing_result is None:
+            break
+        if monotonic() >= deadline:
+            return missing_result
+        sleep(0.25)
+
+    stable = _is_size_stable(path, stable_checks, stable_interval_seconds)
+    return FileValidationResult(
+        ok=stable,
+        status=FileValidationStatus.VALID if stable else FileValidationStatus.UNSTABLE,
+        path=path,
+        size_bytes=path.stat().st_size,
+        stable=stable,
+        message="File is valid" if stable else "File size is not stable",
+    )
+
+
+def _missing_or_empty_result(path: Path) -> FileValidationResult | None:
     if not path.exists():
         return FileValidationResult(
             ok=False,
@@ -45,7 +67,6 @@ def validate_file(
             stable=False,
             message=f"Path is not a file: {path}",
         )
-
     initial_size = path.stat().st_size
     if initial_size <= 0:
         return FileValidationResult(
@@ -56,16 +77,7 @@ def validate_file(
             stable=False,
             message=f"File is empty: {path}",
         )
-
-    stable = _is_size_stable(path, stable_checks, stable_interval_seconds)
-    return FileValidationResult(
-        ok=stable,
-        status=FileValidationStatus.VALID if stable else FileValidationStatus.UNSTABLE,
-        path=path,
-        size_bytes=path.stat().st_size,
-        stable=stable,
-        message="File is valid" if stable else "File size is not stable",
-    )
+    return None
 
 
 def _is_size_stable(path: Path, stable_checks: int, stable_interval_seconds: float) -> bool:

@@ -5,6 +5,15 @@ from pos_report_bot.core.dates import format_filename_date, format_pos_date, res
 from pos_report_bot.drive.folder_id import parse_drive_folder_id
 from pos_report_bot.reports.models import DryRunPlan, PlannedOutput
 
+BRANCH_FILENAME_NAMES = {
+    "N001": "站前4樓",
+    "N002": "站前11樓",
+    "N003": "忠孝7樓",
+    "N004": "忠孝國際醫學3樓",
+    "N005": "忠孝健康7樓",
+    "N006": "忠孝預防醫學3樓",
+}
+
 
 def build_dry_run_plan(config: ProjectConfig, *, today: date | None = None) -> DryRunPlan:
     base_date = today or date.today()
@@ -87,4 +96,10 @@ def _format_output_filename(
         today=format_filename_date(today),
         yesterday=format_filename_date(yesterday),
         branch_code=branch.code if branch else "",
+        branch_name=_safe_filename_branch_name(branch) if branch else "",
     )
+
+
+def _safe_filename_branch_name(branch: BranchConfig) -> str:
+    value = BRANCH_FILENAME_NAMES.get(branch.code, branch.display_name)
+    return value.replace("/", "_").replace("\\", "_").replace(":", "_").strip()

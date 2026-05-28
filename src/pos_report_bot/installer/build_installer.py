@@ -15,6 +15,7 @@ def build_packaging_plan(*, project_root: Path) -> PackagingPlan:
             "pyinstaller",
             "--noconfirm",
             "--clean",
+            "--console",
             "--name",
             "POSReportBot",
             "--paths",

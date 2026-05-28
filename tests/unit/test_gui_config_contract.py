@@ -48,4 +48,4 @@ def test_settings_pages_reflect_loaded_config_counts() -> None:
     reports = next(page for page in pages if page.page_id == "reports")
 
     assert branches.badge == "6 enabled"
-    assert reports.badge == "13 enabled"
+    assert reports.badge == "12 enabled"

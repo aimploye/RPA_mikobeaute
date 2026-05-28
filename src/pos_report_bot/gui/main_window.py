@@ -10,12 +10,15 @@ from pydantic import BaseModel, Field
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -25,12 +28,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from pos_report_bot import __version__
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
+from pos_report_bot.notifier.email import send_failure_notification
 from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
 from pos_report_bot.pos.save_as_handler import OverwritePolicy, WindowsSaveAsHandler
-from pos_report_bot.pos.ui_probe import UiProbeError, UiProbeReport, connect_pos_window, probe_window_controls, write_probe_report
+from pos_report_bot.pos.ui_probe import (
+    UiProbeError,
+    UiProbeReport,
+    actual_window_backend,
+    connect_pos_window,
+    probe_window_controls,
+    write_probe_report,
+)
 from pos_report_bot.reports.planner import build_dry_run_plan
 
 
@@ -46,6 +58,16 @@ class GuiActionResult(BaseModel):
     ok: bool
     error_code: str | None = None
     message: str
+    details: str | None = None
+
+
+@dataclass(frozen=True)
+class ReportRunFailure:
+    task_id: str
+    output_filename: str
+    error_code: str
+    message: str
+    diagnostic_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +156,7 @@ class SettingsMainWindow(QMainWindow):
         self.last_action_result: GuiActionResult | None = None
         self.last_dry_run_payload: dict[str, Any] | None = None
         self.last_ui_probe_report: Any | None = None
+        self._open_error_dialogs: list[QDialog] = []
         self._drive_target_table: QTableWidget | None = None
         self._branches_table: QTableWidget | None = None
         self._reports_table: QTableWidget | None = None
@@ -229,7 +252,10 @@ class SettingsMainWindow(QMainWindow):
         title = self._window_title(window)
         return GuiActionResult(
             ok=True,
-            message=f"已連接已開啟 POS：{title or self.config.pos.window_title_contains}",
+            message=(
+                f"已連接已開啟 POS：{title or self.config.pos.window_title_contains}"
+                f"；backend={actual_window_backend(window, self.config.pos.backend)}"
+            ),
         )
 
     def export_ui_probe_report(self, window: Any, path: Path) -> GuiActionResult:
@@ -601,6 +627,8 @@ class SettingsMainWindow(QMainWindow):
     def _record_action_result(self, result: GuiActionResult) -> GuiActionResult:
         self.last_action_result = result
         self.statusBar().showMessage(result.message)
+        if not result.ok:
+            self._show_copyable_warning(result)
         return result
 
     def execute_enabled_reports(self) -> GuiActionResult:
@@ -616,6 +644,7 @@ class SettingsMainWindow(QMainWindow):
             )
             save_as_handler = WindowsSaveAsHandler(
                 dialog_title_contains=self.config.save_as.dialog_title_contains,
+                filename_label=self.config.save_as.filename_label,
                 save_button_text=self.config.save_as.save_button_text,
                 default_extension=self.config.save_as.default_extension,
                 overwrite_policy=OverwritePolicy(self.config.save_as.overwrite_policy),
@@ -626,25 +655,112 @@ class SettingsMainWindow(QMainWindow):
                 window,
                 save_as_handler=save_as_handler,
                 output_dir=Path(self.config.app.downloads_dir),
+                diagnostic_dir=Path(self.config.app.screenshots_dir),
+                runtime_metadata={
+                    "app_version": __version__,
+                    "config_path": str(self.settings_path),
+                    "configured_backend": self.config.pos.backend,
+                },
             )
-            for output in plan.outputs:
+            failures: list[ReportRunFailure] = []
+            completed = 0
+            for index, output in enumerate(plan.outputs):
                 report = next(item for item in self.config.reports if item.id == output.task_id)
-                result = automator.download_report(output, report)
-                if not result.ok:
-                    return GuiActionResult(
-                        ok=False,
-                        error_code=result.error_code or "REPORT_DOWNLOAD_FAILED",
-                        message=f"{output.task_id} 下載失敗：{result.message}",
+                close_after_success = not (
+                    output.task_id == "R06" and any(later.task_id == output.task_id for later in plan.outputs[index + 1 :])
+                )
+                try:
+                    result = automator.download_report(output, report, close_after_success=close_after_success)
+                except ReportAutomationError as exc:
+                    failures.append(
+                        ReportRunFailure(
+                            task_id=output.task_id,
+                            output_filename=output.output_filename,
+                            error_code=exc.error_code,
+                            message=exc.message,
+                            diagnostic_path=str(exc.diagnostic_path) if exc.diagnostic_path else None,
+                        )
                     )
+                    continue
+                if not result.ok:
+                    failures.append(
+                        ReportRunFailure(
+                            task_id=output.task_id,
+                            output_filename=output.output_filename,
+                            error_code=result.error_code or "REPORT_DOWNLOAD_FAILED",
+                            message=f"{output.task_id} 下載失敗：{result.message}",
+                        )
+                    )
+                    continue
+                completed += 1
         except UiProbeError as exc:
             return GuiActionResult(ok=False, error_code="POS_CONNECTION_FAILED", message=f"連接 POS 失敗：{exc}")
-        except ReportAutomationError as exc:
-            return GuiActionResult(ok=False, error_code=exc.error_code, message=exc.message)
+
+        if failures:
+            details = self._format_report_failures(failures)
+            notify_result = self._notify_report_failures(details)
+            notify_suffix = f"；{notify_result.message}" if notify_result else ""
+            return GuiActionResult(
+                ok=False,
+                error_code="PARTIAL_REPORT_RUN_FAILED" if completed else "REPORT_RUN_FAILED",
+                message=f"已完成 {completed} 個 POS 報表下載，{len(failures)} 個失敗或無資料{notify_suffix}",
+                details=details,
+            )
 
         return GuiActionResult(
             ok=True,
             message=f"已完成 {len(plan.outputs)} 個 POS 報表下載；Google Drive 上傳仍需另外驗證 OAuth。",
         )
+
+    def _format_report_failures(self, failures: list[ReportRunFailure]) -> str:
+        lines = ["POSReportBot 自動化執行未完全成功", ""]
+        for failure in failures:
+            lines.extend(
+                [
+                    f"任務：{failure.task_id}",
+                    f"輸出檔名：{failure.output_filename}",
+                    f"錯誤代碼：{failure.error_code}",
+                    f"說明：{failure.message}",
+                ]
+            )
+            if failure.diagnostic_path:
+                lines.append(f"診斷檔：{failure.diagnostic_path}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _notify_report_failures(self, details: str) -> Any | None:
+        if not self.config.email.enabled or not self.config.email.notify_on_failure:
+            return None
+        return send_failure_notification(
+            self.config.email,
+            subject="POSReportBot 報表自動化失敗通知",
+            body=details,
+        )
+
+    def _show_copyable_warning(self, result: GuiActionResult) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("POSReportBot 警告")
+        dialog.resize(680, 420)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(result.message, dialog))
+
+        text = QPlainTextEdit(result.details or result.message, dialog)
+        text.setReadOnly(True)
+        text.selectAll()
+        layout.addWidget(text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.close)
+        layout.addWidget(buttons)
+
+        def remove_dialog() -> None:
+            if dialog in self._open_error_dialogs:
+                self._open_error_dialogs.remove(dialog)
+
+        dialog.finished.connect(lambda _code: remove_dialog())
+        self._open_error_dialogs.append(dialog)
+        dialog.show()
 
     def _resolve_settings_path(self, settings_path: Path | None) -> Path:
         if settings_path is not None and "config_templates" not in settings_path.parts:

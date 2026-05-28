@@ -1,10 +1,20 @@
 import os
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QCheckBox, QLineEdit, QPushButton, QSpinBox, QTableWidget, QTabWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QCheckBox,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTabWidget,
+)
 
 from pos_report_bot.config.loader import load_project_config  # noqa: E402
 from pos_report_bot.drive.folder_id import parse_drive_folder_id  # noqa: E402
@@ -35,7 +45,7 @@ def test_pyside_settings_window_can_be_created() -> None:
     assert tabs.count() == 10
     table = window.findChild(QTableWidget, "drive_target_table")
     assert table is not None
-    assert table.rowCount() == 18
+    assert table.rowCount() == 17
     window.close()
 
 
@@ -215,7 +225,7 @@ def test_settings_window_can_fill_all_drive_targets_and_dry_run_has_no_missing()
     window.fill_all_drive_targets_for_testing(prefix="folder")
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 17
     assert payload["counts"]["missing_drive_targets"] == 0
     window.close()
 
@@ -228,8 +238,8 @@ def test_settings_window_can_trigger_dry_run_without_pos() -> None:
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
     assert payload["mode"] == "dry_run"
-    assert payload["counts"]["outputs"] == 18
-    assert payload["counts"]["missing_drive_targets"] == 18
+    assert payload["counts"]["outputs"] == 17
+    assert payload["counts"]["missing_drive_targets"] == 17
     window.close()
 
 
@@ -245,7 +255,7 @@ def test_dry_run_button_updates_status_and_result() -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert window.last_dry_run_payload is not None
-    assert window.last_dry_run_payload["counts"]["outputs"] == 18
+    assert window.last_dry_run_payload["counts"]["outputs"] == 17
     assert "Dry-run 完成" in window.statusBar().currentMessage()
     window.close()
 
@@ -571,6 +581,57 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
     assert window.last_action_result.ok is True
     assert "已完成 1 個 POS 報表下載" in window.statusBar().currentMessage()
     assert len(list(tmp_path.glob("R01_*.xls"))) == 1
+    window.close()
+
+
+def test_dashboard_execute_continues_after_failed_report_and_shows_copyable_warning(
+    monkeypatch, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.downloads_dir = str(tmp_path)
+    for report in config.reports:
+        report.enabled = report.id in {"R01", "R02", "R03"}
+    window = SettingsMainWindow(config)
+    calls: list[str] = []
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            if output.task_id == "R02":
+                raise main_window.ReportAutomationError(
+                    "CONTROL_NOT_CLICKABLE",
+                    "控制項無法點擊：檢視報表",
+                )
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: FakePosControl("SPA-POS"))
+    monkeypatch.setattr(main_window, "WindowsSaveAsHandler", lambda **_kwargs: MockSaveAsHandler())
+    monkeypatch.setattr(main_window, "ReportWindowAutomator", FakeAutomator)
+
+    result = window.execute_enabled_reports()
+
+    assert calls == ["R01", "R02", "R03"]
+    assert result.ok is False
+    assert result.error_code == "PARTIAL_REPORT_RUN_FAILED"
+    assert result.details is not None
+    assert "任務：R02" in result.details
+
+    recorded = window._record_action_result(result)
+    assert recorded is result
+    assert window._open_error_dialogs
+    text_edit = window._open_error_dialogs[-1].findChild(QPlainTextEdit)
+    assert text_edit is not None
+    assert "控制項無法點擊：檢視報表" in text_edit.toPlainText()
     window.close()
 
 

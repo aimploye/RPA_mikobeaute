@@ -1,0 +1,136 @@
+{
+  "window_title": "SPA-POS",
+  "backend": "uia",
+  "controls": [
+    {
+      "control_type": "Window",
+      "name": "SPA-POS",
+      "automation_id": "",
+      "class_name": "WindowsForms10.Window.8.app.0.33c0d9d",
+      "rectangle": {"left": 0, "top": 0, "right": 1280, "bottom": 800},
+      "enabled": true,
+      "visible": true,
+      "depth": 0
+    },
+    {
+      "control_type": "MenuItem",
+      "name": "統計報表",
+      "automation_id": "",
+      "class_name": "",
+      "rectangle": {"left": 180, "top": 28, "right": 250, "bottom": 52},
+      "enabled": true,
+      "visible": true,
+      "depth": 1
+    },
+    {
+      "control_type": "MenuItem",
+      "name": "課程服務明細表",
+      "automation_id": "",
+      "class_name": "",
+      "rectangle": {"left": 214, "top": 74, "right": 468, "bottom": 98},
+      "enabled": true,
+      "visible": false,
+      "depth": 2
+    },
+    {
+      "control_type": "Dialog",
+      "name": "課程服務明細表",
+      "automation_id": "ClassService_Report",
+      "class_name": "WindowsForms10.Window.8.app.0.33c0d9d",
+      "rectangle": {"left": 210, "top": 261, "right": 1254, "bottom": 778},
+      "enabled": true,
+      "visible": true,
+      "depth": 1
+    },
+    {
+      "control_type": "ComboBox",
+      "name": "查詢分店",
+      "automation_id": "cB_QueryBranch",
+      "class_name": "WindowsForms10.COMBOBOX.app.0.33c0d9d",
+      "rectangle": {"left": 249, "top": 330, "right": 395, "bottom": 354},
+      "enabled": true,
+      "visible": true,
+      "depth": 2
+    },
+    {
+      "control_type": "CheckBox",
+      "name": "顯示銷售分店",
+      "automation_id": "cK_ShowBranchNo",
+      "class_name": "WindowsForms10.BUTTON.app.0.33c0d9d",
+      "rectangle": {"left": 249, "top": 356, "right": 345, "bottom": 372},
+      "enabled": true,
+      "visible": true,
+      "depth": 2
+    },
+    {
+      "control_type": "Pane",
+      "name": "課程服務明細表",
+      "automation_id": "pn_Query",
+      "class_name": "WindowsForms10.Window.8.app.0.33c0d9d",
+      "rectangle": {"left": 514, "top": 292, "right": 1246, "bottom": 375},
+      "enabled": true,
+      "visible": true,
+      "depth": 2
+    },
+    {
+      "control_type": "Edit",
+      "name": "",
+      "automation_id": "cT_QueryBdate",
+      "class_name": "WindowsForms10.EDIT.app.0.33c0d9d",
+      "rectangle": {"left": 660, "top": 304, "right": 764, "bottom": 328},
+      "enabled": true,
+      "visible": true,
+      "depth": 3
+    },
+    {
+      "control_type": "Edit",
+      "name": "",
+      "automation_id": "cT_QueryEdate",
+      "class_name": "WindowsForms10.EDIT.app.0.33c0d9d",
+      "rectangle": {"left": 792, "top": 304, "right": 896, "bottom": 328},
+      "enabled": true,
+      "visible": true,
+      "depth": 3
+    },
+    {
+      "control_type": "CheckBox",
+      "name": "不列\r\n明細",
+      "automation_id": "K_NoItemList",
+      "class_name": "WindowsForms10.BUTTON.app.0.33c0d9d",
+      "rectangle": {"left": 815, "top": 327, "right": 863, "bottom": 355},
+      "enabled": true,
+      "visible": true,
+      "depth": 3
+    },
+    {
+      "control_type": "Button",
+      "name": "檢視\r\n報表",
+      "automation_id": "B_RunReport",
+      "class_name": "WindowsForms10.BUTTON.app.0.33c0d9d",
+      "rectangle": {"left": 1179, "top": 298, "right": 1240, "bottom": 331},
+      "enabled": true,
+      "visible": true,
+      "depth": 3
+    },
+    {
+      "control_type": "MenuItem",
+      "name": "匯出",
+      "automation_id": "",
+      "class_name": "",
+      "rectangle": {"left": 490, "top": 374, "right": 525, "bottom": 398},
+      "enabled": false,
+      "visible": true,
+      "depth": 2
+    },
+    {
+      "control_type": "MenuItem",
+      "name": "Excel",
+      "automation_id": "",
+      "class_name": "",
+      "rectangle": {"left": 490, "top": 400, "right": 555, "bottom": 424},
+      "enabled": true,
+      "visible": true,
+      "depth": 2
+    }
+  ]
+}

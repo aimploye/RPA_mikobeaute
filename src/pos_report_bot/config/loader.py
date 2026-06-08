@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 from typing import Any
 
 import yaml
@@ -10,6 +11,28 @@ from pos_report_bot.config.models import (
     ReportConfig,
     TaskDriveTarget,
 )
+
+LEGACY_REPORT_OUTPUT_FILENAMES: dict[str, set[str]] = {
+    "R01": {"R01_每日課程服務明細表_新舊客_{start}_{end}.xls"},
+    "R02": {"R02_每日商品銷售明細表_新舊客_{start}_{end}.xls"},
+    "R03": {"R03_每日商品銷售明細表_僅新客_{start}_{end}.xls"},
+    "R04": {"R04_每日商品銷售明細表_二次篩選_{start}_{end}.xls"},
+    "R05": {
+        "R05_諮詢師課程明細_二次篩選_{start}_{end}.xls",
+        "R05_商品銷售明細_課程服務明細_二次篩選_{start}_{end}.xls",
+    },
+    "R06": {
+        "R06_{branch_code}_會員剩餘點數殘值統計表_{end}.xls",
+        "R06_{branch_name}_會員剩餘點數殘值統計表_{end}.xls",
+    },
+    "R07": {"R07_每日預約_截至前一日_{start}.xls"},
+    "R08": {"R08_每日預約_當日應到_{start}.xls"},
+    "R09": {"R09_客戶來源與產值_性別年齡_{start}_{end}.xls"},
+    "R10": {"R10_客戶來源與產值_服務人員_{start}_{end}.xls"},
+    "R11": {"R11_商品銷售明細_新客分攤金額_{start}_{end}.xls"},
+    "R12": {"R12_商品銷售明細_二次篩選分攤金額_{start}_{end}.xls"},
+    "R13": {"R13_沙貨耗材領用查詢表_{start}_{end}.xls"},
+}
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -25,7 +48,7 @@ def load_project_config(app_config_path: Path) -> ProjectConfig:
     app_data = load_yaml(app_config_path)
 
     if "reports" in app_data and "branches" in app_data and "drive_targets" in app_data:
-        return _load_consolidated_config(app_data)
+        return _merge_template_defaults(_load_consolidated_config(app_data), app_config_path)
 
     reports_data = load_yaml(_companion_config_path(template_dir, "reports"))
     branches_data = load_yaml(_companion_config_path(template_dir, "branches"))
@@ -35,12 +58,13 @@ def load_project_config(app_config_path: Path) -> ProjectConfig:
     if not isinstance(target_items, dict):
         raise ValueError("drive_targets must be a mapping")
 
-    return ProjectConfig(
+    config = ProjectConfig(
         **app_data,
         reports=_load_report_configs(reports_data.get("reports", [])),
         branches=[BranchConfig.model_validate(item) for item in branches_data.get("branches", [])],
         drive_targets=DriveTargetsConfig(targets=_load_drive_targets(target_items)),
     )
+    return _merge_template_defaults(config, app_config_path)
 
 
 def _companion_config_path(config_dir: Path, name: str) -> Path:
@@ -68,6 +92,123 @@ def _load_consolidated_config(data: dict[str, Any]) -> ProjectConfig:
     )
 
 
+def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> ProjectConfig:
+    """Add newly shipped reports/targets to older saved user configs.
+
+    Installed users may keep a consolidated app.yaml under LOCALAPPDATA or
+    ProgramData. When a new built-in report such as R13 ships, that file won't
+    contain the new row until we merge template defaults. Existing user edits
+    always win; this only appends missing IDs.
+    """
+
+    template_defaults = _load_template_defaults(app_config_path)
+    if template_defaults is None:
+        return config
+
+    existing_report_ids = {report.id for report in config.reports}
+    for report in template_defaults.reports:
+        if report.id not in existing_report_ids:
+            config.reports.append(report.model_copy(deep=True))
+            existing_report_ids.add(report.id)
+
+    default_reports_by_id = {report.id: report for report in template_defaults.reports}
+    for report in config.reports:
+        default_report = default_reports_by_id.get(report.id)
+        if default_report is None:
+            continue
+        if _should_update_report_output_filename(report, default_report):
+            report.output_filename = default_report.output_filename
+
+    existing_branch_codes = {branch.code for branch in config.branches}
+    for branch in template_defaults.branches:
+        if branch.code not in existing_branch_codes:
+            config.branches.append(branch.model_copy(deep=True))
+            existing_branch_codes.add(branch.code)
+
+    for task_id, target in template_defaults.drive_targets.targets.items():
+        if task_id not in config.drive_targets.targets:
+            config.drive_targets.targets[task_id] = target.model_copy(deep=True)
+            continue
+        existing_target = config.drive_targets.targets[task_id]
+        if not existing_target.folder_id_or_url.strip() and target.folder_id_or_url.strip():
+            existing_target.folder_id_or_url = target.folder_id_or_url
+        for branch_code, folder_id_or_url in target.branches.items():
+            if folder_id_or_url.strip() and not existing_target.branches.get(branch_code, "").strip():
+                existing_target.branches[branch_code] = folder_id_or_url
+
+    _merge_app_defaults(config, template_defaults)
+
+    return config
+
+
+def _should_update_report_output_filename(report: ReportConfig, default_report: ReportConfig) -> bool:
+    current = report.output_filename.strip()
+    if not current:
+        return True
+    return current in LEGACY_REPORT_OUTPUT_FILENAMES.get(report.id, set()) and current != default_report.output_filename
+
+
+def _merge_app_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    if _should_use_default_pos_executable_path(config.pos.executable_path):
+        config.pos.executable_path = template_defaults.pos.executable_path
+    if config.scheduler.daily_time in {"", "07:30"}:
+        config.scheduler.daily_time = template_defaults.scheduler.daily_time
+    if not config.email.recipients:
+        config.email.recipients = list(template_defaults.email.recipients)
+
+
+def _should_use_default_pos_executable_path(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return True
+    lowered = normalized.replace("/", "\\").lower()
+    return "\\appdata\\local\\apps\\2.0\\" in lowered and lowered.endswith("\\spa1.exe")
+
+
+def _load_template_defaults(app_config_path: Path) -> ProjectConfig | None:
+    for template_dir in _template_default_dirs(app_config_path):
+        template_path = template_dir / "app.template.yaml"
+        reports_path = template_dir / "reports.template.yaml"
+        branches_path = template_dir / "branches.template.yaml"
+        drive_targets_path = template_dir / "drive_targets.template.yaml"
+        if not all(path.exists() for path in (template_path, reports_path, branches_path, drive_targets_path)):
+            continue
+        try:
+            app_data = load_yaml(template_path)
+            reports_data = load_yaml(reports_path)
+            branches_data = load_yaml(branches_path)
+            drive_targets_data = load_yaml(drive_targets_path)
+        except Exception:
+            continue
+        target_items = drive_targets_data.get("drive_targets", {})
+        if not isinstance(target_items, dict):
+            continue
+        return ProjectConfig(
+            **app_data,
+            reports=_load_report_configs(reports_data.get("reports", [])),
+            branches=[BranchConfig.model_validate(item) for item in branches_data.get("branches", [])],
+            drive_targets=DriveTargetsConfig(targets=_load_drive_targets(target_items)),
+        )
+    return None
+
+
+def _template_default_dirs(app_config_path: Path) -> list[Path]:
+    dirs: list[Path] = []
+
+    def add(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved not in dirs:
+            dirs.append(resolved)
+
+    frozen_base = getattr(sys, "_MEIPASS", None)
+    if frozen_base:
+        add(Path(frozen_base) / "config_templates")
+    add(Path.cwd() / "config_templates")
+    add(Path(__file__).resolve().parents[3] / "config_templates")
+    add(app_config_path.parent)
+    return dirs
+
+
 def _load_report_configs(items: Any) -> list[ReportConfig]:
     if not isinstance(items, list):
         return []
@@ -80,8 +221,10 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
     uncheck = list(report.options.uncheck)
     other_conditions = list(report.options.other_conditions)
 
-    if report.id in {"R02", "R03", "R04", "R05A", "R11", "R12"}:
+    if report.id in {"R02", "R03", "R05A", "R11", "R12"}:
         check = _replace_option(check, "顯示銷售分店", "顯示分店碼")
+    if report.id == "R04":
+        check = _replace_option(check, "顯示分店碼", "顯示銷售分店")
     if report.id in {"R11", "R12"}:
         check = _replace_option(check, "顯示銷售分攤金額", "銷售分攤金額")
     if report.id == "R05":
@@ -94,6 +237,7 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
         check = _remove_options(check, {"顯示分館"})
     if report.id in {"R09", "R10"}:
         check = _remove_options(check, {"顯示備註"})
+        check = _append_missing_options(check, ["限區間有消費", "含0元結單"])
     if report.id == "R06":
         check = _replace_option(check, "清單顯示", "清單檢視")
         report.output_filename = report.output_filename.replace("{branch_code}", "{branch_name}")
@@ -162,7 +306,7 @@ def _make_r05_report_from_legacy(
             "report_menu_text": "課程服務明細表",
             "branch_mode": "all",
             "date_range": source.date_range.model_dump(mode="json"),
-            "output_filename": "R05_諮詢師課程明細_二次篩選_{start}_{end}.xls",
+            "output_filename": "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls",
             "drive_folder_id": (legacy_r05b or source).drive_folder_id,
             "upload_enabled": source.upload_enabled,
             "options": {

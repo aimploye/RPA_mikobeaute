@@ -2,6 +2,7 @@ import os
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from time import monotonic, sleep
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -33,6 +34,17 @@ def _app() -> QApplication:
     return QApplication.instance() or QApplication([])
 
 
+def _process_events_until(condition, *, timeout_seconds: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+    deadline = monotonic() + timeout_seconds
+    app = _app()
+    while monotonic() < deadline:
+        app.processEvents()
+        if condition():
+            return
+        sleep(0.02)
+    raise AssertionError("condition was not met before timeout")
+
+
 def test_pyside_settings_window_can_be_created() -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
@@ -45,7 +57,7 @@ def test_pyside_settings_window_can_be_created() -> None:
     assert tabs.count() == 10
     table = window.findChild(QTableWidget, "drive_target_table")
     assert table is not None
-    assert table.rowCount() == 17
+    assert table.rowCount() == 18
     window.close()
 
 
@@ -62,6 +74,51 @@ def test_settings_window_can_save_and_reload_drive_target(tmp_path: Path) -> Non
     assert parse_drive_folder_id(reloaded.drive_targets.targets["R01"].folder_id_or_url) == "folder_456"
     assert "password" not in saved_path.read_text(encoding="utf-8").lower()
     assert "token" not in saved_path.read_text(encoding="utf-8").lower()
+    window.close()
+
+
+def test_settings_window_stores_pos_credential_in_keyring_only(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.login.username = "A0042"
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+    stored: dict[tuple[str, str], str] = {}
+
+    fake_keyring = SimpleNamespace(
+        set_password=lambda service, username, secret: stored.__setitem__((service, username), secret)
+    )
+    monkeypatch.setattr(main_window, "import_module", lambda name: fake_keyring if name == "keyring" else None)
+
+    result = window._store_pos_credential_value(username="A0042", secret="secret-for-test")
+    saved_path = window.save_settings(tmp_path / "app.yaml")
+    text = saved_path.read_text(encoding="utf-8").lower()
+
+    assert result.ok is True
+    assert stored == {("POSReportBot POS", "A0042"): "secret-for-test"}
+    assert "secret-for-test" not in text
+    assert "password" not in text
+    window.close()
+
+
+def test_settings_window_uses_transient_pos_secret_when_keyring_is_missing(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.login.username = "A0042"
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+
+    def fake_import_module(_name):  # type: ignore[no-untyped-def]
+        raise ImportError("No module named 'keyring'")
+
+    monkeypatch.setattr(main_window, "import_module", fake_import_module)
+    result = window._store_pos_credential_value(username="A0042", secret="secret-for-test")
+    saved_path = window.save_settings(tmp_path / "app.yaml")
+    text = saved_path.read_text(encoding="utf-8").lower()
+
+    assert result.ok is True
+    assert "本次程式執行期間暫存" in result.message
+    assert window._current_pos_login_secret() == "secret-for-test"
+    assert "secret-for-test" not in text
+    assert "password" not in text
     window.close()
 
 
@@ -217,6 +274,24 @@ def test_report_settings_table_saves_editable_values(tmp_path: Path) -> None:
     window.close()
 
 
+def test_report_settings_table_preserves_r13_full_menu_path(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+
+    report_entry = window.findChild(QLineEdit, "report_R13_report_menu_text")
+    assert report_entry is not None
+    assert report_entry.text() == "庫存管理 > 相關報表 > 沙貨耗材領用查詢表"
+
+    saved_path = window.save_settings(tmp_path / "app.yaml")
+    reloaded = load_project_config(saved_path)
+    r13 = next(report for report in reloaded.reports if report.id == "R13")
+
+    assert r13.report_menu_text == "沙貨耗材領用查詢表"
+    assert r13.menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
+    window.close()
+
+
 def test_settings_window_can_fill_all_drive_targets_and_dry_run_has_no_missing() -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
@@ -225,7 +300,7 @@ def test_settings_window_can_fill_all_drive_targets_and_dry_run_has_no_missing()
     window.fill_all_drive_targets_for_testing(prefix="folder")
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
-    assert payload["counts"]["outputs"] == 17
+    assert payload["counts"]["outputs"] == 18
     assert payload["counts"]["missing_drive_targets"] == 0
     window.close()
 
@@ -238,8 +313,8 @@ def test_settings_window_can_trigger_dry_run_without_pos() -> None:
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
     assert payload["mode"] == "dry_run"
-    assert payload["counts"]["outputs"] == 17
-    assert payload["counts"]["missing_drive_targets"] == 17
+    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["missing_drive_targets"] == 0
     window.close()
 
 
@@ -255,7 +330,7 @@ def test_dry_run_button_updates_status_and_result() -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert window.last_dry_run_payload is not None
-    assert window.last_dry_run_payload["counts"]["outputs"] == 17
+    assert window.last_dry_run_payload["counts"]["outputs"] == 18
     assert "Dry-run 完成" in window.statusBar().currentMessage()
     window.close()
 
@@ -280,7 +355,36 @@ def test_save_settings_button_persists_drive_table_edits(tmp_path: Path) -> None
     window.close()
 
 
-def test_pos_test_button_returns_visible_friendly_error() -> None:
+def test_google_drive_upload_test_parses_folder_url(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.state_dir = str(tmp_path)
+    window = SettingsMainWindow(config)
+    uploaded: dict[str, str] = {}
+
+    class FakeGoogleDriveUploader:
+        def __init__(self, _oauth):  # type: ignore[no-untyped-def]
+            pass
+
+        def upload(self, file_path, folder_id, name):  # type: ignore[no-untyped-def]
+            uploaded["folder_id"] = folder_id
+            uploaded["name"] = name
+            return SimpleNamespace(success=True, error_code=None, message="ok")
+
+    monkeypatch.setattr(main_window, "GoogleDriveUploader", FakeGoogleDriveUploader)
+    editor = window.findChild(QLineEdit, "drive_target_R01")
+    assert editor is not None
+    editor.setText("https://drive.google.com/drive/folders/folder_from_url?usp=sharing")
+
+    result = window.test_google_drive_upload()
+
+    assert result.ok is True
+    assert uploaded["folder_id"] == "folder_from_url"
+    assert uploaded["name"] == "google_drive_upload_test.txt"
+    window.close()
+
+
+def test_pos_test_button_returns_visible_friendly_error_for_missing_default_executable() -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     window = SettingsMainWindow(config)
@@ -291,8 +395,8 @@ def test_pos_test_button_returns_visible_friendly_error() -> None:
 
     assert window.last_action_result is not None
     assert window.last_action_result.ok is False
-    assert window.last_action_result.error_code == "POS_EXECUTABLE_NOT_CONFIGURED"
-    assert "POS exe 路徑" in window.statusBar().currentMessage()
+    assert window.last_action_result.error_code == "POS_EXECUTABLE_NOT_FOUND"
+    assert "找不到 POS 啟動檔" in window.statusBar().currentMessage()
     window.close()
 
 
@@ -352,7 +456,8 @@ def test_export_ui_probe_button_writes_report_from_open_pos_window(
 
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
-    reports = list(tmp_path.glob("ui_probe_*.json"))
+    dated_screenshots_dir = tmp_path / date.today().strftime("%Y%m%d")
+    reports = list(dated_screenshots_dir.glob("ui_probe_*.json"))
     assert len(reports) == 1
     assert "UI 探測報告已匯出" in window.statusBar().currentMessage()
     window.close()
@@ -386,13 +491,14 @@ def test_report_entry_probe_finds_expected_report_menu_names_with_mock_window() 
             FakeControl("會員剩餘點數殘值統計表"),
             FakeControl("預約紀錄查詢統計表"),
             FakeControl("客戶來源與產值統計表"),
+            FakeControl("沙貨耗材領用查詢表"),
         ],
     )
 
     result = window.probe_report_entries(fake_window)
 
     assert result.ok is True
-    assert "5/5" in result.message
+    assert "6/6" in result.message
     window.close()
 
 
@@ -411,6 +517,7 @@ def test_report_entry_probe_uses_cached_probe_report_and_normalized_names() -> N
             FakeControl("會員剩餘點數殘值統計表"),
             FakeControl("預約紀錄查詢統計表"),
             FakeControl("客戶來源與產值統計表"),
+            FakeControl("沙貨耗材領用查詢表"),
         ],
     )
     probe_result = window.probe_pos_controls(fake_window)
@@ -419,7 +526,7 @@ def test_report_entry_probe_uses_cached_probe_report_and_normalized_names() -> N
 
     assert probe_result.ok is True
     assert result.ok is True
-    assert "5/5" in result.message
+    assert "6/6" in result.message
     window.close()
 
 
@@ -447,6 +554,7 @@ def test_report_entry_probe_counts_collapsed_menu_items_from_probe_report() -> N
                 "會員剩餘點數殘值統計表",
                 "預約紀錄查詢統計表",
                 "客戶來源與產值統計表",
+                "沙貨耗材領用查詢表",
             ]
         ],
     )
@@ -454,7 +562,7 @@ def test_report_entry_probe_counts_collapsed_menu_items_from_probe_report() -> N
     result = window.probe_report_entries()
 
     assert result.ok is True
-    assert "5/5" in result.message
+    assert "6/6" in result.message
     window.close()
 
 
@@ -482,6 +590,7 @@ def test_report_entry_probe_falls_back_to_latest_saved_ui_probe_report(tmp_path:
                 "會員剩餘點數殘值統計表",
                 "預約紀錄查詢統計表",
                 "客戶來源與產值統計表",
+                "沙貨耗材領用查詢表",
             ]
         ],
     )
@@ -494,7 +603,7 @@ def test_report_entry_probe_falls_back_to_latest_saved_ui_probe_report(tmp_path:
     result = window.probe_report_entries(FakeControl("SPA-POS", [FakeControl("主畫面")]))
 
     assert result.ok is True
-    assert "5/5" in result.message
+    assert "6/6" in result.message
     window.close()
 
 
@@ -503,15 +612,18 @@ def test_report_entry_probe_clicks_statistics_menu_before_live_probe() -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     window = SettingsMainWindow(config)
     stats_menu = FakePosControl("統計報表", "MenuItem")
+    inventory_menu = FakePosControl("庫存管理", "MenuItem")
     fake_window = FakePosControl(
         "SPA-POS",
         children=[
             stats_menu,
+            inventory_menu,
             FakePosControl("商品銷售明細表", "MenuItem"),
             FakePosControl("課程服務明細表", "MenuItem"),
             FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
             FakePosControl("客戶來源與產值統計表", "MenuItem"),
             FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+            FakePosControl("沙貨耗材領用查詢表", "MenuItem"),
         ],
     )
 
@@ -519,6 +631,7 @@ def test_report_entry_probe_clicks_statistics_menu_before_live_probe() -> None:
 
     assert result.ok is True
     assert stats_menu.clicked is True
+    assert inventory_menu.clicked is True
     window.close()
 
 
@@ -551,6 +664,9 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     config.app.downloads_dir = str(tmp_path)
+    config.app.state_dir = str(tmp_path / "state")
+    for report in config.reports:
+        report.upload_enabled = False
     window = SettingsMainWindow(config)
     fake_window = FakePosControl(
         "SPA-POS",
@@ -577,10 +693,19 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
     only_r01.click()
     execute.click()
 
+    dated_downloads_dir = tmp_path / date.today().strftime("%Y%m%d")
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert "已開始背景執行" in window.last_action_result.message
+    _process_events_until(
+        lambda: window._automation_thread is None and len(list(dated_downloads_dir.glob("課程服務明細表-*.xls"))) == 1
+    )
+
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert "已完成 1 個 POS 報表下載" in window.statusBar().currentMessage()
-    assert len(list(tmp_path.glob("R01_*.xls"))) == 1
+    assert len(list(dated_downloads_dir.glob("課程服務明細表-*.xls"))) == 1
+    assert (tmp_path / "state" / date.today().strftime("%Y%m%d") / "run_state_latest.json").exists()
     window.close()
 
 
@@ -590,8 +715,10 @@ def test_dashboard_execute_continues_after_failed_report_and_shows_copyable_warn
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     config.app.downloads_dir = str(tmp_path)
+    config.app.state_dir = str(tmp_path / "state")
     for report in config.reports:
         report.enabled = report.id in {"R01", "R02", "R03"}
+        report.upload_enabled = False
     window = SettingsMainWindow(config)
     calls: list[str] = []
 
@@ -625,6 +752,7 @@ def test_dashboard_execute_continues_after_failed_report_and_shows_copyable_warn
     assert result.error_code == "PARTIAL_REPORT_RUN_FAILED"
     assert result.details is not None
     assert "任務：R02" in result.details
+    assert (tmp_path / "state" / date.today().strftime("%Y%m%d") / "run_state_latest.json").exists()
 
     recorded = window._record_action_result(result)
     assert recorded is result
@@ -638,13 +766,14 @@ def test_dashboard_execute_continues_after_failed_report_and_shows_copyable_warn
 def test_settings_window_pos_test_returns_friendly_error_without_pos_path() -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.pos.executable_path = ""
     window = SettingsMainWindow(config)
 
     result = window.test_pos_connection()
 
     assert result.ok is False
-    assert result.error_code == "POS_EXECUTABLE_NOT_CONFIGURED"
-    assert "POS exe 路徑" in result.message
+    assert result.error_code == "POS_EXECUTABLE_NOT_FOUND"
+    assert "找不到 POS 啟動檔" in result.message
     window.close()
 
 

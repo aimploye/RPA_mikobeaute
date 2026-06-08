@@ -19,7 +19,10 @@ class AppSettings(StrictBaseModel):
 
 
 class PosSettings(StrictBaseModel):
-    executable_path: str = ""
+    executable_path: str = (
+        "C:\\Users\\MIKO\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\"
+        "台灣凱惠資訊科技有限公司\\SPA1\\SPA資訊服務應用系統.appref-ms"
+    )
     launch_args: str = ""
     working_dir: str = ""
     window_title_contains: str = "SPA-POS"
@@ -27,11 +30,12 @@ class PosSettings(StrictBaseModel):
     backend: Literal["auto", "uia", "win32"] = "auto"
     startup_wait_seconds: int = 20
     run_as_admin: bool = False
+    close_after_run: bool = False
 
 
 class LoginSettings(StrictBaseModel):
-    required: bool = False
-    username: str = ""
+    required: bool = True
+    username: str = "A0042"
     company_code: str = ""
     login_button_text: str = "登入"
     login_success_text: str = "統計報表"
@@ -50,6 +54,7 @@ class SaveAsSettings(StrictBaseModel):
 
 
 class GoogleDriveSettings(StrictBaseModel):
+    upload_enabled: bool = False
     auth_mode: str = "drive_api"
     allow_folder_url_or_id: bool = True
     token_storage: str = "keyring"
@@ -62,7 +67,9 @@ class EmailSettings(StrictBaseModel):
     smtp_port: int = 587
     use_tls: bool = True
     username: str = ""
-    recipients: list[str] = Field(default_factory=list)
+    recipients: list[str] = Field(
+        default_factory=lambda: ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
+    )
     cc: list[str] = Field(default_factory=list)
     notify_on_failure: bool = True
     notify_on_success_summary: bool = True
@@ -70,10 +77,10 @@ class EmailSettings(StrictBaseModel):
 
 class SchedulerSettings(StrictBaseModel):
     enabled: bool = False
-    daily_time: str = "07:30"
-    weekly_enabled: bool = True
+    daily_time: str = "01:00"
+    weekly_enabled: bool = False
     weekly_day: str = "Thursday"
-    weekly_time: str = "07:30"
+    weekly_time: str = "01:00"
     retry_count: int = 2
     retry_interval_seconds: int = 60
 
@@ -87,6 +94,17 @@ class PosUpdateSettings(StrictBaseModel):
     restart_wait_seconds: int = 180
     max_restart_wait_seconds: int = 600
     resume_unfinished_tasks: bool = True
+
+
+class PosRecoverySettings(StrictBaseModel):
+    enabled: bool = False
+    health_check_interval_seconds: int = 5
+    restart_delay_seconds: int = 5
+    max_restarts_per_run: int = 2
+    kill_process_on_hang: bool = True
+    relaunch_after_kill: bool = True
+    retry_current_task_after_restart: bool = True
+    credential_keyring_service: str = "POSReportBot POS"
 
 
 class BranchConfig(StrictBaseModel):
@@ -117,6 +135,7 @@ class ReportConfig(StrictBaseModel):
     name: str
     handler: str
     report_menu_text: str
+    menu_path: list[str] = Field(default_factory=list)
     branch_mode: Literal["all", "each_branch", "multi_select", "single"]
     date_range: DateRangeConfig
     output_filename: str
@@ -148,6 +167,7 @@ class ProjectConfig(StrictBaseModel):
     email: EmailSettings
     scheduler: SchedulerSettings
     pos_update: PosUpdateSettings
+    pos_recovery: PosRecoverySettings = Field(default_factory=PosRecoverySettings)
     reports: list[ReportConfig]
     branches: list[BranchConfig]
     drive_targets: DriveTargetsConfig

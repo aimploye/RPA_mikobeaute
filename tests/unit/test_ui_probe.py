@@ -94,6 +94,30 @@ def test_probe_window_controls_supports_mock_window() -> None:
     assert [control.depth for control in report.controls] == [0, 1, 2]
 
 
+def test_probe_window_controls_limits_default_depth_to_avoid_large_report_tables() -> None:
+    current = FakeControl("depth_12")
+    for depth in range(11, -1, -1):
+        current = FakeControl(f"depth_{depth}", [current])
+
+    report = probe_window_controls(current, window_title="SPA-POS", backend="mock")
+
+    names = [control.name for control in report.controls]
+    assert "depth_9" in names
+    assert "depth_10" not in names
+    assert "depth_11" not in names
+    assert "depth_12" not in names
+
+
+def test_probe_window_controls_allows_explicit_deeper_probe_for_diagnostics() -> None:
+    current = FakeControl("depth_12")
+    for depth in range(11, -1, -1):
+        current = FakeControl(f"depth_{depth}", [current])
+
+    report = probe_window_controls(current, window_title="SPA-POS", backend="mock", max_depth=12)
+
+    assert "depth_12" in [control.name for control in report.controls]
+
+
 def test_connect_pos_window_returns_clear_error_without_windows_pos() -> None:
     if sys.platform.startswith("win"):
         pytest.skip("This test covers non-Windows no-POS behavior only.")

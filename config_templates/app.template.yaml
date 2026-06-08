@@ -9,7 +9,7 @@ app:
   language: "zh-TW"
 
 pos:
-  executable_path: ""
+  executable_path: "C:\\Users\\MIKO\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\台灣凱惠資訊科技有限公司\\SPA1\\SPA資訊服務應用系統.appref-ms"
   launch_args: ""
   working_dir: ""
   window_title_contains: "SPA-POS"
@@ -17,10 +17,11 @@ pos:
   backend: "auto"   # auto | uia | win32
   startup_wait_seconds: 20
   run_as_admin: false
+  close_after_run: false
 
 login:
-  required: false
-  username: ""
+  required: true
+  username: "A0042"
   company_code: ""
   login_button_text: "登入"
   login_success_text: "統計報表"
@@ -37,6 +38,7 @@ save_as:
   stable_seconds: 3
 
 google_drive:
+  upload_enabled: false
   auth_mode: "drive_api"
   allow_folder_url_or_id: true
   token_storage: "keyring"
@@ -48,17 +50,19 @@ email:
   smtp_port: 587
   use_tls: true
   username: ""
-  recipients: []
+  recipients:
+    - "joe.little7208@gmail.com"
+    - "jamie.yeh@bebetterone.com"
   cc: []
   notify_on_failure: true
   notify_on_success_summary: true
 
 scheduler:
   enabled: false
-  daily_time: "07:30"
-  weekly_enabled: true
+  daily_time: "01:00"
+  weekly_enabled: false
   weekly_day: "Thursday"
-  weekly_time: "07:30"
+  weekly_time: "01:00"
   retry_count: 2
   retry_interval_seconds: 60
 
@@ -71,3 +75,13 @@ pos_update:
   restart_wait_seconds: 180
   max_restart_wait_seconds: 600
   resume_unfinished_tasks: true
+
+pos_recovery:
+  enabled: false
+  health_check_interval_seconds: 5
+  restart_delay_seconds: 5
+  max_restarts_per_run: 2
+  kill_process_on_hang: true
+  relaunch_after_kill: true
+  retry_current_task_after_restart: true
+  credential_keyring_service: "POSReportBot POS"

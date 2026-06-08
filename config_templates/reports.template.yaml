@@ -9,7 +9,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R01_每日課程服務明細表_新舊客_{start}_{end}.xls"
+    output_filename: "課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -30,7 +30,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R02_每日商品銷售明細表_新舊客_{start}_{end}.xls"
+    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -51,7 +51,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R03_每日商品銷售明細表_僅新客_{start}_{end}.xls"
+    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部-僅新客.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -72,11 +72,11 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R04_每日商品銷售明細表_二次篩選_{start}_{end}.xls"
+    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示分店碼", "顯示客代與電話", "顯示退費"]
+      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
       uncheck: ["不列明細"]
       other_conditions: ["二次篩選"]
     max_wait_seconds: 300
@@ -93,7 +93,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R05_諮詢師課程明細_二次篩選_{start}_{end}.xls"
+    output_filename: "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -114,7 +114,7 @@ reports:
     date_range:
       start: "2024/01/01"
       end: "{yesterday}"
-    output_filename: "R06_{branch_name}_會員剩餘點數殘值統計表_{end}.xls"
+    output_filename: "會員剩餘點數殘值統計表-清單檢視{today_yymmdd}-{branch_name}.xls"
     upload_enabled: true
     branch_drive_folder_ids:
       N001: ""
@@ -141,7 +141,7 @@ reports:
     date_range:
       start: "{yesterday}"
       end: "{yesterday}"
-    output_filename: "R07_每日預約_截至前一日_{start}.xls"
+    output_filename: "預約資料統計報表-前一天{yesterday_yymmdd}-前一天{yesterday_yymmdd}.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -162,7 +162,7 @@ reports:
     date_range:
       start: "{today}"
       end: "{today}"
-    output_filename: "R08_每日預約_當日應到_{start}.xls"
+    output_filename: "預約資料統計報表-當天{today_yymmdd}-當天{today_yymmdd}.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -183,12 +183,12 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R09_客戶來源與產值_性別年齡_{start}_{end}.xls"
+    output_filename: "客戶來源與產值報表-.-當天{today_yymmdd}-顯示性別年齡.xls"
     drive_folder_id: ""
     upload_enabled: true
     variant: "gender_age"
     options:
-      check: []
+      check: ["限區間有消費", "含0元結單"]
       uncheck: []
       other_conditions: ["顯示性別年齡"]
     max_wait_seconds: 300
@@ -205,12 +205,12 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R10_客戶來源與產值_服務人員_{start}_{end}.xls"
+    output_filename: "客戶來源與產值報表-.-當天{today_yymmdd}-顯示服務人員.xls"
     drive_folder_id: ""
     upload_enabled: true
     variant: "service_staff"
     options:
-      check: []
+      check: ["限區間有消費", "含0元結單"]
       uncheck: []
       other_conditions: ["顯示服務人員"]
     max_wait_seconds: 300
@@ -227,7 +227,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R11_商品銷售明細_新客分攤金額_{start}_{end}.xls"
+    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-僅新客.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -248,13 +248,35 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "R12_商品銷售明細_二次篩選分攤金額_{start}_{end}.xls"
+    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
       check: ["顯示分店碼", "銷售分攤金額", "顯示退費"]
       uncheck: ["不列明細"]
       other_conditions: ["二次篩選"]
+    max_wait_seconds: 300
+    retry_count: 1
+    real_pos_validation_status: "pending_real_pos_validation"
+
+  - id: "R13"
+    enabled: true
+    frequency: "daily"
+    name: "每日 沙貨耗材領用查詢表"
+    handler: "inventory_consumable_usage"
+    report_menu_text: "沙貨耗材領用查詢表"
+    menu_path: ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
+    branch_mode: "all"
+    date_range:
+      start: "{month_start}"
+      end: "{yesterday}"
+    output_filename: "診所stock status - {today_year} demand planning-{today_mmdd}.xls"
+    drive_folder_id: ""
+    upload_enabled: true
+    options:
+      check: ["顯示課程耗用"]
+      uncheck: []
+      other_conditions: []
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"

@@ -13,6 +13,12 @@ def test_resolve_relative_date_tokens_from_injected_today() -> None:
     assert resolve_date_token("{month_start}", today=today) == date(2026, 5, 1)
 
 
+def test_month_start_uses_yesterdays_month_for_month_boundary() -> None:
+    assert resolve_date_token("{month_start}", today=date(2026, 6, 1)) == date(2026, 5, 1)
+    assert resolve_date_token("{month_start}", today=date(2026, 6, 2)) == date(2026, 6, 1)
+    assert resolve_date_token("{month_start}", today=date(2026, 6, 3)) == date(2026, 6, 1)
+
+
 def test_resolve_fixed_and_literal_dates() -> None:
     today = date(2026, 5, 13)
 

@@ -11,6 +11,10 @@ dependencies = [
   "pydantic>=2.8",
   "PyYAML>=6.0",
   "PySide6>=6.7",
+  "google-api-python-client>=2.140",
+  "google-auth-httplib2>=0.2",
+  "google-auth-oauthlib>=1.2",
+  "keyring>=25.0",
   "pywinauto>=0.6.8",
   "pywin32>=306; sys_platform == 'win32'",
 ]

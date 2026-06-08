@@ -33,7 +33,7 @@
 
 欄位：
 
-- POS exe 路徑
+- POS 啟動路徑（.appref-ms 或 SPA1.exe）
 - 啟動參數
 - 工作目錄
 - 視窗標題包含，預設 `SPA-POS`

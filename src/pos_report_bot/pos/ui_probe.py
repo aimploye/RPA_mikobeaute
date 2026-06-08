@@ -5,6 +5,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+DEFAULT_PROBE_MAX_DEPTH = 9
+DEFAULT_PROBE_MAX_CONTROLS = 1000
+
 
 class UiProbeError(RuntimeError):
     pass
@@ -61,9 +64,16 @@ def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str =
     )
 
 
-def probe_window_controls(window: Any, *, window_title: str, backend: str) -> UiProbeReport:
+def probe_window_controls(
+    window: Any,
+    *,
+    window_title: str,
+    backend: str,
+    max_depth: int = DEFAULT_PROBE_MAX_DEPTH,
+    max_controls: int = DEFAULT_PROBE_MAX_CONTROLS,
+) -> UiProbeReport:
     records: list[ControlProbeRecord] = []
-    _collect_control_records(window, depth=0, records=records)
+    _collect_control_records(window, depth=0, records=records, max_depth=max_depth, max_controls=max_controls)
     return UiProbeReport(window_title=window_title, backend=actual_window_backend(window, backend), controls=records)
 
 
@@ -73,10 +83,29 @@ def write_probe_report(report: UiProbeReport, path: Path) -> Path:
     return path
 
 
-def _collect_control_records(control: Any, *, depth: int, records: list[ControlProbeRecord]) -> None:
+def _collect_control_records(
+    control: Any,
+    *,
+    depth: int,
+    records: list[ControlProbeRecord],
+    max_depth: int,
+    max_controls: int,
+) -> None:
+    if len(records) >= max_controls:
+        return
     records.append(_record_from_control(control, depth=depth))
+    if depth >= max_depth:
+        return
     for child in _safe_call(control, "children", default=[]):
-        _collect_control_records(child, depth=depth + 1, records=records)
+        if len(records) >= max_controls:
+            return
+        _collect_control_records(
+            child,
+            depth=depth + 1,
+            records=records,
+            max_depth=max_depth,
+            max_controls=max_controls,
+        )
 
 
 def _record_from_control(control: Any, *, depth: int) -> ControlProbeRecord:

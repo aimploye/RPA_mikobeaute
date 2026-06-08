@@ -13,7 +13,7 @@
 ### B. 設定中心
 
 - 可設定工作目錄。
-- 可設定 POS exe 路徑與 window title contains。
+- 可設定 POS 啟動路徑（.appref-ms 或 SPA1.exe）與 window title contains。
 - 可設定 Google Drive 授權。
 - 可設定每個任務的 folder ID。
 - R06 可設定每個分館的 folder ID。

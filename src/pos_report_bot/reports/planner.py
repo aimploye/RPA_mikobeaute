@@ -1,17 +1,24 @@
 from datetime import date
 
 from pos_report_bot.config.models import BranchConfig, ProjectConfig, ReportConfig
-from pos_report_bot.core.dates import format_filename_date, format_pos_date, resolve_date_token
+from pos_report_bot.core.dates import (
+    format_filename_date,
+    format_filename_date_short,
+    format_filename_month_day,
+    format_filename_year,
+    format_pos_date,
+    resolve_date_token,
+)
 from pos_report_bot.drive.folder_id import parse_drive_folder_id
 from pos_report_bot.reports.models import DryRunPlan, PlannedOutput
 
 BRANCH_FILENAME_NAMES = {
-    "N001": "站前4樓",
-    "N002": "站前11樓",
-    "N003": "忠孝7樓",
-    "N004": "忠孝國際醫學3樓",
-    "N005": "忠孝健康7樓",
-    "N006": "忠孝預防醫學3樓",
+    "N001": "站前4F",
+    "N002": "站前11F",
+    "N003": "忠孝7F",
+    "N004": "忠孝國際3F",
+    "N005": "忠孝健康7F",
+    "N006": "忠孝預防醫學3F",
 }
 
 
@@ -49,6 +56,7 @@ def _build_output(
         frequency=report.frequency,
         handler=report.handler,
         report_menu_text=report.report_menu_text,
+        menu_path=list(report.menu_path),
         branch_mode=report.branch_mode,
         branch_code=branch.code if branch else None,
         branch_display_name=branch.display_name if branch else None,
@@ -92,9 +100,15 @@ def _format_output_filename(
     yesterday = resolve_date_token("{yesterday}", today=today)
     return template.format(
         start=format_filename_date(start),
+        start_yymmdd=format_filename_date_short(start),
         end=format_filename_date(end),
+        end_yymmdd=format_filename_date_short(end),
         today=format_filename_date(today),
+        today_yymmdd=format_filename_date_short(today),
+        today_year=format_filename_year(today),
+        today_mmdd=format_filename_month_day(today),
         yesterday=format_filename_date(yesterday),
+        yesterday_yymmdd=format_filename_date_short(yesterday),
         branch_code=branch.code if branch else "",
         branch_name=_safe_filename_branch_name(branch) if branch else "",
     )

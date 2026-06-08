@@ -4,32 +4,34 @@
 
 drive_targets:
   R01:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1DibytnRl9054M65TMUVfHNSTIAeQ-ghF"
   R02:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"
   R03:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"
   R04:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1iIwcWtj4Vs5yFf4YN_iU2pnkbMNWj9sl"
   R05:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/11W0BAM7l4XbI4iaIEWLbfuFJbgbln4BH"
   R06:
     branches:
-      N001: ""
-      N002: ""
-      N003: ""
-      N004: ""
-      N005: ""
-      N006: ""
+      N001: "https://drive.google.com/drive/u/6/folders/1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG"
+      N002: "https://drive.google.com/drive/u/6/folders/1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG"
+      N003: "https://drive.google.com/drive/u/6/folders/1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG"
+      N004: "https://drive.google.com/drive/u/6/folders/1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG"
+      N005: "https://drive.google.com/drive/u/6/folders/1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG"
+      N006: "https://drive.google.com/drive/u/6/folders/1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG"
   R07:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1NHEkCC4jT7lZkyqlqUdBg9ftwiR63B73"
   R08:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1q8FGPQj4CUtC1YyNV3O8elHPh7IF1YYE"
   R09:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1bdKGOQtys0QogaNNlMZPFJT_MH0BIhNI"
   R10:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1OqQQFQr2RhpgT5U4Po6Xj4FgidzynLnU"
   R11:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1jXBVMvFyOOshoUBp2XtGsRhvjv2t_xpv"
   R12:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/138OFGxT7UghB5HkjIsUsXIkT6vOpqoXl"
+  R13:
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1ti3TAtYg7anbwglrR2eSzT-TkPYme3Ys"

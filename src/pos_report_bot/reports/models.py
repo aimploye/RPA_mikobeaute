@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class PlannedOutput(BaseModel):
@@ -7,6 +7,7 @@ class PlannedOutput(BaseModel):
     frequency: str
     handler: str
     report_menu_text: str
+    menu_path: list[str] = Field(default_factory=list)
     branch_mode: str
     branch_code: str | None
     branch_display_name: str | None

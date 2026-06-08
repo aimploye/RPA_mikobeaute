@@ -38,6 +38,12 @@ def test_settings_pages_cover_required_sections_without_importing_pyside() -> No
         "測試上傳",
         "立即 Dry-run",
     ]
+    assert next(page for page in pages if page.page_id == "schedule").actions == [
+        "儲存排程設定",
+        "安裝 Windows Task Scheduler",
+        "移除 Windows Task Scheduler",
+        "檢查排程狀態",
+    ]
 
 
 def test_settings_pages_reflect_loaded_config_counts() -> None:
@@ -48,4 +54,4 @@ def test_settings_pages_reflect_loaded_config_counts() -> None:
     reports = next(page for page in pages if page.page_id == "reports")
 
     assert branches.badge == "6 enabled"
-    assert reports.badge == "12 enabled"
+    assert reports.badge == "13 enabled"

@@ -1,12 +1,16 @@
 import os
+import re
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,11 +33,17 @@ from PySide6.QtWidgets import (
 )
 
 from pos_report_bot import __version__
+from pos_report_bot.app.automation_runner import AutomationProgress, AutomationRunSummary, AutomationRunner
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
+from pos_report_bot.drive.folder_id import parse_drive_folder_id
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
-from pos_report_bot.notifier.email import send_failure_notification
-from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
+from pos_report_bot.drive.uploader import GoogleDriveUploader
+from pos_report_bot.google.gmail import GmailOAuthSender
+from pos_report_bot.google.oauth import GoogleOAuthService
+from pos_report_bot.pos.launcher import resolve_pos_executable_path
+from pos_report_bot.pos.report_automation import ReportAutomationError as _ReportAutomationError
+from pos_report_bot.pos.report_automation import ReportWindowAutomator
 from pos_report_bot.pos.save_as_handler import OverwritePolicy, WindowsSaveAsHandler
 from pos_report_bot.pos.ui_probe import (
     UiProbeError,
@@ -44,6 +54,10 @@ from pos_report_bot.pos.ui_probe import (
     write_probe_report,
 )
 from pos_report_bot.reports.planner import build_dry_run_plan
+from pos_report_bot.scheduler.windows_task_scheduler import DEFAULT_TASK_NAME, install_task, query_task, remove_task
+from pos_report_bot.storage.runtime_paths import RuntimePaths, dated_runtime_dir
+
+ReportAutomationError = _ReportAutomationError
 
 
 class SettingsPageContract(BaseModel):
@@ -61,13 +75,27 @@ class GuiActionResult(BaseModel):
     details: str | None = None
 
 
-@dataclass(frozen=True)
-class ReportRunFailure:
-    task_id: str
-    output_filename: str
-    error_code: str
-    message: str
-    diagnostic_path: str | None = None
+class AutomationRunWorker(QObject):
+    progress = Signal(object)
+    finished = Signal(object)
+
+    def __init__(self, runner: AutomationRunner) -> None:
+        super().__init__()
+        self.runner = runner
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            summary = self.runner.run(on_progress=self.progress.emit)
+        except Exception as exc:
+            summary = AutomationRunSummary(
+                ok=False,
+                completed=0,
+                total=0,
+                error_code="UNEXPECTED_AUTOMATION_ERROR",
+                message=f"背景自動化執行發生未預期錯誤：{exc}",
+            )
+        self.finished.emit(summary)
 
 
 @dataclass(frozen=True)
@@ -100,13 +128,14 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
         SettingsPageContract(
             page_id="pos",
             title="POS 設定",
-            fields=["POS exe 路徑", "啟動參數", "工作目錄", "視窗標題包含", "視窗標題 regex", "automation backend"],
+            fields=["POS 啟動路徑（.appref-ms 或 SPA1.exe）", "啟動參數", "工作目錄", "視窗標題包含", "視窗標題 regex", "automation backend"],
             actions=["測試啟動 POS", "連接已開啟 POS", "探測 POS 畫面元件", "測報表入口", "匯出 UI 探測報告"],
         ),
         SettingsPageContract(
             page_id="login",
             title="登入設定",
             fields=["是否需要登入", "帳號", "密碼", "分店/公司代號", "登入按鈕文字", "登入逾時秒數"],
+            actions=["儲存 POS 憑證"],
         ),
         SettingsPageContract(
             page_id="branches",
@@ -136,8 +165,8 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
         SettingsPageContract(
             page_id="schedule",
             title="排程設定",
-            fields=["啟用每日排程", "每日時間", "啟用每週任務", "每週日", "週四更新策略", "失敗重試次數"],
-            actions=["安裝 Windows Task Scheduler", "移除 Windows Task Scheduler", "檢查排程狀態"],
+            fields=["啟用每日排程", "每日時間", "失敗重試次數", "重試間隔秒數"],
+            actions=["儲存排程設定", "安裝 Windows Task Scheduler", "移除 Windows Task Scheduler", "檢查排程狀態"],
         ),
         SettingsPageContract(
             page_id="diagnostics",
@@ -157,10 +186,15 @@ class SettingsMainWindow(QMainWindow):
         self.last_dry_run_payload: dict[str, Any] | None = None
         self.last_ui_probe_report: Any | None = None
         self._open_error_dialogs: list[QDialog] = []
+        self._automation_thread: QThread | None = None
+        self._automation_worker: AutomationRunWorker | None = None
+        self._last_automation_progress: AutomationProgress | None = None
         self._drive_target_table: QTableWidget | None = None
         self._branches_table: QTableWidget | None = None
         self._reports_table: QTableWidget | None = None
         self._setting_editors: dict[str, QLineEdit | QCheckBox | QSpinBox | QComboBox] = {}
+        self._pos_login_secret_editor: QLineEdit | None = None
+        self._transient_pos_login_secret: str = ""
         self.setWindowTitle("POSReportBot 設定中心")
         self.resize(1100, 720)
 
@@ -196,7 +230,54 @@ class SettingsMainWindow(QMainWindow):
 
     def save_settings(self, path: Path) -> Path:
         self._sync_gui_to_config()
-        return save_project_config(self.config, path)
+        saved_path = save_project_config(self.config, path)
+        self.settings_path = saved_path
+        return saved_path
+
+    def _handle_scheduler_action(self, action: str) -> GuiActionResult:
+        if action == "儲存排程設定":
+            self._sync_gui_to_config()
+            self.config.scheduler.weekly_enabled = False
+            saved_path = save_project_config(self.config, self.settings_path)
+            self.settings_path = saved_path
+            return GuiActionResult(ok=True, message=f"排程設定已儲存：每日 {self.config.scheduler.daily_time}，設定檔：{saved_path}")
+        if action == "安裝 Windows Task Scheduler":
+            self._sync_gui_to_config()
+            self.config.scheduler.weekly_enabled = False
+            saved_path = save_project_config(self.config, self.settings_path)
+            self.settings_path = saved_path
+            result = install_task(
+                self.config.scheduler,
+                task_name=DEFAULT_TASK_NAME,
+                python_exe=str(Path(sys.executable)),
+                config_path=str(saved_path),
+                retry_elevated_on_access_denied=True,
+            )
+            return self._gui_result_from_scheduler_result(result)
+        if action == "移除 Windows Task Scheduler":
+            return self._gui_result_from_scheduler_result(remove_task(task_name=DEFAULT_TASK_NAME))
+        if action == "檢查排程狀態":
+            return self._gui_result_from_scheduler_result(query_task(task_name=DEFAULT_TASK_NAME))
+        return GuiActionResult(ok=False, error_code="UNKNOWN_SCHEDULER_ACTION", message=f"未知排程動作：{action}")
+
+    def _gui_result_from_scheduler_result(self, result: Any) -> GuiActionResult:
+        command = " ".join(str(part) for part in result.command)
+        details = "\n".join(
+            part
+            for part in (
+                f"command: {command}",
+                f"returncode: {result.returncode}" if result.returncode is not None else "",
+                f"stdout:\n{result.stdout}".strip() if result.stdout else "",
+                f"stderr:\n{result.stderr}".strip() if result.stderr else "",
+            )
+            if part
+        )
+        return GuiActionResult(
+            ok=bool(result.ok),
+            error_code=None if result.ok else "WINDOWS_SCHEDULER_FAILED",
+            message=str(result.message),
+            details=details,
+        )
 
     def trigger_dry_run(self, *, today: date | None = None) -> dict[str, Any]:
         self._sync_gui_to_config()
@@ -208,19 +289,14 @@ class SettingsMainWindow(QMainWindow):
         self._refresh_drive_target_table()
 
     def test_pos_connection(self) -> GuiActionResult:
-        if not self.config.pos.executable_path:
-            return GuiActionResult(
-                ok=False,
-                error_code="POS_EXECUTABLE_NOT_CONFIGURED",
-                message="尚未設定 POS exe 路徑，無法測試啟動 POS。",
-            )
-        executable_path = Path(self.config.pos.executable_path)
-        if not executable_path.exists():
+        resolution = resolve_pos_executable_path(self.config.pos.executable_path)
+        if not resolution.ok or resolution.path is None:
             return GuiActionResult(
                 ok=False,
                 error_code="POS_EXECUTABLE_NOT_FOUND",
-                message=f"找不到 POS exe 路徑：{executable_path}",
+                message=resolution.failure_message(),
             )
+        executable_path = resolution.path
 
         try:
             self._launch_pos_executable(executable_path)
@@ -291,7 +367,7 @@ class SettingsMainWindow(QMainWindow):
             return window_result
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = Path(self.config.app.screenshots_dir) / f"ui_probe_{timestamp}.json"
+        report_path = dated_runtime_dir(self.config.app.screenshots_dir, run_date=date.today()) / f"ui_probe_{timestamp}.json"
         result = self.export_ui_probe_report(window_result, report_path)
         if result.ok:
             report = probe_window_controls(
@@ -321,7 +397,7 @@ class SettingsMainWindow(QMainWindow):
                 )
 
         if report is None:
-            self._open_report_root_menu_for_probe(window)
+            self._open_report_root_menus_for_probe(window)
             report = probe_window_controls(
                 window,
                 window_title=self.config.pos.window_title_contains,
@@ -378,6 +454,13 @@ class SettingsMainWindow(QMainWindow):
             for spec in field_specs:
                 editor = self._create_setting_editor(spec)
                 form.addRow(spec.label, editor)
+            if page.page_id == "login":
+                secret_editor = QLineEdit()
+                secret_editor.setObjectName("pos_login_transient_secret")
+                secret_editor.setEchoMode(QLineEdit.EchoMode.Password)
+                secret_editor.setText(self._transient_pos_login_secret)
+                self._pos_login_secret_editor = secret_editor
+                form.addRow("本次 POS 密碼", secret_editor)
             layout.addLayout(form)
         else:
             for field in page.fields:
@@ -444,8 +527,12 @@ class SettingsMainWindow(QMainWindow):
             table.setCellWidget(row_index, 0, enabled)
             table.setItem(row_index, 1, QTableWidgetItem(report.id))
             table.setCellWidget(row_index, 2, self._table_line_edit(f"report_{report.id}_name", report.name))
-            table.setCellWidget(row_index, 3, self._table_combo(f"report_{report.id}_frequency", ("daily", "weekly"), report.frequency))
-            table.setCellWidget(row_index, 4, self._table_line_edit(f"report_{report.id}_report_menu_text", report.report_menu_text))
+            table.setCellWidget(row_index, 3, self._table_combo(f"report_{report.id}_frequency", ("daily",), report.frequency))
+            table.setCellWidget(
+                row_index,
+                4,
+                self._table_line_edit(f"report_{report.id}_report_menu_text", self._report_menu_entry_text(report)),
+            )
             table.setCellWidget(
                 row_index,
                 5,
@@ -563,6 +650,12 @@ class SettingsMainWindow(QMainWindow):
             )
 
         if action == "停止":
+            if self._automation_thread is not None:
+                return GuiActionResult(
+                    ok=False,
+                    error_code="AUTOMATION_STOP_NOT_SUPPORTED",
+                    message="目前任務仍在背景執行；本階段尚未支援安全中止 POS 自動化，請等待目前步驟結束。",
+                )
             return GuiActionResult(ok=True, message="目前沒有執行中的任務。")
 
         if action == "測試啟動 POS":
@@ -586,13 +679,15 @@ class SettingsMainWindow(QMainWindow):
         if action in {"開啟下載資料夾", "開啟 log", "開啟 logs", "開啟 screenshots", "開啟 screenshot"}:
             return self._folder_status_for_action(action)
 
-        if page_id == "drive" or action in {"測試上傳", "連接 Google Drive", "測試列出使用者資訊", "測試指定 folder ID"}:
+        if action == "連接 Google Drive":
+            return self.connect_google_drive()
+
+        if action == "測試列出使用者資訊":
+            return self.test_google_account()
+
+        if action in {"測試上傳", "測試指定 folder ID"}:
             self._sync_drive_target_table_to_config()
-            return GuiActionResult(
-                ok=False,
-                error_code="GOOGLE_DRIVE_OAUTH_NOT_CONFIGURED",
-                message="已讀取 Drive folder ID 設定；真實 Google Drive OAuth / 上傳尚未在此 MVP 操作。",
-            )
+            return self.test_google_drive_upload()
 
         if action == "只啟用 R01 測試":
             self._set_only_report_enabled("R01")
@@ -603,21 +698,16 @@ class SettingsMainWindow(QMainWindow):
             return GuiActionResult(ok=True, message="已啟用全部報表任務。")
 
         if action == "立即執行選取任務":
-            return self.execute_enabled_reports()
+            return self.start_enabled_reports_async()
 
         if page_id == "email":
-            return GuiActionResult(
-                ok=False,
-                error_code="EMAIL_SEND_NOT_CONFIGURED",
-                message="Email 測試寄信需先完成 SMTP 設定，密碼將使用系統認證管理保存。",
-            )
+            return self.test_gmail_send()
+
+        if page_id == "login" and action == "儲存 POS 憑證":
+            return self.store_pos_credential()
 
         if page_id == "schedule":
-            return GuiActionResult(
-                ok=False,
-                error_code="WINDOWS_SCHEDULER_REQUIRED",
-                message="Windows Task Scheduler 動作需在 Windows 環境以足夠權限執行。",
-            )
+            return self._handle_scheduler_action(action)
 
         if page_id == "diagnostics":
             return GuiActionResult(ok=True, message="診斷動作已接收；完整 zip 匯出仍在 MVP 待辦。")
@@ -633,16 +723,45 @@ class SettingsMainWindow(QMainWindow):
 
     def execute_enabled_reports(self) -> GuiActionResult:
         self._sync_gui_to_config()
+        return self._gui_result_from_automation_summary(self._build_automation_runner().run())
+
+    def start_enabled_reports_async(self) -> GuiActionResult:
+        self._sync_gui_to_config()
         plan = build_dry_run_plan(self.config)
         if not plan.outputs:
             return GuiActionResult(ok=False, error_code="NO_ENABLED_REPORTS", message="沒有啟用中的報表任務。")
-
-        try:
-            window = connect_pos_window(
-                window_title_contains=self.config.pos.window_title_contains,
-                backend=self.config.pos.backend,
+        if self._automation_thread is not None:
+            return GuiActionResult(
+                ok=False,
+                error_code="AUTOMATION_ALREADY_RUNNING",
+                message="已有 POS 報表任務正在背景執行，請等待目前任務完成。",
             )
-            save_as_handler = WindowsSaveAsHandler(
+
+        worker = AutomationRunWorker(self._build_automation_runner())
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._handle_automation_progress)
+        worker.finished.connect(self._handle_automation_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_automation_worker)
+        self._automation_worker = worker
+        self._automation_thread = thread
+        thread.start()
+        return GuiActionResult(
+            ok=True,
+            message=f"已開始背景執行 {len(plan.outputs)} 個 POS 報表任務；進度會顯示在狀態列。",
+        )
+
+    def _build_automation_runner(self) -> AutomationRunner:
+        return AutomationRunner(
+            self.config,
+            settings_path=self.settings_path,
+            app_version=__version__,
+            connect_pos_window_func=connect_pos_window,
+            save_as_handler_factory=lambda _config: WindowsSaveAsHandler(
                 dialog_title_contains=self.config.save_as.dialog_title_contains,
                 filename_label=self.config.save_as.filename_label,
                 save_button_text=self.config.save_as.save_button_text,
@@ -650,92 +769,147 @@ class SettingsMainWindow(QMainWindow):
                 overwrite_policy=OverwritePolicy(self.config.save_as.overwrite_policy),
                 wait_timeout_seconds=self.config.save_as.wait_timeout_seconds,
                 stable_seconds=self.config.save_as.stable_seconds,
-            )
-            automator = ReportWindowAutomator(
-                window,
-                save_as_handler=save_as_handler,
-                output_dir=Path(self.config.app.downloads_dir),
-                diagnostic_dir=Path(self.config.app.screenshots_dir),
-                runtime_metadata={
-                    "app_version": __version__,
-                    "config_path": str(self.settings_path),
-                    "configured_backend": self.config.pos.backend,
-                },
-            )
-            failures: list[ReportRunFailure] = []
-            completed = 0
-            for index, output in enumerate(plan.outputs):
-                report = next(item for item in self.config.reports if item.id == output.task_id)
-                close_after_success = not (
-                    output.task_id == "R06" and any(later.task_id == output.task_id for later in plan.outputs[index + 1 :])
-                )
-                try:
-                    result = automator.download_report(output, report, close_after_success=close_after_success)
-                except ReportAutomationError as exc:
-                    failures.append(
-                        ReportRunFailure(
-                            task_id=output.task_id,
-                            output_filename=output.output_filename,
-                            error_code=exc.error_code,
-                            message=exc.message,
-                            diagnostic_path=str(exc.diagnostic_path) if exc.diagnostic_path else None,
-                        )
-                    )
-                    continue
-                if not result.ok:
-                    failures.append(
-                        ReportRunFailure(
-                            task_id=output.task_id,
-                            output_filename=output.output_filename,
-                            error_code=result.error_code or "REPORT_DOWNLOAD_FAILED",
-                            message=f"{output.task_id} 下載失敗：{result.message}",
-                        )
-                    )
-                    continue
-                completed += 1
-        except UiProbeError as exc:
-            return GuiActionResult(ok=False, error_code="POS_CONNECTION_FAILED", message=f"連接 POS 失敗：{exc}")
+            ),
+            automator_factory=ReportWindowAutomator,
+            pos_login_secret_provider=self._current_pos_login_secret,
+            run_source="gui_manual",
+        )
 
-        if failures:
-            details = self._format_report_failures(failures)
-            notify_result = self._notify_report_failures(details)
-            notify_suffix = f"；{notify_result.message}" if notify_result else ""
+    def _gui_result_from_automation_summary(self, summary: AutomationRunSummary) -> GuiActionResult:
+        return GuiActionResult(
+            ok=summary.ok,
+            error_code=summary.error_code,
+            message=summary.message,
+            details=summary.details,
+        )
+
+    @Slot(object)
+    def _handle_automation_progress(self, progress: AutomationProgress) -> None:
+        self._last_automation_progress = progress
+        self.statusBar().showMessage(progress.message)
+
+    @Slot(object)
+    def _handle_automation_finished(self, summary: AutomationRunSummary) -> None:
+        self._record_action_result(self._gui_result_from_automation_summary(summary))
+
+    @Slot()
+    def _clear_automation_worker(self) -> None:
+        self._automation_thread = None
+        self._automation_worker = None
+
+    def store_pos_credential(self) -> GuiActionResult:
+        self._sync_gui_to_config()
+        username = self.config.login.username.strip()
+        if not username:
             return GuiActionResult(
                 ok=False,
-                error_code="PARTIAL_REPORT_RUN_FAILED" if completed else "REPORT_RUN_FAILED",
-                message=f"已完成 {completed} 個 POS 報表下載，{len(failures)} 個失敗或無資料{notify_suffix}",
-                details=details,
+                error_code="POS_LOGIN_USERNAME_REQUIRED",
+                message="請先在登入設定填入 POS 帳號，再儲存 POS 憑證。",
             )
 
+        dialog = QDialog(self)
+        dialog.setWindowTitle("儲存 POS 憑證")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"帳號：{username}"))
+        secret_edit = QLineEdit()
+        secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        secret_edit.setObjectName("pos_credential_secret")
+        form = QFormLayout()
+        form.addRow("POS 密碼", secret_edit)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return GuiActionResult(ok=False, error_code="POS_CREDENTIAL_CANCELLED", message="已取消儲存 POS 憑證。")
+
+        secret = secret_edit.text()
+        if not secret:
+            return GuiActionResult(ok=False, error_code="POS_CREDENTIAL_REQUIRED", message="POS 密碼不可空白。")
+        self._set_current_pos_login_secret(secret)
+        return self._store_pos_credential_value(username=username, secret=secret)
+
+    def _store_pos_credential_value(self, *, username: str, secret: str) -> GuiActionResult:
+        self._set_current_pos_login_secret(secret)
+        try:
+            keyring: Any = import_module("keyring")
+        except ImportError as exc:
+            return GuiActionResult(
+                ok=True,
+                message=(
+                    f"目前環境沒有 keyring：{exc}；已改為只在本次程式執行期間暫存 POS 密碼，"
+                    "可用於本次自動登入與重啟後登入。"
+                ),
+            )
+        set_password = getattr(keyring, "set_password", None)
+        if set_password is None:
+            return GuiActionResult(ok=False, error_code="KEYRING_NOT_AVAILABLE", message="keyring 不支援儲存憑證。")
+        try:
+            set_password(self.config.pos_recovery.credential_keyring_service, username, secret)
+        except Exception as exc:
+            return GuiActionResult(ok=False, error_code="POS_CREDENTIAL_STORE_FAILED", message=f"儲存 POS 憑證失敗：{exc}")
+        return GuiActionResult(ok=True, message="POS 憑證已儲存到 Windows Credential Manager；設定檔不會保存密碼。")
+
+    def connect_google_drive(self) -> GuiActionResult:
+        self._sync_gui_to_config()
+        result = GoogleOAuthService(self.config).connect()
+        return GuiActionResult(ok=result.ok, error_code=result.error_code, message=result.message)
+
+    def test_google_account(self) -> GuiActionResult:
+        self._sync_gui_to_config()
+        result = GoogleOAuthService(self.config).status()
+        return GuiActionResult(ok=result.ok, error_code=result.error_code, message=result.message)
+
+    def test_google_drive_upload(self) -> GuiActionResult:
+        self._sync_gui_to_config()
+        self._sync_drive_target_table_to_config()
+        target = next(
+            (
+                item.folder_id_or_url
+                for item in self.config.drive_targets.targets.values()
+                if item.folder_id_or_url.strip()
+            ),
+            "",
+        )
+        if not target:
+            return GuiActionResult(ok=False, error_code="DRIVE_FOLDER_ID_MISSING", message="尚未設定任何 Drive folder ID。")
+        try:
+            folder_id = parse_drive_folder_id(target)
+        except ValueError as exc:
+            return GuiActionResult(ok=False, error_code="DRIVE_FOLDER_ID_INVALID", message=str(exc))
+        if not folder_id:
+            return GuiActionResult(ok=False, error_code="DRIVE_FOLDER_ID_MISSING", message="尚未設定任何 Drive folder ID。")
+        test_file = dated_runtime_dir(self.config.app.state_dir, run_date=date.today()) / "google_drive_upload_test.txt"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("POSReportBot Google Drive upload test\n", encoding="utf-8")
+        result = GoogleDriveUploader(GoogleOAuthService(self.config)).upload(test_file, folder_id, test_file.name)
         return GuiActionResult(
-            ok=True,
-            message=f"已完成 {len(plan.outputs)} 個 POS 報表下載；Google Drive 上傳仍需另外驗證 OAuth。",
+            ok=result.success,
+            error_code=result.error_code,
+            message=result.message if result.success else result.message,
         )
 
-    def _format_report_failures(self, failures: list[ReportRunFailure]) -> str:
-        lines = ["POSReportBot 自動化執行未完全成功", ""]
-        for failure in failures:
-            lines.extend(
-                [
-                    f"任務：{failure.task_id}",
-                    f"輸出檔名：{failure.output_filename}",
-                    f"錯誤代碼：{failure.error_code}",
-                    f"說明：{failure.message}",
-                ]
-            )
-            if failure.diagnostic_path:
-                lines.append(f"診斷檔：{failure.diagnostic_path}")
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    def _notify_report_failures(self, details: str) -> Any | None:
-        if not self.config.email.enabled or not self.config.email.notify_on_failure:
-            return None
-        return send_failure_notification(
+    def test_gmail_send(self) -> GuiActionResult:
+        self._sync_gui_to_config()
+        result = GmailOAuthSender(GoogleOAuthService(self.config)).send(
             self.config.email,
-            subject="POSReportBot 報表自動化失敗通知",
-            body=details,
+            subject="POSReportBot Gmail API 測試",
+            body="這是 POSReportBot Gmail API 測試信。",
         )
+        return GuiActionResult(ok=result.ok, error_code=result.error_code, message=result.message)
+
+    def _current_pos_login_secret(self) -> str | None:
+        editor = self._pos_login_secret_editor
+        if editor is not None and editor.text():
+            return editor.text()
+        return self._transient_pos_login_secret or None
+
+    def _set_current_pos_login_secret(self, secret: str) -> None:
+        self._transient_pos_login_secret = secret
+        editor = self._pos_login_secret_editor
+        if editor is not None and editor.text() != secret:
+            editor.setText(secret)
 
     def _show_copyable_warning(self, result: GuiActionResult) -> None:
         dialog = QDialog(self)
@@ -769,11 +943,11 @@ class SettingsMainWindow(QMainWindow):
 
     def _folder_status_for_action(self, action: str) -> GuiActionResult:
         folder_by_action = {
-            "開啟下載資料夾": self.config.app.downloads_dir,
-            "開啟 log": self.config.app.logs_dir,
-            "開啟 logs": self.config.app.logs_dir,
-            "開啟 screenshots": self.config.app.screenshots_dir,
-            "開啟 screenshot": self.config.app.screenshots_dir,
+            "開啟下載資料夾": str(dated_runtime_dir(self.config.app.downloads_dir, run_date=date.today())),
+            "開啟 log": str(dated_runtime_dir(self.config.app.logs_dir, run_date=date.today())),
+            "開啟 logs": str(dated_runtime_dir(self.config.app.logs_dir, run_date=date.today())),
+            "開啟 screenshots": str(dated_runtime_dir(self.config.app.screenshots_dir, run_date=date.today())),
+            "開啟 screenshot": str(dated_runtime_dir(self.config.app.screenshots_dir, run_date=date.today())),
         }
         folder = folder_by_action.get(action, self.config.app.work_dir)
         return GuiActionResult(ok=True, message=f"{action}：{folder}")
@@ -835,17 +1009,28 @@ class SettingsMainWindow(QMainWindow):
             )
         ]
 
-    def _open_report_root_menu_for_probe(self, window: Any) -> None:
-        control = self._find_probe_control(window, "統計報表")
-        if control is None:
-            return
-        try:
-            if hasattr(control, "click_input"):
-                control.click_input()
-            elif hasattr(control, "click"):
-                control.click()
-        except Exception:
-            return
+    def _open_report_root_menus_for_probe(self, window: Any) -> None:
+        for root_menu_name in self._probe_root_menu_names():
+            control = self._find_probe_control(window, root_menu_name)
+            if control is None:
+                continue
+            try:
+                if hasattr(control, "click_input"):
+                    control.click_input()
+                elif hasattr(control, "click"):
+                    control.click()
+            except Exception:
+                continue
+
+    def _probe_root_menu_names(self) -> list[str]:
+        names: list[str] = []
+        for report in self.config.reports:
+            if not report.enabled:
+                continue
+            menu_path = self._effective_report_menu_path(report)
+            if menu_path:
+                names.append(menu_path[0])
+        return list(dict.fromkeys(names))
 
     def _find_probe_control(self, root: Any, name: str) -> Any | None:
         expected = self._normalized_menu_text(name)
@@ -898,7 +1083,10 @@ class SettingsMainWindow(QMainWindow):
             return None
 
     def _ui_probe_search_dirs(self) -> list[Path]:
+        runtime_paths = RuntimePaths.from_config(self.config, run_date=date.today())
         paths = [
+            runtime_paths.screenshots_dir,
+            runtime_paths.downloads_dir,
             Path(self.config.app.screenshots_dir),
             Path(self.config.app.downloads_dir),
             Path.cwd(),
@@ -913,13 +1101,21 @@ class SettingsMainWindow(QMainWindow):
         return paths
 
     def _test_folder_permissions(self) -> GuiActionResult:
-        folder_paths = [
+        runtime_paths = RuntimePaths.from_config(self.config, run_date=date.today())
+        base_folder_paths = [
             self.config.app.work_dir,
             self.config.app.downloads_dir,
             self.config.app.output_dir,
             self.config.app.logs_dir,
             self.config.app.screenshots_dir,
             self.config.app.state_dir,
+        ]
+        folder_paths = [
+            *(Path(path) for path in base_folder_paths),
+            runtime_paths.downloads_dir,
+            runtime_paths.logs_dir,
+            runtime_paths.screenshots_dir,
+            runtime_paths.state_dir,
         ]
         checked = 0
         for folder_text in folder_paths:
@@ -948,7 +1144,7 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("state 資料夾", "app.state_dir", "text"),
             ],
             "pos": [
-                SettingFieldSpec("POS exe 路徑", "pos.executable_path", "text"),
+                SettingFieldSpec("POS 啟動路徑（.appref-ms 或 SPA1.exe）", "pos.executable_path", "text"),
                 SettingFieldSpec("啟動參數", "pos.launch_args", "text"),
                 SettingFieldSpec("工作目錄", "pos.working_dir", "text"),
                 SettingFieldSpec("視窗標題包含", "pos.window_title_contains", "text"),
@@ -956,6 +1152,15 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("automation backend", "pos.backend", "combo", ("auto", "uia", "win32")),
                 SettingFieldSpec("啟動等待秒數", "pos.startup_wait_seconds", "int", minimum=1, maximum=600),
                 SettingFieldSpec("以系統管理員啟動", "pos.run_as_admin", "bool"),
+                SettingFieldSpec("所有任務結束後關閉 POS", "pos.close_after_run", "bool"),
+                SettingFieldSpec("POS 無回應自動重啟", "pos_recovery.enabled", "bool"),
+                SettingFieldSpec("無回應檢查間隔秒數", "pos_recovery.health_check_interval_seconds", "int", minimum=1, maximum=120),
+                SettingFieldSpec("重啟等待秒數", "pos_recovery.restart_delay_seconds", "int", minimum=1, maximum=300),
+                SettingFieldSpec("每輪最多重啟次數", "pos_recovery.max_restarts_per_run", "int", minimum=0, maximum=10),
+                SettingFieldSpec("當機時強制關閉 POS", "pos_recovery.kill_process_on_hang", "bool"),
+                SettingFieldSpec("關閉後重新啟動 POS", "pos_recovery.relaunch_after_kill", "bool"),
+                SettingFieldSpec("重啟後重跑目前任務", "pos_recovery.retry_current_task_after_restart", "bool"),
+                SettingFieldSpec("POS 憑證 keyring service", "pos_recovery.credential_keyring_service", "text"),
             ],
             "login": [
                 SettingFieldSpec("是否需要登入", "login.required", "bool"),
@@ -967,6 +1172,7 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("登入逾時秒數", "login.timeout_seconds", "int", minimum=1, maximum=600),
             ],
             "drive": [
+                SettingFieldSpec("啟用 Google Drive 上傳", "google_drive.upload_enabled", "bool"),
                 SettingFieldSpec("OAuth client 設定方式", "google_drive.auth_mode", "text"),
                 SettingFieldSpec("OAuth client secret 路徑", "google_drive.client_secret_path", "text"),
             ],
@@ -984,9 +1190,6 @@ class SettingsMainWindow(QMainWindow):
             "schedule": [
                 SettingFieldSpec("啟用每日排程", "scheduler.enabled", "bool"),
                 SettingFieldSpec("每日時間", "scheduler.daily_time", "text"),
-                SettingFieldSpec("啟用每週任務", "scheduler.weekly_enabled", "bool"),
-                SettingFieldSpec("每週日", "scheduler.weekly_day", "text"),
-                SettingFieldSpec("每週時間", "scheduler.weekly_time", "text"),
                 SettingFieldSpec("失敗重試次數", "scheduler.retry_count", "int", minimum=0, maximum=20),
                 SettingFieldSpec("重試間隔秒數", "scheduler.retry_interval_seconds", "int", minimum=1, maximum=3600),
             ],
@@ -1122,7 +1325,13 @@ class SettingsMainWindow(QMainWindow):
             if frequency is not None:
                 report.frequency = frequency.currentText()  # type: ignore[assignment]
             if report_menu_text is not None:
-                report.report_menu_text = report_menu_text.text()
+                menu_path = self._parse_report_menu_path(report_menu_text.text())
+                if len(menu_path) > 1:
+                    report.menu_path = menu_path
+                    report.report_menu_text = menu_path[-1]
+                else:
+                    report.menu_path = []
+                    report.report_menu_text = report_menu_text.text().strip()
             if branch_mode is not None:
                 report.branch_mode = branch_mode.currentText()  # type: ignore[assignment]
             if date_start is not None:
@@ -1149,6 +1358,19 @@ class SettingsMainWindow(QMainWindow):
             checkbox = self.findChild(QCheckBox, f"report_{report.id}_enabled")
             if checkbox is not None:
                 checkbox.setChecked(True)
+
+    def _report_menu_entry_text(self, report: Any) -> str:
+        if report.menu_path:
+            return " > ".join(report.menu_path)
+        return str(report.report_menu_text)
+
+    def _effective_report_menu_path(self, report: Any) -> list[str]:
+        if report.menu_path:
+            return [part.strip() for part in report.menu_path if part and part.strip()]
+        return ["統計報表", report.report_menu_text]
+
+    def _parse_report_menu_path(self, value: str) -> list[str]:
+        return [part.strip() for part in re.split(r"\s*(?:>|->)\s*", value) if part.strip()]
 
 
 def launch_settings_gui(config: ProjectConfig, *, settings_path: Path | None = None) -> int:

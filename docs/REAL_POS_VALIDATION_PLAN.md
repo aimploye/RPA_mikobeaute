@@ -7,7 +7,7 @@
 ## 事前準備
 
 1. 安裝 POSReportBot。
-2. 設定 POS exe 路徑。
+2. 設定 POS 啟動路徑（建議使用 `.appref-ms`；若留空，程式會嘗試自動搜尋）。
 3. 設定 window title contains：`SPA-POS`。
 4. 設定下載目錄到 `C:\ProgramData\POSReportBot\downloads`。
 5. 設定測試用 Google Drive folder ID。

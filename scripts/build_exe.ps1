@@ -8,4 +8,6 @@ if (-not (Test-Path $Python)) {
   throw "Python venv not found: $Python. Run py -3 -m venv .venv and install dependencies first."
 }
 
+& $Python -m pip install --upgrade pip
+& $Python -m pip install -e ".[dev]"
 & $Python -m PyInstaller --noconfirm --clean $Spec

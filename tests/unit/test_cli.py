@@ -37,8 +37,8 @@ def test_dry_run_cli_outputs_json_plan() -> None:
 
     assert payload["mode"] == "dry_run"
     assert payload["status"] == "success"
-    assert payload["counts"]["outputs"] == 17
-    assert payload["counts"]["missing_drive_targets"] == 17
+    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["missing_drive_targets"] == 0
     assert any(
         output["task_id"] == "R06" and output["branch_code"] == "N006"
         for output in payload["outputs"]
@@ -71,9 +71,10 @@ def test_dry_run_cli_can_write_summary(tmp_path: Path) -> None:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
     assert summary_path.parent == tmp_path
-    assert summary["status"] == "failed"
-    assert len(summary["outputs"]) == 17
-    assert summary["outputs"][0]["error_code"] == "DRIVE_FOLDER_ID_MISSING"
+    assert summary["status"] == "success"
+    assert len(summary["outputs"]) == 18
+    assert summary["outputs"][0]["status"] == "skipped"
+    assert summary["outputs"][0]["drive_folder_id"] == "1DibytnRl9054M65TMUVfHNSTIAeQ-ghF"
 
 
 def test_gui_cli_loads_config_and_launches_gui(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -126,6 +127,22 @@ def test_default_config_path_prefers_programdata_when_available(
     monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
 
     assert cli.default_config_path() == programdata_config
+
+
+def test_default_config_path_prefers_user_saved_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    user_config = tmp_path / "local" / "POSReportBot" / "config" / "app.yaml"
+    programdata_config = tmp_path / "programdata" / "POSReportBot" / "config" / "app.yaml"
+    user_config.parent.mkdir(parents=True)
+    programdata_config.parent.mkdir(parents=True)
+    user_config.write_text("app: user", encoding="utf-8")
+    programdata_config.write_text("app: programdata", encoding="utf-8")
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "programdata"))
+
+    assert cli.default_config_path() == user_config
 
 
 def test_default_config_path_can_resolve_pyinstaller_bundle(
@@ -189,6 +206,43 @@ def test_run_task_cli_executes_single_pos_report_with_real_automation_path(
     assert Path(payload["output_path"]).exists()
     assert "click:統計報表" in payload["actions"]
     assert "click:課程服務明細表" in payload["actions"]
+
+
+def test_run_enabled_cli_uses_automation_runner(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    captured = {}
+
+    class FakeSummary:
+        ok = True
+        completed = 12
+        total = 12
+        message = "done"
+        error_code = None
+        details = None
+        failures = ()
+
+    class FakeRunner:
+        def __init__(self, config, *, settings_path: Path, app_version: str, run_source: str) -> None:  # type: ignore[no-untyped-def]
+            captured["app_name"] = config.app.name
+            captured["settings_path"] = settings_path
+            captured["app_version"] = app_version
+            captured["run_source"] = run_source
+
+        def run(self) -> FakeSummary:
+            captured["ran"] = True
+            return FakeSummary()
+
+    monkeypatch.setattr(cli, "AutomationRunner", FakeRunner)
+
+    config_path = ROOT / "config_templates" / "app.template.yaml"
+    exit_code = cli.main(["--run-enabled", "--config", str(config_path)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert captured["ran"] is True
+    assert captured["settings_path"] == config_path
+    assert captured["run_source"] == "manual_cli"
+    assert payload["ok"] is True
+    assert payload["completed"] == 12
 
 
 def test_probe_export_controls_cli_outputs_targeted_report(monkeypatch, capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

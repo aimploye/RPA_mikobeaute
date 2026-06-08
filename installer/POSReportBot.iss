@@ -38,5 +38,9 @@ Source: "..\config_templates\drive_targets.template.yaml"; DestDir: "C:\ProgramD
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 
+[Tasks]
+Name: "dailytrigger"; Description: "建立每日 Windows Task Scheduler 報表排程"; GroupDescription: "排程設定："; Flags: unchecked
+
 [Run]
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--install-scheduler --config ""C:\ProgramData\POSReportBot\config\app.yaml"""; Flags: runhidden; Tasks: dailytrigger
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

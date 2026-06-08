@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import asdict
 import json
 import os
 import sys
@@ -7,7 +8,9 @@ from pathlib import Path
 from typing import Sequence
 
 from pos_report_bot import __version__
+from pos_report_bot.app.automation_runner import AutomationRunner
 from pos_report_bot.config.loader import load_project_config
+from pos_report_bot.config.writer import user_config_path
 from pos_report_bot.core.summary import build_dry_run_summary, write_run_summary
 from pos_report_bot.gui.main_window import launch_settings_gui
 from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
@@ -18,9 +21,20 @@ from pos_report_bot.pos.save_as_handler import (
 )
 from pos_report_bot.pos.ui_probe import UiProbeError, actual_window_backend, connect_pos_window
 from pos_report_bot.reports.planner import build_dry_run_plan
+from pos_report_bot.scheduler.windows_task_scheduler import (
+    DEFAULT_TASK_NAME,
+    install_task,
+    query_task,
+    remove_task,
+)
+from pos_report_bot.storage.runtime_paths import RuntimePaths
 
 
 def default_config_path() -> Path:
+    user_config = user_config_path()
+    if user_config.exists():
+        return user_config
+
     programdata = os.environ.get("PROGRAMDATA")
     if programdata:
         installed_config = Path(programdata) / "POSReportBot" / "config" / "app.yaml"
@@ -44,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pos_report_bot")
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--dry-run", action="store_true", help="展開報表任務但不操作 POS")
+    parser.add_argument("--run-enabled", action="store_true", help="執行設定中已啟用的報表任務，用於 Windows 排程")
+    parser.add_argument("--run-source", default="manual_cli", help=argparse.SUPPRESS)
     parser.add_argument("--run-task", help="在已開啟的 SPA-POS 上執行單一報表任務，例如 R01")
     parser.add_argument("--gui", action="store_true", help="啟動 PySide6 設定中心")
     parser.add_argument("--today", help="測試用日期，格式 YYYY-MM-DD")
@@ -53,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-save-as-dialog", action="store_true", help="匯出目前另存新檔視窗的元件診斷 JSON")
     parser.add_argument("--probe-output", type=Path, help="匯出按鈕診斷 JSON 輸出路徑")
     parser.add_argument("--probe-depth", type=int, default=4, help="匯出按鈕診斷掃描深度，預設 4")
+    parser.add_argument("--install-scheduler", action="store_true", help="建立每日 Windows Task Scheduler 排程")
+    parser.add_argument("--remove-scheduler", action="store_true", help="移除 Windows Task Scheduler 排程")
+    parser.add_argument("--query-scheduler", action="store_true", help="檢查 Windows Task Scheduler 排程")
+    parser.add_argument("--scheduler-task-name", default=DEFAULT_TASK_NAME, help="Windows Task Scheduler 任務名稱")
     return parser
 
 
@@ -68,11 +88,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.run_task:
         return _run_single_pos_task(args.config, args.run_task, today=args.today)
 
+    if args.run_enabled:
+        return _run_enabled_pos_tasks(args.config, run_source=args.run_source)
+
     if args.probe_export_controls:
         return _probe_export_controls(args.config, output_path=args.probe_output, max_depth=args.probe_depth)
 
     if args.probe_save_as_dialog:
         return _probe_save_as_dialog(args.config, output_path=args.probe_output, max_depth=args.probe_depth)
+
+    if args.install_scheduler:
+        return _install_scheduler_from_cli(args.config, task_name=args.scheduler_task_name)
+
+    if args.remove_scheduler:
+        return _scheduler_result_to_exit_code(remove_task(task_name=args.scheduler_task_name))
+
+    if args.query_scheduler:
+        return _scheduler_result_to_exit_code(query_task(task_name=args.scheduler_task_name))
 
     if not args.dry_run:
         parser.print_help()
@@ -99,9 +131,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None = None) -> int:
-    run_date = date.fromisoformat(today) if today else None
+    run_date = date.fromisoformat(today) if today else date.today()
     config = load_project_config(config_path)
     plan = build_dry_run_plan(config, today=run_date)
+    runtime_paths = RuntimePaths.from_config(config, run_date=run_date)
     output = next((item for item in plan.outputs if item.task_id == task_id), None)
     report = next((item for item in config.reports if item.id == task_id), None)
     if output is None or report is None:
@@ -136,12 +169,18 @@ def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None =
         result = ReportWindowAutomator(
             window,
             save_as_handler=handler,
-            output_dir=Path(config.app.downloads_dir),
-            diagnostic_dir=Path(config.app.screenshots_dir),
+            output_dir=runtime_paths.downloads_dir,
+            diagnostic_dir=runtime_paths.screenshots_dir,
+            log_dir=runtime_paths.logs_dir,
             runtime_metadata={
                 "app_version": __version__,
                 "config_path": str(config_path),
                 "configured_backend": config.pos.backend,
+                "run_date": run_date.isoformat(),
+                "downloads_dir": str(runtime_paths.downloads_dir),
+                "logs_dir": str(runtime_paths.logs_dir),
+                "screenshots_dir": str(runtime_paths.screenshots_dir),
+                "state_dir": str(runtime_paths.state_dir),
             },
         ).download_report(output, report)
     except UiProbeError as exc:
@@ -169,8 +208,48 @@ def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None =
     return 0 if result.ok else 1
 
 
+def _run_enabled_pos_tasks(config_path: Path, *, run_source: str = "manual_cli") -> int:
+    config = load_project_config(config_path)
+    summary = AutomationRunner(
+        config,
+        settings_path=config_path,
+        app_version=__version__,
+        run_source=run_source,
+    ).run()
+    payload = {
+        "ok": summary.ok,
+        "completed": summary.completed,
+        "skipped": getattr(summary, "skipped", 0),
+        "total": summary.total,
+        "message": summary.message,
+        "error_code": summary.error_code,
+        "details": summary.details,
+        "failures": [asdict(failure) for failure in summary.failures],
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if summary.ok else 1
+
+
+def _install_scheduler_from_cli(config_path: Path, *, task_name: str) -> int:
+    config = load_project_config(config_path)
+    result = install_task(
+        config.scheduler,
+        task_name=task_name,
+        python_exe=str(Path(sys.executable)),
+        config_path=str(config_path),
+    )
+    return _scheduler_result_to_exit_code(result)
+
+
+def _scheduler_result_to_exit_code(result: object) -> int:
+    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if getattr(result, "ok", False) else 1
+
+
 def _probe_export_controls(config_path: Path, *, output_path: Path | None, max_depth: int) -> int:
     config = load_project_config(config_path)
+    runtime_paths = RuntimePaths.from_config(config, run_date=date.today())
     try:
         window = connect_pos_window(
             window_title_contains=config.pos.window_title_contains,
@@ -188,11 +267,16 @@ def _probe_export_controls(config_path: Path, *, output_path: Path | None, max_d
         report = ReportWindowAutomator(
             window,
             save_as_handler=handler,
-            output_dir=Path(config.app.downloads_dir),
+            output_dir=runtime_paths.downloads_dir,
             runtime_metadata={
                 "app_version": __version__,
                 "config_path": str(config_path),
                 "configured_backend": config.pos.backend,
+                "run_date": runtime_paths.run_date.isoformat(),
+                "downloads_dir": str(runtime_paths.downloads_dir),
+                "logs_dir": str(runtime_paths.logs_dir),
+                "screenshots_dir": str(runtime_paths.screenshots_dir),
+                "state_dir": str(runtime_paths.state_dir),
             },
         ).export_control_probe(max_depth=max(max_depth, 0))
     except UiProbeError as exc:

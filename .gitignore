@@ -14,6 +14,7 @@ venv/
 build/
 dist/
 *.spec
+!POSReportBot.spec
 
 # Runtime
 runtime_dev/downloads/*
@@ -41,3 +42,4 @@ _external/
 # OS
 .DS_Store
 Thumbs.db
+.gstack/

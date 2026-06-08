@@ -124,7 +124,7 @@ Never：
 ### 0.9 MVP-0.1 驗收條件
 
 1. 可建立 `.venv` 並用 `.venv` Python 執行測試。
-2. `python -m pos_report_bot --dry-run --config config_templates/app.template.yaml` 可展開 R01–R12。
+2. `python -m pos_report_bot --dry-run --config config_templates/app.template.yaml` 可展開 R01–R13。
 3. Dry-run 中 R06 展開為 N001–N006 六個分館輸出。
 4. 每個 dry-run output 都包含 task id、日期區間、預期 `.xls` 檔名、Drive folder target、實機驗證狀態。
 5. 沒有填 Drive folder ID 時，dry-run 明確標示 target missing，但不得假裝可上傳。
@@ -173,7 +173,7 @@ SPA-POS 是 Windows 桌面軟體，廠商不提供 API。營運上需要固定�
 
 1. Windows GUI 應用程式。
 2. 設定檔讀寫與 schema 驗證。
-3. 報表任務模板 R01–R12。
+3. 報表任務模板 R01–R13。
 4. 每個任務/每個分館輸出檔可設定 Drive folder ID。
 5. Google Drive OAuth 授權與測試上傳。
 6. 檔案監控、檔案大小穩定檢查。

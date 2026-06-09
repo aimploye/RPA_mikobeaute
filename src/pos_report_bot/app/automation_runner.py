@@ -1,7 +1,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from importlib import import_module
+import json
 import os
 from pathlib import Path
 import shlex
@@ -166,6 +167,13 @@ class AutomationRunner:
                 pos_window = window
             except (UiProbeError, RuntimeError) as exc:
                 message = f"準備 POS 失敗：{exc}"
+                diagnostic_path = self._write_preparation_failure_diagnostic(
+                    plan.outputs,
+                    error_code="POS_CONNECTION_FAILED",
+                    message=message,
+                )
+                if diagnostic_path is not None:
+                    message = f"{message}；診斷檔：{diagnostic_path}"
                 self._mark_pending_outputs_failed(
                     run_state_store,
                     plan.outputs,
@@ -463,6 +471,52 @@ class AutomationRunner:
                 run_state_store.mark_failed(output, error_code=error_code, message=message)
             except Exception:
                 continue
+
+    def _write_preparation_failure_diagnostic(
+        self,
+        outputs: list[PlannedOutput],
+        *,
+        error_code: str,
+        message: str,
+    ) -> Path | None:
+        log_dir = self.runtime_paths.logs_dir
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            task_ids = "_".join(dict.fromkeys(output.task_id for output in outputs)) or "RUN"
+            path = log_dir / f"automation_prepare_failure_{self.run_date.strftime('%Y%m%d')}_{task_ids}.json"
+            payload = {
+                "schema_version": 1,
+                "created_at": datetime.now(tz=UTC).isoformat(),
+                "error": {
+                    "code": error_code,
+                    "message": message,
+                },
+                "required_root_menus": list(self._required_report_root_menus(self.config, outputs)),
+                "outputs": [
+                    {
+                        "task_id": output.task_id,
+                        "output_filename": output.output_filename,
+                        "start_date": output.start_date,
+                        "end_date": output.end_date,
+                        "branch_code": output.branch_code,
+                        "branch_display_name": output.branch_display_name,
+                    }
+                    for output in outputs
+                ],
+                "runtime": {
+                    "app_version": self.app_version,
+                    "config_path": str(self.settings_path),
+                    "run_source": self.run_source,
+                    "run_date": self.run_date.isoformat(),
+                    "logs_dir": str(self.runtime_paths.logs_dir),
+                    "state_dir": str(self.runtime_paths.state_dir),
+                },
+                "note": "此失敗發生於報表自動化開始前，因此不會有單一報表 action log。",
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            return path
+        except Exception:
+            return None
 
     def _upload_report_file(
         self,
@@ -788,11 +842,9 @@ class AutomationRunner:
                 direct_login = _safe_method(window, "login_pos")
                 if callable(direct_login):
                     direct_login(config.login.username, password, config.login.company_code)
-                    self._wait_for_login_complete(config, window)
-                    return self._connect_pos_window()
+                    return self._wait_for_login_complete(config, window)
                 self._generic_login(config, window, password)
-                self._wait_for_login_complete(config, window)
-                return self._connect_pos_window()
+                return self._wait_for_login_complete(config, window)
             except Exception as exc:
                 if _is_invalid_window_handle_error(exc):
                     if password is None:
@@ -940,13 +992,17 @@ class AutomationRunner:
     def _pos_not_ready_message_visible(self, names: list[str]) -> bool:
         return any(marker in name for marker in POS_NOT_READY_TEXTS for name in names)
 
-    def _wait_for_login_complete(self, config: ProjectConfig, window: Any) -> None:
+    def _wait_for_login_complete(self, config: ProjectConfig, window: Any) -> Any:
         deadline = monotonic() + max(config.login.timeout_seconds, 1)
         while monotonic() < deadline:
-            if not self._login_screen_visible(config, window):
-                return
+            if self._pos_main_screen_visible(window):
+                return window
+            try:
+                window = self._connect_pos_window()
+            except Exception:
+                pass
             sleep(0.5)
-        raise RuntimeError("POS 登入後畫面仍停留在登入視窗，無法開始報表自動化。")
+        raise RuntimeError("POS 登入後未出現完整主選單，無法開始報表自動化。")
 
     def _set_login_text(self, control: Any, value: str) -> None:
         setter = getattr(control, "set_edit_text", None)
@@ -995,7 +1051,7 @@ class AutomationRunner:
         while monotonic() < deadline:
             try:
                 window = self._connect_pos_window()
-                if not self._login_screen_visible(config, window):
+                if self._pos_main_screen_visible(window):
                     return window
             except Exception:
                 pass

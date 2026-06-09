@@ -822,6 +822,65 @@ def test_automation_runner_reconnects_when_login_window_handle_becomes_invalid(t
     assert calls == ["R01"]
 
 
+def test_automation_runner_control_login_waits_for_main_menu_not_unreadable_window(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 2
+
+    class UnreadableWindow(FakePosControl):
+        def window_text(self) -> str:
+            return ""
+
+        def children(self) -> list[FakePosControl]:
+            return []
+
+        def descendants(self) -> list[FakePosControl]:
+            return []
+
+    account_edit = FakePosControl("", "Edit")
+    secret_edit = FakePosControl("", "Edit")
+    login_window = FakePosControl("帳號登入", "Window")
+    unreadable_window = UnreadableWindow("SPA-POS", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    login_clicked = False
+    post_click_connects = 0
+
+    def complete_login() -> None:
+        nonlocal login_clicked
+        login_clicked = True
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal post_click_connects
+        if login_clicked:
+            post_click_connects += 1
+            return unreadable_window if post_click_connects == 1 else main_window
+        return login_window
+
+    login_window.children_controls = [
+        FakePosControl("帳號", "Text"),
+        account_edit,
+        FakePosControl("密碼", "Text"),
+        secret_edit,
+        FakePosControl("登入", "Button", on_click=complete_login),
+    ]
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        pos_login_secret_provider=lambda: "fake-login-secret",
+        keyboard_sender=None,
+    )
+
+    result = runner._login_if_required(config, login_window)
+
+    assert result is main_window
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "fake-login-secret"
+    assert post_click_connects == 2
+
+
 def test_automation_runner_uses_keyboard_login_when_login_handle_is_invalid(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
@@ -1054,6 +1113,55 @@ def test_automation_runner_keyboard_login_when_login_detection_wrapper_is_stale(
     assert sent_keys == ["^a{BACKSPACE}", "A0042", "{TAB}", "^a{BACKSPACE}", "test-password", "{ENTER}"]
 
 
+def test_automation_runner_keyboard_login_waits_for_main_menu_not_unreadable_window(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 2
+
+    class UnreadableLoginWindow(FakePosControl):
+        def window_text(self) -> str:
+            return ""
+
+        def children(self) -> list[FakePosControl]:
+            return []
+
+        def descendants(self) -> list[FakePosControl]:
+            return []
+
+    login_window = FakePosControl("帳號登入", "Window")
+    unreadable_window = UnreadableLoginWindow("帳號登入", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    current_window = login_window
+    post_enter_connects = 0
+    sent_keys: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal post_enter_connects
+        if sent_keys and sent_keys[-1] == "{ENTER}":
+            post_enter_connects += 1
+            return unreadable_window if post_enter_connects == 1 else main_window
+        return current_window
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+
+    assert result is main_window
+    assert post_enter_connects == 2
+    assert sent_keys == ["^a{BACKSPACE}", "A0042", "{TAB}", "^a{BACKSPACE}", "test-password", "{ENTER}"]
+
+
 def test_automation_runner_does_not_require_login_when_main_window_is_already_open(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     _disable_uploads(config)
@@ -1131,6 +1239,46 @@ def test_automation_runner_waits_for_required_menu_before_running_r13(tmp_path: 
     assert summary.ok is True
     assert downloads == ["R13"]
     assert connect_calls >= 2
+
+
+def test_automation_runner_writes_diagnostic_when_pos_never_reaches_required_menu(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.app.logs_dir = str(tmp_path / "logs")
+    config.pos.startup_wait_seconds = 1
+    config.login.required = False
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R13"
+
+    class UnreadableWindow(FakePosControl):
+        def window_text(self) -> str:
+            return ""
+
+        def children(self) -> list[FakePosControl]:
+            return []
+
+        def descendants(self) -> list[FakePosControl]:
+            return []
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: UnreadableWindow("SPA-POS"),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+    )
+
+    summary = runner.run()
+    diagnostics = list((tmp_path / "logs" / date.today().strftime("%Y%m%d")).glob("automation_prepare_failure_*.json"))
+
+    assert summary.ok is False
+    assert summary.error_code == "POS_CONNECTION_FAILED"
+    assert diagnostics
+    payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+    assert payload["error"]["code"] == "POS_CONNECTION_FAILED"
+    assert payload["required_root_menus"] == ["庫存管理"]
+    assert "診斷檔" in summary.message
 
 
 def test_automation_runner_required_roots_include_default_and_explicit_report_menus(tmp_path: Path) -> None:
@@ -1579,7 +1727,7 @@ def test_automation_runner_launches_pos_when_not_running_then_logs_in_and_runs(t
     summary = runner.run()
 
     assert launched == ["launch"]
-    assert connect_attempts == 4
+    assert connect_attempts == 3
     assert account_edit.text_value == "A0042"
     assert secret_edit.text_value == "fake-login-secret"
     assert login_button.clicked is True

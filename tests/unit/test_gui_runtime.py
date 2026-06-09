@@ -741,7 +741,15 @@ def test_dashboard_execute_continues_after_failed_report_and_shows_copyable_warn
                 message="saved",
             )
 
-    monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: FakePosControl("SPA-POS"))
+    monkeypatch.setattr(
+        main_window,
+        "connect_pos_window",
+        lambda **_kwargs: FakePosControl(
+            "SPA-POS",
+            "Window",
+            children=[FakePosControl("統計報表", "MenuItem")],
+        ),
+    )
     monkeypatch.setattr(main_window, "WindowsSaveAsHandler", lambda **_kwargs: MockSaveAsHandler())
     monkeypatch.setattr(main_window, "ReportWindowAutomator", FakeAutomator)
 

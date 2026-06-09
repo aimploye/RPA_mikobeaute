@@ -9,6 +9,7 @@ from pos_report_bot.drive.uploader import DriveUploadResult, MockDriveUploader
 from pos_report_bot.pos.report_automation import ReportAutomationError
 from pos_report_bot.pos.save_as_handler import MockSaveAsHandler
 from pos_report_bot.pos.ui_probe import UiProbeError
+from pos_report_bot.reports.planner import build_dry_run_plan
 from pos_report_bot.storage.run_state import RunStateStore
 from tests.unit.test_report_automation import FakePosControl
 
@@ -18,11 +19,20 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class FakeClosablePosWindow(FakePosControl):
     def __init__(self) -> None:
-        super().__init__("SPA-POS")
+        super().__init__("SPA-POS", children=[FakePosControl("統計報表", "MenuItem")])
         self.closed = False
 
     def close(self) -> None:
         self.closed = True
+
+
+def _ready_pos_window(*roots: str) -> FakePosControl:
+    menu_roots = roots or ("統計報表",)
+    return FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[FakePosControl(root, "MenuItem") for root in menu_roots],
+    )
 
 
 def _load_runner_config(tmp_path: Path):  # type: ignore[no-untyped-def]
@@ -65,7 +75,7 @@ def test_automation_runner_continues_after_failed_report(tmp_path: Path) -> None
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
     )
@@ -135,7 +145,7 @@ def test_automation_runner_reconnects_after_success_with_stale_post_save_actions
 
     def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
         connect_calls.append("connect")
-        return FakePosControl("SPA-POS")
+        return _ready_pos_window()
 
     class FakeAutomator:
         def __init__(self, *_args, **kwargs):  # type: ignore[no-untyped-def]
@@ -172,7 +182,7 @@ def test_automation_runner_reconnects_after_success_with_stale_post_save_actions
 
     assert summary.ok is True
     assert task_calls == ["R01", "R02"]
-    assert len(connect_calls) == 2
+    assert len(connect_calls) == 3
     assert runtime_sources == ["windows_task_scheduler", "windows_task_scheduler"]
 
 
@@ -203,7 +213,7 @@ def test_automation_runner_closes_each_r06_branch_window(tmp_path: Path) -> None
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
     )
@@ -253,7 +263,7 @@ def test_automation_runner_treats_r06_no_data_branch_as_skipped_not_failure(tmp_
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         run_state_store=run_state_store,
@@ -303,7 +313,7 @@ def test_automation_runner_uses_gmail_api_for_failure_notification(tmp_path: Pat
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         gmail_sender_factory=lambda _config: FakeGmailSender(),
@@ -338,7 +348,7 @@ def test_automation_runner_finishes_run_state_on_unexpected_task_error(tmp_path:
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
     )
@@ -384,7 +394,7 @@ def test_automation_runner_continues_after_unexpected_task_error(tmp_path: Path)
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
     )
@@ -418,7 +428,7 @@ def test_automation_runner_returns_no_enabled_reports_without_pos_connection(tmp
     def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
         nonlocal connected
         connected = True
-        return FakePosControl("SPA-POS")
+        return _ready_pos_window()
 
     runner = AutomationRunner(
         config,
@@ -492,13 +502,13 @@ def test_automation_runner_recovers_pos_and_retries_current_task(tmp_path: Path)
 
     def recover_pos(_config, _on_progress):  # type: ignore[no-untyped-def]
         recoveries.append("recover")
-        return FakePosControl("SPA-POS recovered")
+        return _ready_pos_window()
 
     runner = AutomationRunner(
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         pos_recovery_func=recover_pos,
@@ -535,13 +545,13 @@ def test_automation_runner_stops_recovery_after_restart_limit(tmp_path: Path) ->
 
     def recover_pos(_config, _on_progress):  # type: ignore[no-untyped-def]
         recoveries.append("recover")
-        return FakePosControl("SPA-POS recovered")
+        return _ready_pos_window()
 
     runner = AutomationRunner(
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         pos_recovery_func=recover_pos,
@@ -1051,7 +1061,208 @@ def test_automation_runner_does_not_require_login_when_main_window_is_already_op
     config.login.username = "A0042"
     runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
 
-    runner._login_if_required(config, FakePosControl("SPA-POS 主畫面", "Window"))
+    runner._login_if_required(
+        config,
+        FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")]),
+    )
+
+
+def test_automation_runner_waits_for_required_menu_before_running_r13(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.pos.startup_wait_seconds = 2
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R13"
+
+    splash_window = FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[
+            FakePosControl("稍候程式將自動關閉!", "Text"),
+            FakePosControl("系統", "MenuItem"),
+        ],
+    )
+    ready_window = FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[
+            FakePosControl("常用表單", "MenuItem"),
+            FakePosControl("統計報表", "MenuItem"),
+            FakePosControl("庫存管理", "MenuItem"),
+        ],
+    )
+    connect_calls = 0
+    downloads: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal connect_calls
+        connect_calls += 1
+        return splash_window if connect_calls == 1 else ready_window
+
+    class FakeAutomator:
+        def __init__(self, window, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            assert window is ready_window
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            downloads.append(output.task_id)
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert downloads == ["R13"]
+    assert connect_calls >= 2
+
+
+def test_automation_runner_required_roots_include_default_and_explicit_report_menus(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    for report in config.reports:
+        report.enabled = report.id in {"R01", "R13"}
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    outputs = [output for output in build_dry_run_plan(config).outputs if output.task_id in {"R01", "R13"}]
+
+    roots = runner._required_report_root_menus(config, outputs)
+
+    assert roots == ("統計報表", "庫存管理")
+
+
+def test_automation_runner_waits_for_all_required_roots_in_mixed_batch(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.pos.startup_wait_seconds = 2
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id in {"R01", "R13"}
+
+    stats_only_window = _ready_pos_window("統計報表")
+    ready_window = _ready_pos_window("統計報表", "庫存管理")
+    connect_calls = 0
+    downloads: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal connect_calls
+        connect_calls += 1
+        return stats_only_window if connect_calls == 1 else ready_window
+
+    class FakeAutomator:
+        def __init__(self, window, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            assert window is ready_window
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            downloads.append(output.task_id)
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert downloads == ["R01", "R13"]
+    assert connect_calls >= 2
+
+
+def test_automation_runner_waits_for_r13_root_after_pos_recovery(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.pos.startup_wait_seconds = 2
+    config.pos_recovery.enabled = True
+    config.pos_recovery.max_restarts_per_run = 1
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R13"
+
+    splash_window = FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[
+            FakePosControl("稍候程式將自動關閉!", "Text"),
+            FakePosControl("系統", "MenuItem"),
+        ],
+    )
+    ready_window = _ready_pos_window("統計報表", "庫存管理")
+    connect_after_recovery_calls = 0
+    task_calls: list[str] = []
+
+    class FakeAutomator:
+        def __init__(self, window, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.window = window
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            task_calls.append(output.task_id)
+            if len(task_calls) == 1:
+                raise ReportAutomationError("POS_NOT_RESPONDING", "POS 無回應")
+            assert self.window is ready_window
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal connect_after_recovery_calls
+        if task_calls:
+            connect_after_recovery_calls += 1
+            return splash_window if connect_after_recovery_calls == 1 else ready_window
+        return ready_window
+
+    def recover_pos(_config, _on_progress):  # type: ignore[no-untyped-def]
+        return splash_window
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_recovery_func=recover_pos,
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert task_calls == ["R13", "R13"]
+    assert connect_after_recovery_calls >= 2
 
 
 def test_automation_runner_uploads_downloaded_report_before_marking_success(tmp_path: Path) -> None:
@@ -1084,7 +1295,7 @@ def test_automation_runner_uploads_downloaded_report_before_marking_success(tmp_
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         drive_uploader_factory=lambda _config: MockDriveUploader(),
@@ -1132,7 +1343,7 @@ def test_automation_runner_fails_downloaded_report_when_upload_target_is_missing
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         drive_uploader_factory=lambda _config: MockDriveUploader(),
@@ -1186,7 +1397,7 @@ def test_automation_runner_rejects_upload_success_without_drive_file_id(tmp_path
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         drive_uploader_factory=lambda _config: FakeUploader(),
@@ -1236,7 +1447,7 @@ def test_automation_runner_global_drive_upload_disabled_fails_before_download(tm
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         drive_uploader_factory=lambda _config: FakeUploader(),
@@ -1289,7 +1500,7 @@ def test_automation_runner_global_drive_upload_disabled_allows_explicit_local_on
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
-        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
     )
@@ -1368,7 +1579,7 @@ def test_automation_runner_launches_pos_when_not_running_then_logs_in_and_runs(t
     summary = runner.run()
 
     assert launched == ["launch"]
-    assert connect_attempts == 3
+    assert connect_attempts == 4
     assert account_edit.text_value == "A0042"
     assert secret_edit.text_value == "fake-login-secret"
     assert login_button.clicked is True

@@ -26,6 +26,9 @@ from pos_report_bot.storage.run_state import RunStateStore
 from pos_report_bot.storage.runtime_paths import RuntimePaths
 
 
+POS_MAIN_MENU_NAMES = ("常用表單", "維護設定", "統計報表", "庫存管理")
+POS_NOT_READY_TEXTS = ("稍候程式將自動關閉",)
+
 ProgressEventType = Literal[
     "start",
     "connect",
@@ -159,7 +162,7 @@ class AutomationRunner:
         pos_window: Any | None = None
         try:
             try:
-                window = self._ensure_pos_session(on_progress)
+                window = self._ensure_pos_session(on_progress, plan.outputs)
                 pos_window = window
             except (UiProbeError, RuntimeError) as exc:
                 message = f"準備 POS 失敗：{exc}"
@@ -214,6 +217,7 @@ class AutomationRunner:
                         )
                         try:
                             window = self.pos_recovery_func(self.config, on_progress)
+                            window = self._wait_for_pos_main_menu_ready(self.config, window, [output])
                             pos_window = window
                             save_as_handler = self.save_as_handler_factory(self.config)
                             automator = self._build_automator(window, save_as_handler)
@@ -582,7 +586,7 @@ class AutomationRunner:
         except Exception as exc:
             return SimpleNamespace(ok=False, message=f"Gmail API 通知失敗：{exc}")
 
-    def _ensure_pos_session(self, on_progress: ProgressCallback | None) -> Any:
+    def _ensure_pos_session(self, on_progress: ProgressCallback | None, outputs: list[PlannedOutput]) -> Any:
         self._emit(on_progress, AutomationProgress("connect", "檢查 SPA-POS 是否已開啟"))
         try:
             window = self._connect_pos_window()
@@ -596,6 +600,7 @@ class AutomationRunner:
                 raise RuntimeError(f"POS 自動啟動或連線失敗：{exc}") from exc
             self._emit(on_progress, AutomationProgress("connect", "SPA-POS 已啟動並連接"))
         window = self._login_if_required(self.config, window)
+        window = self._wait_for_pos_main_menu_ready(self.config, window, outputs)
         return window
 
     def _build_windows_save_as_handler(self, config: ProjectConfig) -> WindowsSaveAsHandler:
@@ -755,8 +760,17 @@ class AutomationRunner:
             password: str | None = None
             try:
                 login_visible = self._login_screen_visible(config, window)
-                if not login_visible and self._pos_main_screen_visible(window):
-                    return window
+                if not login_visible:
+                    if self._pos_main_screen_visible(window):
+                        return window
+                    if self._visible_control_names(window):
+                        ready_window = self._wait_for_login_or_main_screen(config, window)
+                        if ready_window is None:
+                            raise RuntimeError("POS 尚未出現登入畫面或完整主選單，不能開始輸入帳密或執行報表。")
+                        window = ready_window
+                        login_visible = self._login_screen_visible(config, window)
+                        if not login_visible and self._pos_main_screen_visible(window):
+                            return window
                 password = self._pos_login_password(config)
                 if self._keyboard_login_available():
                     keyboard_window = self._keyboard_login_and_wait(config, password, window=window)
@@ -857,14 +871,74 @@ class AutomationRunner:
         return (has_account_field and has_secret_field) or (has_login_button and has_edit_controls)
 
     def _pos_main_screen_visible(self, window: Any) -> bool:
+        names = self._visible_control_names(window)
+        if self._pos_not_ready_message_visible(names):
+            return False
+        return any(name in POS_MAIN_MENU_NAMES for name in names)
+
+    def _wait_for_login_or_main_screen(self, config: ProjectConfig, window: Any) -> Any | None:
+        deadline = monotonic() + max(config.pos.startup_wait_seconds, 1)
+        while monotonic() < deadline:
+            if self._login_screen_visible(config, window) or self._pos_main_screen_visible(window):
+                return window
+            try:
+                window = self._connect_pos_window()
+            except Exception:
+                pass
+            sleep(0.5)
+        return None
+
+    def _wait_for_pos_main_menu_ready(
+        self,
+        config: ProjectConfig,
+        window: Any,
+        outputs: list[PlannedOutput],
+    ) -> Any:
+        required_roots = self._required_report_root_menus(config, outputs)
+        deadline = monotonic() + max(config.pos.startup_wait_seconds, 1)
+        last_names: list[str] = []
+        while monotonic() < deadline:
+            try:
+                window = self._connect_pos_window()
+                names = self._visible_control_names(window)
+                last_names = names
+                if not self._pos_not_ready_message_visible(names) and all(root in names for root in required_roots):
+                    return window
+            except Exception:
+                pass
+            sleep(0.5)
+        visible_hint = "、".join(last_names[:8]) if last_names else "無可辨識控制項"
+        raise RuntimeError(
+            "POS 主畫面尚未就緒，找不到本輪報表需要的主選單："
+            f"{'、'.join(required_roots)}；目前可見：{visible_hint}"
+        )
+
+    def _required_report_root_menus(self, config: ProjectConfig, outputs: list[PlannedOutput]) -> tuple[str, ...]:
+        reports_by_id = {report.id: report for report in config.reports}
+        roots: list[str] = []
+        for output in outputs:
+            report = reports_by_id.get(output.task_id)
+            if report is None:
+                continue
+            root = report.menu_path[0] if report.menu_path else "統計報表"
+            if root and root not in roots:
+                roots.append(root)
+        return tuple(roots or (config.login.login_success_text, "統計報表"))
+
+    def _visible_control_names(self, window: Any) -> list[str]:
         controls = [
             window,
             *_safe_child_controls(window),
         ]
-        normalized_names = [_safe_control_name(control).replace("\r", "").replace("\n", "") for control in controls]
-        if any("SPA-POS" in name and "帳號登入" not in name for name in normalized_names):
-            return True
-        return any(name in {"統計報表", "常用表單", "維護設定", "系統"} for name in normalized_names)
+        names: list[str] = []
+        for control in controls:
+            name = _safe_control_name(control).replace("\r", "").replace("\n", "")
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def _pos_not_ready_message_visible(self, names: list[str]) -> bool:
+        return any(marker in name for marker in POS_NOT_READY_TEXTS for name in names)
 
     def _wait_for_login_complete(self, config: ProjectConfig, window: Any) -> None:
         deadline = monotonic() + max(config.login.timeout_seconds, 1)

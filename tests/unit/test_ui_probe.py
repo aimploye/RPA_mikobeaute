@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from pos_report_bot.pos.ui_probe import (
     probe_window_controls,
     write_probe_report,
 )
+from pos_report_bot.pos import ui_probe
 
 
 def test_ui_probe_report_serializes_required_fields(tmp_path: Path) -> None:
@@ -124,3 +126,73 @@ def test_connect_pos_window_returns_clear_error_without_windows_pos() -> None:
 
     with pytest.raises(UiProbeError, match="requires Windows"):
         connect_pos_window(window_title_contains="SPA-POS", backend="auto")
+
+
+def test_connect_pos_window_tries_login_title_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = object()
+    calls: list[tuple[str, str]] = []
+
+    class WindowSpec:
+        def wrapper_object(self):
+            return wrapper
+
+    class FakeApplication:
+        def __init__(self, *, backend: str) -> None:
+            self.backend = backend
+
+        def connect(self, *, title_re: str):
+            calls.append((self.backend, title_re))
+            if "帳號登入" not in title_re:
+                raise RuntimeError(f"not found: {title_re}")
+            return self
+
+        def window(self, *, title_re: str):
+            return WindowSpec()
+
+    monkeypatch.setattr(ui_probe.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "pywinauto", SimpleNamespace(Application=FakeApplication))
+
+    window = connect_pos_window(window_title_contains="SPA-POS", backend="uia")
+
+    assert window is wrapper
+    assert calls == [
+        ("uia", ".*SPA\\-POS.*"),
+        ("uia", ".*帳號登入.*"),
+    ]
+
+
+def test_resolve_connected_window_prefers_matching_title_specification() -> None:
+    class Wrapper:
+        pass
+
+    wrapper = Wrapper()
+    calls: list[tuple[str, str | None]] = []
+
+    class WindowSpec:
+        def wrapper_object(self):
+            calls.append(("wrapper_object", None))
+            return wrapper
+
+    class App:
+        def window(self, *, title_re: str):
+            calls.append(("window", title_re))
+            return WindowSpec()
+
+        def top_window(self):
+            raise AssertionError("top_window should not be used when title spec resolves")
+
+    assert ui_probe._resolve_connected_window(App(), ".*SPA\\-POS.*") is wrapper  # type: ignore[attr-defined]
+    assert calls == [("window", ".*SPA\\-POS.*"), ("wrapper_object", None)]
+
+
+def test_resolve_connected_window_falls_back_to_top_window_when_title_spec_fails() -> None:
+    top_window = object()
+
+    class App:
+        def window(self, *, title_re: str):
+            raise RuntimeError(f"cannot resolve {title_re}")
+
+        def top_window(self):
+            return top_window
+
+    assert ui_probe._resolve_connected_window(App(), ".*SPA\\-POS.*") is top_window  # type: ignore[attr-defined]

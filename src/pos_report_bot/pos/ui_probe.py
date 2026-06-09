@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 DEFAULT_PROBE_MAX_DEPTH = 9
 DEFAULT_PROBE_MAX_CONTROLS = 1000
+DEFAULT_WINDOW_TITLE_FALLBACK_CONTAINS = ("SPA-POS", "帳號登入", "SPA資訊")
 
 
 class UiProbeError(RuntimeError):
@@ -44,24 +45,52 @@ def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str =
         raise UiProbeError("pywinauto is not installed; cannot run POS UI probe.") from exc
 
     backends = ["uia", "win32"] if backend == "auto" else [backend]
-    title_re = f".*{re.escape(window_title_contains)}.*"
+    title_candidates = _window_title_candidates(window_title_contains)
     errors: list[str] = []
     for candidate_backend in backends:
-        try:
-            app = Application(backend=candidate_backend).connect(title_re=title_re)
-            window = app.top_window()
+        for title_contains in title_candidates:
+            title_re = f".*{re.escape(title_contains)}.*"
             try:
-                setattr(window, "_pos_report_bot_backend", candidate_backend)
-            except Exception:
-                pass
-            return window
-        except Exception as exc:  # pragma: no cover - real Windows probe only
-            errors.append(f"{candidate_backend}: {exc}")
+                app = Application(backend=candidate_backend).connect(title_re=title_re)
+                window = _resolve_connected_window(app, title_re)
+                try:
+                    setattr(window, "_pos_report_bot_backend", candidate_backend)
+                except Exception:
+                    pass
+                return window
+            except Exception as exc:  # pragma: no cover - real Windows probe only
+                errors.append(f"{candidate_backend}/{title_contains}: {exc}")
 
     raise UiProbeError(
-        f"Cannot connect to window containing {window_title_contains!r}. "
+        f"Cannot connect to window containing any of {title_candidates!r}. "
         f"Tried backends: {', '.join(backends)}. Errors: {'; '.join(errors)}"
     )
+
+
+def _window_title_candidates(window_title_contains: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for candidate in (window_title_contains, *DEFAULT_WINDOW_TITLE_FALLBACK_CONTAINS):
+        value = str(candidate).strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    return tuple(candidates)
+
+
+def _resolve_connected_window(app: Any, title_re: str) -> Any:
+    try:
+        window_spec = app.window(title_re=title_re)
+        wrapper_object = getattr(window_spec, "wrapper_object", None)
+        if callable(wrapper_object):
+            return wrapper_object()
+        return window_spec
+    except Exception as specific_exc:
+        try:
+            return app.top_window()
+        except Exception as top_exc:
+            raise RuntimeError(
+                f"Cannot resolve connected POS window by title_re={title_re!r}; "
+                f"specific window failed: {specific_exc}; top_window failed: {top_exc}"
+            ) from top_exc
 
 
 def probe_window_controls(

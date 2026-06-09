@@ -5,6 +5,7 @@ from importlib import import_module
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from pos_report_bot.storage.runtime_paths import RuntimePaths
 
 POS_MAIN_MENU_NAMES = ("常用表單", "維護設定", "統計報表", "庫存管理")
 POS_NOT_READY_TEXTS = ("稍候程式將自動關閉",)
+UI_TEXT_NOISE_RE = re.compile(r"[\s　&()（）]+")
 
 ProgressEventType = Literal[
     "start",
@@ -118,6 +120,7 @@ class AutomationRunner:
         self.run_state_store = run_state_store
         self.keyboard_sender = keyboard_sender
         self.run_source = run_source
+        self._last_visible_control_names: list[str] = []
 
     def run(self, *, on_progress: ProgressCallback | None = None) -> AutomationRunSummary:
         plan = build_dry_run_plan(self.config, today=self.run_date)
@@ -280,7 +283,7 @@ class AutomationRunner:
                     )
                     self._emit_failure(on_progress, failure)
                     try:
-                        window = self._connect_pos_window()
+                        window = self._reconnect_ready_pos_session(on_progress, plan.outputs[index + 1 :] or [output])
                         pos_window = window
                         save_as_handler = self.save_as_handler_factory(self.config)
                         automator = self._build_automator(window, save_as_handler)
@@ -346,7 +349,7 @@ class AutomationRunner:
                         ),
                     )
                     try:
-                        window = self._connect_pos_window()
+                        window = self._reconnect_ready_pos_session(on_progress, plan.outputs[index + 1 :] or [output])
                         pos_window = window
                         save_as_handler = self.save_as_handler_factory(self.config)
                         automator = self._build_automator(window, save_as_handler)
@@ -492,6 +495,7 @@ class AutomationRunner:
                     "message": message,
                 },
                 "required_root_menus": list(self._required_report_root_menus(self.config, outputs)),
+                "visible_control_names": self._visible_control_names_for_diagnostic(),
                 "outputs": [
                     {
                         "task_id": output.task_id,
@@ -655,6 +659,13 @@ class AutomationRunner:
             self._emit(on_progress, AutomationProgress("connect", "SPA-POS 已啟動並連接"))
         window = self._login_if_required(self.config, window)
         window = self._wait_for_pos_main_menu_ready(self.config, window, outputs)
+        return window
+
+    def _reconnect_ready_pos_session(self, on_progress: ProgressCallback | None, outputs: list[PlannedOutput]) -> Any:
+        window = self._connect_pos_window()
+        window = self._login_if_required(self.config, window)
+        window = self._wait_for_pos_main_menu_ready(self.config, window, outputs)
+        self._emit(on_progress, AutomationProgress("recovery", "已重新連接並確認 SPA-POS 主畫面可執行後續任務"))
         return window
 
     def _build_windows_save_as_handler(self, config: ProjectConfig) -> WindowsSaveAsHandler:
@@ -826,7 +837,16 @@ class AutomationRunner:
                         if not login_visible and self._pos_main_screen_visible(window):
                             return window
                 password = self._pos_login_password(config)
-                if self._keyboard_login_available():
+                direct_login = _safe_method(window, "login_pos")
+                if callable(direct_login):
+                    direct_login(config.login.username, password, config.login.company_code)
+                    return self._wait_for_login_complete(config, window)
+                try:
+                    self._generic_login(config, window, password)
+                    return self._wait_for_login_complete(config, window)
+                except Exception as control_login_exc:
+                    if not self._keyboard_login_available():
+                        raise
                     keyboard_window = self._keyboard_login_and_wait(config, password, window=window)
                     if keyboard_window is not None:
                         return keyboard_window
@@ -836,15 +856,10 @@ class AutomationRunner:
                         if keyboard_window is not None:
                             return keyboard_window
                     raise RuntimeError(
-                        "POS_LOGIN_FAILED: POS 自動登入失敗：已用鍵盤輸入帳密但仍停留在登入畫面；"
-                        "已停止本次自動化，避免用失效視窗控制項操作或誤關 POS。"
-                    )
-                direct_login = _safe_method(window, "login_pos")
-                if callable(direct_login):
-                    direct_login(config.login.username, password, config.login.company_code)
-                    return self._wait_for_login_complete(config, window)
-                self._generic_login(config, window, password)
-                return self._wait_for_login_complete(config, window)
+                        "POS_LOGIN_FAILED: POS 自動登入失敗：控制項填入帳密失敗，"
+                        "改用鍵盤輸入後仍未登入；"
+                        f"控制項錯誤：{control_login_exc}"
+                    ) from control_login_exc
             except Exception as exc:
                 if _is_invalid_window_handle_error(exc):
                     if password is None:
@@ -890,12 +905,7 @@ class AutomationRunner:
 
     def _generic_login(self, config: ProjectConfig, window: Any, password: str) -> None:
         controls = _safe_child_controls(window)
-        edit_controls = [
-            control
-            for control in controls
-            if "edit" in str(_safe_control_type(control)).lower()
-            and bool(getattr(control, "is_enabled", lambda: True)())
-        ]
+        edit_controls = self._login_edit_controls(config, controls)
         values = [config.login.username, password]
         if config.login.company_code:
             values.append(config.login.company_code)
@@ -909,6 +919,106 @@ class AutomationRunner:
                     click()
                     return
         raise RuntimeError("找不到 POS 登入按鈕，無法自動登入。")
+
+    def _login_edit_controls(self, config: ProjectConfig, controls: list[Any]) -> list[Any]:
+        expected_count = 3 if config.login.company_code else 2
+        labeled_controls: list[Any | None] = [None] * expected_count
+        used_control_ids: set[int] = set()
+        labels = ["帳號", "密碼"]
+        if config.login.company_code:
+            labels.append("公司")
+        for index, label in enumerate(labels):
+            control = self._find_edit_control_after_label(controls, label, used_control_ids)
+            if control is not None:
+                labeled_controls[index] = control
+                used_control_ids.add(id(control))
+        if all(control is not None for control in labeled_controls):
+            return [control for control in labeled_controls if control is not None]
+        fallback_controls = [
+            control
+            for control in controls
+            if "edit" in str(_safe_control_type(control)).lower()
+            and _safe_is_enabled(control)
+            and id(control) not in used_control_ids
+        ]
+        if any(control is not None for control in labeled_controls):
+            completed_controls = list(labeled_controls)
+            fallback_index = 0
+            for index, control in enumerate(completed_controls):
+                if control is not None:
+                    continue
+                if fallback_index >= len(fallback_controls):
+                    break
+                completed_controls[index] = fallback_controls[fallback_index]
+                fallback_index += 1
+            return [control for control in completed_controls if control is not None]
+        return fallback_controls
+
+    def _find_edit_control_after_label(self, controls: list[Any], label: str, used_control_ids: set[int]) -> Any | None:
+        named_control = self._find_named_edit_control(controls, label, used_control_ids)
+        if named_control is not None:
+            return named_control
+        for index, control in enumerate(controls):
+            if "edit" in str(_safe_control_type(control)).lower():
+                continue
+            if _normalize_ui_text(label) not in _normalize_ui_text(_safe_control_name(control)):
+                continue
+            positioned_control = self._find_edit_control_by_label_position(control, controls, used_control_ids)
+            if positioned_control is not None:
+                return positioned_control
+            for candidate in controls[index + 1 :]:
+                if id(candidate) in used_control_ids:
+                    continue
+                if "edit" in str(_safe_control_type(candidate)).lower() and _safe_is_enabled(candidate):
+                    return candidate
+        return None
+
+    def _find_named_edit_control(self, controls: list[Any], label: str, used_control_ids: set[int]) -> Any | None:
+        normalized_label = _normalize_ui_text(label)
+        for control in controls:
+            if id(control) in used_control_ids:
+                continue
+            if "edit" not in str(_safe_control_type(control)).lower() or not _safe_is_enabled(control):
+                continue
+            control_name = _normalize_ui_text(_safe_control_name(control))
+            if normalized_label and normalized_label in control_name:
+                return control
+        return None
+
+    def _find_edit_control_by_label_position(
+        self,
+        label_control: Any,
+        controls: list[Any],
+        used_control_ids: set[int],
+    ) -> Any | None:
+        label_rect = _safe_rectangle_tuple(label_control)
+        if label_rect is None:
+            return None
+        label_left, label_top, label_right, label_bottom = label_rect
+        label_center_y = (label_top + label_bottom) / 2
+        label_height = max(label_bottom - label_top, 1)
+        candidates: list[tuple[float, Any]] = []
+        for candidate in controls:
+            if id(candidate) in used_control_ids:
+                continue
+            if "edit" not in str(_safe_control_type(candidate)).lower() or not _safe_is_enabled(candidate):
+                continue
+            candidate_rect = _safe_rectangle_tuple(candidate)
+            if candidate_rect is None:
+                continue
+            edit_left, edit_top, _edit_right, edit_bottom = candidate_rect
+            edit_center_y = (edit_top + edit_bottom) / 2
+            vertical_distance = abs(edit_center_y - label_center_y)
+            if vertical_distance > max(label_height * 1.5, 18):
+                continue
+            horizontal_gap = edit_left - label_right
+            if horizontal_gap < -8:
+                continue
+            candidates.append((vertical_distance * 1000 + max(horizontal_gap, 0), candidate))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
 
     def _login_screen_visible(self, config: ProjectConfig, window: Any) -> bool:
         controls = [
@@ -926,7 +1036,7 @@ class AutomationRunner:
         names = self._visible_control_names(window)
         if self._pos_not_ready_message_visible(names):
             return False
-        return any(name in POS_MAIN_MENU_NAMES for name in names)
+        return any(_ui_text_matches(expected, name) for expected in POS_MAIN_MENU_NAMES for name in names)
 
     def _wait_for_login_or_main_screen(self, config: ProjectConfig, window: Any) -> Any | None:
         deadline = monotonic() + max(config.pos.startup_wait_seconds, 1)
@@ -950,14 +1060,23 @@ class AutomationRunner:
         deadline = monotonic() + max(config.pos.startup_wait_seconds, 1)
         last_names: list[str] = []
         while monotonic() < deadline:
+            names = self._visible_control_names(window)
+            last_names = names
+            if not self._pos_not_ready_message_visible(names) and all(
+                any(_ui_text_matches(root, name) for name in names) for root in required_roots
+            ):
+                return window
             try:
                 window = self._connect_pos_window()
-                names = self._visible_control_names(window)
-                last_names = names
-                if not self._pos_not_ready_message_visible(names) and all(root in names for root in required_roots):
-                    return window
             except Exception:
-                pass
+                sleep(0.5)
+                continue
+            names = self._visible_control_names(window)
+            last_names = names
+            if not self._pos_not_ready_message_visible(names) and all(
+                any(_ui_text_matches(root, name) for name in names) for root in required_roots
+            ):
+                return window
             sleep(0.5)
         visible_hint = "、".join(last_names[:8]) if last_names else "無可辨識控制項"
         raise RuntimeError(
@@ -987,7 +1106,18 @@ class AutomationRunner:
             name = _safe_control_name(control).replace("\r", "").replace("\n", "")
             if name and name not in names:
                 names.append(name)
+        if names:
+            self._last_visible_control_names = names[:30]
         return names
+
+    def _visible_control_names_for_diagnostic(self) -> list[str]:
+        if self._last_visible_control_names:
+            return self._last_visible_control_names[:30]
+        try:
+            window = self._connect_pos_window()
+        except Exception:
+            return []
+        return self._visible_control_names(window)[:30]
 
     def _pos_not_ready_message_visible(self, names: list[str]) -> bool:
         return any(marker in name for marker in POS_NOT_READY_TEXTS for name in names)
@@ -1000,7 +1130,10 @@ class AutomationRunner:
             try:
                 window = self._connect_pos_window()
             except Exception:
-                pass
+                sleep(0.5)
+                continue
+            if self._pos_main_screen_visible(window):
+                return window
             sleep(0.5)
         raise RuntimeError("POS 登入後未出現完整主選單，無法開始報表自動化。")
 
@@ -1043,22 +1176,29 @@ class AutomationRunner:
         return self.keyboard_sender is not None or sys.platform.startswith("win")
 
     def _keyboard_login_and_wait(self, config: ProjectConfig, password: str, *, window: Any | None = None) -> Any | None:
+        if window is not None and self._pos_main_screen_visible(window):
+            return window
         if window is not None:
             self._focus_login_window_for_keyboard(window)
         if not self._keyboard_login_current_focus(config, password):
             return None
         deadline = monotonic() + max(config.login.timeout_seconds, 1)
         while monotonic() < deadline:
+            if window is not None and self._pos_main_screen_visible(window):
+                return window
             try:
                 window = self._connect_pos_window()
-                if self._pos_main_screen_visible(window):
-                    return window
             except Exception:
-                pass
+                sleep(0.5)
+                continue
+            if self._pos_main_screen_visible(window):
+                return window
             sleep(0.5)
         return None
 
     def _focus_login_window_for_keyboard(self, window: Any) -> None:
+        if self._focus_first_login_edit_for_keyboard(window):
+            return
         focus = _safe_method(window, "set_focus")
         if callable(focus):
             try:
@@ -1079,6 +1219,27 @@ class AutomationRunner:
             sleep(0.1)
         except Exception:
             pass
+
+    def _focus_first_login_edit_for_keyboard(self, window: Any) -> bool:
+        controls = _safe_child_controls(window)
+        account_control = self._find_edit_control_after_label(controls, "帳號", set())
+        candidates = [account_control] if account_control is not None else controls
+        for control in candidates:
+            if control is None:
+                continue
+            if "edit" not in _safe_control_type(control).lower() or not _safe_is_enabled(control):
+                continue
+            for method_name in ("set_focus", "click_input", "click"):
+                method = _safe_method(control, method_name)
+                if method is None:
+                    continue
+                try:
+                    method()
+                    sleep(0.1)
+                    return True
+                except Exception:
+                    continue
+        return False
 
     def _send_login_keys(self, keys: str, **kwargs: Any) -> bool:
         sender = self.keyboard_sender
@@ -1138,6 +1299,18 @@ def format_report_failures(failures: list[ReportRunFailure]) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize_ui_text(value: str) -> str:
+    return UI_TEXT_NOISE_RE.sub("", value.replace("\r", "").replace("\n", ""))
+
+
+def _ui_text_matches(expected: str, actual: str) -> bool:
+    expected_text = _normalize_ui_text(expected)
+    actual_text = _normalize_ui_text(actual)
+    if not expected_text or not actual_text:
+        return False
+    return expected_text == actual_text or expected_text in actual_text
+
+
 def _safe_control_name(control: Any) -> str:
     try:
         name_attr = object.__getattribute__(control, "window_text")
@@ -1184,6 +1357,35 @@ def _safe_child_controls(control: Any) -> list[Any]:
         if isinstance(result, list):
             controls.extend(result)
     return controls
+
+
+def _safe_is_enabled(control: Any) -> bool:
+    checker = _safe_method(control, "is_enabled")
+    if checker is None:
+        return True
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _safe_rectangle_tuple(control: Any) -> tuple[int, int, int, int] | None:
+    rectangle = _safe_method(control, "rectangle")
+    if rectangle is None:
+        return None
+    try:
+        rect = rectangle()
+    except Exception:
+        return None
+    try:
+        return (
+            int(getattr(rect, "left")),
+            int(getattr(rect, "top")),
+            int(getattr(rect, "right")),
+            int(getattr(rect, "bottom")),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_control_type(control: Any) -> str:

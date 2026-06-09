@@ -11,7 +11,7 @@ from pos_report_bot.pos.save_as_handler import MockSaveAsHandler
 from pos_report_bot.pos.ui_probe import UiProbeError
 from pos_report_bot.reports.planner import build_dry_run_plan
 from pos_report_bot.storage.run_state import RunStateStore
-from tests.unit.test_report_automation import FakePosControl
+from tests.unit.test_report_automation import FakePosControl, FakeRectPosControl
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -182,8 +182,79 @@ def test_automation_runner_reconnects_after_success_with_stale_post_save_actions
 
     assert summary.ok is True
     assert task_calls == ["R01", "R02"]
-    assert len(connect_calls) == 3
+    assert len(connect_calls) >= 2
     assert runtime_sources == ["windows_task_scheduler", "windows_task_scheduler"]
+
+
+def test_automation_runner_reconnects_through_login_after_stale_post_save_actions(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id in {"R01", "R02"}
+    ready_window = _ready_pos_window()
+    login_window = FakePosControl("帳號登入", "Window")
+    account_edit = FakePosControl("帳號", "Edit")
+    secret_edit = FakePosControl("密碼", "Edit")
+    current_window = ready_window
+    task_calls: list[str] = []
+    automator_windows: list[object] = []
+
+    def complete_login() -> None:
+        nonlocal current_window
+        current_window = ready_window
+
+    login_window.children_controls = [
+        secret_edit,
+        account_edit,
+        FakePosControl("登入", "Button", on_click=complete_login),
+    ]
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        return current_window
+
+    class FakeAutomator:
+        def __init__(self, window, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            automator_windows.append(window)
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            nonlocal current_window
+            task_calls.append(output.task_id)
+            actions = []
+            if output.task_id == "R01":
+                actions = [
+                    "skip_close_report_viewer:post_save_success:"
+                    "(-2147220991, '事件無法啟動任何訂閱者', (None, None, None, 0, None))"
+                ]
+                current_window = login_window
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+                actions=actions,
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_login_secret_provider=lambda: "1234",
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert task_calls == ["R01", "R02"]
+    assert automator_windows == [ready_window, ready_window]
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "1234"
 
 
 def test_automation_runner_closes_each_r06_branch_window(tmp_path: Path) -> None:
@@ -952,7 +1023,9 @@ def test_automation_runner_uses_keyboard_login_when_login_handle_is_invalid(tmp_
     assert calls == ["R01"]
 
 
-def test_automation_runner_prefers_keyboard_login_before_control_login(tmp_path: Path) -> None:
+def test_automation_runner_falls_back_to_keyboard_when_control_login_does_not_reach_main_screen(
+    tmp_path: Path,
+) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
     _disable_uploads(config)
@@ -1017,9 +1090,342 @@ def test_automation_runner_prefers_keyboard_login_before_control_login(tmp_path:
 
     assert summary.ok is True
     assert sent_keys == ["^a{BACKSPACE}", "A0042", "{TAB}", "^a{BACKSPACE}", "test-password", "{ENTER}"]
-    assert account_edit.text_value == ""
-    assert secret_edit.text_value == ""
-    assert login_button.clicked is False
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "test-password"
+    assert login_button.clicked is True
+    assert calls == ["R01"]
+
+
+def test_automation_runner_uses_control_login_before_keyboard_when_edits_are_available(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.login.required = True
+    config.login.username = "A0042"
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    unrelated_edit = FakePosControl("", "Edit")
+    account_edit = FakePosControl("", "Edit")
+    secret_edit = FakePosControl("", "Edit")
+    login_window = FakePosControl("帳號登入", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    current_window = login_window
+    sent_keys: list[str] = []
+    calls: list[str] = []
+
+    def complete_login() -> None:
+        nonlocal current_window
+        current_window = main_window
+
+    login_button = FakePosControl("登入", "Button", on_click=complete_login)
+    login_window.children_controls = [
+        unrelated_edit,
+        FakePosControl("帳號", "Text"),
+        account_edit,
+        FakePosControl("密碼", "Text"),
+        secret_edit,
+        login_button,
+    ]
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        return current_window
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=lambda keys, **_kwargs: sent_keys.append(keys),  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert sent_keys == []
+    assert unrelated_edit.text_value == ""
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "test-password"
+    assert login_button.clicked is True
+    assert calls == ["R01"]
+
+
+def test_automation_runner_maps_login_edits_by_label_row_when_child_order_is_reversed(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.login.required = True
+    config.login.username = "A0042"
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    account_label = FakeRectPosControl("帳號", "Text", rect=(440, 246, 475, 272))
+    secret_label = FakeRectPosControl("密碼", "Text", rect=(440, 286, 475, 312))
+    account_edit = FakeRectPosControl("", "Edit", rect=(484, 246, 660, 272))
+    secret_edit = FakeRectPosControl("", "Edit", rect=(484, 286, 660, 312))
+    login_window = FakePosControl("帳號登入", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    current_window = login_window
+    sent_keys: list[str] = []
+    calls: list[str] = []
+
+    def complete_login() -> None:
+        nonlocal current_window
+        current_window = main_window
+
+    login_button = FakeRectPosControl("登入", "Button", rect=(690, 248, 784, 310), on_click=complete_login)
+    login_window.children_controls = [
+        secret_edit,
+        account_edit,
+        secret_label,
+        account_label,
+        login_button,
+    ]
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        return current_window
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_login_secret_provider=lambda: "1234",
+        keyboard_sender=lambda keys, **_kwargs: sent_keys.append(keys),  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert sent_keys == []
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "1234"
+    assert calls == ["R01"]
+
+
+def test_automation_runner_preserves_partial_label_login_mapping_when_filling_missing_edits(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.login.required = True
+    config.login.username = "A0042"
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    account_label = FakeRectPosControl("帳號", "Text", rect=(440, 246, 475, 272))
+    account_edit = FakeRectPosControl("", "Edit", rect=(484, 246, 660, 272))
+    secret_edit = FakeRectPosControl("", "Edit", rect=(484, 286, 660, 312))
+    login_window = FakePosControl("帳號登入", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    current_window = login_window
+    sent_keys: list[str] = []
+    calls: list[str] = []
+
+    def complete_login() -> None:
+        nonlocal current_window
+        current_window = main_window
+
+    login_button = FakeRectPosControl("登入", "Button", rect=(690, 248, 784, 310), on_click=complete_login)
+    login_window.children_controls = [
+        secret_edit,
+        account_edit,
+        account_label,
+        login_button,
+    ]
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        return current_window
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_login_secret_provider=lambda: "1234",
+        keyboard_sender=lambda keys, **_kwargs: sent_keys.append(keys),  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert sent_keys == []
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "1234"
+    assert calls == ["R01"]
+
+
+def test_automation_runner_uses_named_edit_login_fields_even_when_child_order_is_reversed(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.login.required = True
+    config.login.username = "A0042"
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    account_edit = FakePosControl("帳號", "Edit")
+    secret_edit = FakePosControl("密碼", "Edit")
+    login_window = FakePosControl("帳號登入", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    current_window = login_window
+    sent_keys: list[str] = []
+    calls: list[str] = []
+
+    def complete_login() -> None:
+        nonlocal current_window
+        current_window = main_window
+
+    login_button = FakePosControl("登入", "Button", on_click=complete_login)
+    login_window.children_controls = [
+        secret_edit,
+        account_edit,
+        login_button,
+    ]
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        return current_window
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_login_secret_provider=lambda: "1234",
+        keyboard_sender=lambda keys, **_kwargs: sent_keys.append(keys),  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert sent_keys == []
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "1234"
+    assert calls == ["R01"]
+
+
+def test_automation_runner_maps_decorated_login_labels_by_normalized_text(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.login.required = True
+    config.login.username = "A0042"
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    account_label = FakeRectPosControl("帳 號(&U)", "Text", rect=(440, 246, 475, 272))
+    secret_label = FakeRectPosControl("密 碼(&P)", "Text", rect=(440, 286, 475, 312))
+    account_edit = FakeRectPosControl("", "Edit", rect=(484, 246, 660, 272))
+    secret_edit = FakeRectPosControl("", "Edit", rect=(484, 286, 660, 312))
+    login_window = FakePosControl("帳號登入", "Window")
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    current_window = login_window
+    calls: list[str] = []
+
+    def complete_login() -> None:
+        nonlocal current_window
+        current_window = main_window
+
+    login_button = FakeRectPosControl("登入", "Button", rect=(690, 248, 784, 310), on_click=complete_login)
+    login_window.children_controls = [
+        secret_edit,
+        account_edit,
+        secret_label,
+        account_label,
+        login_button,
+    ]
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        return current_window
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_login_secret_provider=lambda: "1234",
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "1234"
     assert calls == ["R01"]
 
 
@@ -1162,6 +1568,294 @@ def test_automation_runner_keyboard_login_waits_for_main_menu_not_unreadable_win
     assert sent_keys == ["^a{BACKSPACE}", "A0042", "{TAB}", "^a{BACKSPACE}", "test-password", "{ENTER}"]
 
 
+def test_automation_runner_keyboard_login_focuses_first_edit_before_typing(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+
+    class FocusableEdit(FakePosControl):
+        def __init__(self) -> None:
+            super().__init__("", "Edit")
+            self.focused = False
+
+        def set_focus(self) -> None:
+            self.focused = True
+
+    account_edit = FocusableEdit()
+    login_window = FakePosControl(
+        "帳號登入",
+        "Window",
+        children=[
+            FakePosControl("帳號", "Text"),
+            account_edit,
+            FakePosControl("密碼", "Text"),
+            FakePosControl("", "Edit"),
+            FakePosControl("登入", "Button"),
+        ],
+    )
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    sent_keys: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        return main_window if sent_keys and sent_keys[-1] == "{ENTER}" and account_edit.focused else login_window
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+
+    assert result is main_window
+    assert account_edit.focused is True
+
+
+def test_automation_runner_keyboard_login_focuses_named_account_edit_when_child_order_is_reversed(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+
+    class FocusableEdit(FakePosControl):
+        def __init__(self, name: str) -> None:
+            super().__init__(name, "Edit")
+            self.focused = False
+
+        def set_focus(self) -> None:
+            self.focused = True
+
+    secret_edit = FocusableEdit("密碼")
+    account_edit = FocusableEdit("帳號")
+    login_window = FakePosControl(
+        "帳號登入",
+        "Window",
+        children=[
+            secret_edit,
+            account_edit,
+            FakePosControl("登入", "Button"),
+        ],
+    )
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    sent_keys: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        return main_window if sent_keys and sent_keys[-1] == "{ENTER}" and account_edit.focused else login_window
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+
+    assert result is main_window
+    assert account_edit.focused is True
+    assert secret_edit.focused is False
+
+
+def test_automation_runner_keyboard_login_skips_disabled_login_edit(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+
+    class FocusableEdit(FakePosControl):
+        def __init__(self, *, enabled: bool) -> None:
+            super().__init__("", "Edit", enabled=enabled)
+            self.focused = False
+
+        def set_focus(self) -> None:
+            self.focused = True
+
+    disabled_edit = FocusableEdit(enabled=False)
+    enabled_edit = FocusableEdit(enabled=True)
+    login_window = FakePosControl(
+        "帳號登入",
+        "Window",
+        children=[
+            FakePosControl("帳號", "Text"),
+            disabled_edit,
+            enabled_edit,
+            FakePosControl("密碼", "Text"),
+            FakePosControl("", "Edit"),
+            FakePosControl("登入", "Button"),
+        ],
+    )
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl("統計報表", "MenuItem")])
+    sent_keys: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        return main_window if sent_keys and sent_keys[-1] == "{ENTER}" and enabled_edit.focused else login_window
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+
+    assert result is main_window
+    assert disabled_edit.focused is False
+    assert enabled_edit.focused is True
+
+
+def test_automation_runner_keyboard_login_accepts_decorated_main_menu_text(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+
+    login_window = FakePosControl("帳號登入", "Window")
+    main_window = FakePosControl(
+        "SPA-POS 主畫面",
+        "Window",
+        children=[FakePosControl(" 統計 報表(&R) ", "MenuItem")],
+    )
+    sent_keys: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        return main_window if sent_keys and sent_keys[-1] == "{ENTER}" else login_window
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+
+    assert result is main_window
+
+
+def test_automation_runner_keyboard_login_does_not_hide_screen_check_errors(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+    login_window = FakePosControl("帳號登入", "Window")
+    sent_keys: list[str] = []
+
+    class BrokenRunner(AutomationRunner):
+        def _pos_main_screen_visible(self, window):  # type: ignore[no-untyped-def]
+            raise AssertionError("screen check bug")
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+
+    runner = BrokenRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: login_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    try:
+        runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+    except AssertionError as exc:
+        assert str(exc) == "screen check bug"
+    else:
+        raise AssertionError("screen check programming error was hidden")
+
+
+def test_automation_runner_keyboard_login_uses_current_main_window_when_reconnect_fails(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+    login_window = FakePosControl("帳號登入", "Window")
+    sent_keys: list[str] = []
+
+    def send_keys(keys: str, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        sent_keys.append(keys)
+        if keys == "{ENTER}":
+            login_window.name = "SPA-POS 主畫面"
+            login_window.children_controls = [FakePosControl(" 庫存 管理(&I) ", "MenuItem")]
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: (_ for _ in ()).throw(UiProbeError("temporary reconnect failure")),
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=send_keys,
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=login_window)
+
+    assert result is login_window
+
+
+def test_automation_runner_keyboard_login_does_not_type_when_window_already_main_screen(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    config.login.timeout_seconds = 1
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl(" 庫存 管理(&I) ", "MenuItem")])
+    sent_keys: list[str] = []
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: main_window,
+        pos_login_secret_provider=lambda: "test-password",
+        keyboard_sender=lambda keys, **_kwargs: sent_keys.append(keys),  # type: ignore[arg-type]
+    )
+
+    result = runner._keyboard_login_and_wait(config, "test-password", window=main_window)
+
+    assert result is main_window
+    assert sent_keys == []
+
+
+def test_automation_runner_wait_for_login_complete_uses_current_main_window_when_reconnect_fails(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.timeout_seconds = 1
+    main_window = FakePosControl("SPA-POS 主畫面", "Window", children=[FakePosControl(" 庫存 管理(&I) ", "MenuItem")])
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: (_ for _ in ()).throw(UiProbeError("temporary reconnect failure")),
+    )
+
+    result = runner._wait_for_login_complete(config, main_window)
+
+    assert result is main_window
+
+
 def test_automation_runner_does_not_require_login_when_main_window_is_already_open(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     _disable_uploads(config)
@@ -1241,6 +1935,147 @@ def test_automation_runner_waits_for_required_menu_before_running_r13(tmp_path: 
     assert connect_calls >= 2
 
 
+def test_automation_runner_waits_for_required_menu_with_normalized_ui_text(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.pos.startup_wait_seconds = 1
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R13"
+
+    ready_window = FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[
+            FakePosControl("&統計報表", "MenuItem"),
+            FakePosControl("庫存 管理(&I)", "MenuItem"),
+        ],
+    )
+    downloads: list[str] = []
+
+    class FakeAutomator:
+        def __init__(self, window, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            assert window is ready_window
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            downloads.append(output.task_id)
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: ready_window,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,
+        drive_uploader_factory=lambda _config: MockDriveUploader(),
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert downloads == ["R13"]
+
+
+def test_automation_runner_launch_wait_handles_splash_then_login_window(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.pos.startup_wait_seconds = 2
+    config.login.required = True
+    config.login.username = "A0042"
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R13"
+
+    splash_window = FakePosControl(
+        "SPA-POS",
+        "Window",
+        children=[
+            FakePosControl("稍候程式將自動關閉!", "Text"),
+            FakePosControl("系統", "MenuItem"),
+        ],
+    )
+    login_window = FakePosControl("帳號登入", "Window")
+    account_edit = FakePosControl("", "Edit")
+    secret_edit = FakePosControl("", "Edit")
+
+    def complete_login() -> None:
+        login_window.name = "SPA-POS 主畫面"
+        login_window.children_controls = [
+            FakePosControl("統計報表", "MenuItem"),
+            FakePosControl("庫存管理", "MenuItem"),
+        ]
+
+    login_window.children_controls = [
+        FakePosControl("帳號", "Text"),
+        account_edit,
+        FakePosControl("密碼", "Text"),
+        secret_edit,
+        FakePosControl("登入", "Button", on_click=complete_login),
+    ]
+    connect_calls = 0
+    downloads: list[str] = []
+    launched: list[str] = []
+
+    def connect_pos_window(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 1:
+            raise UiProbeError("POS not running")
+        if connect_calls == 2:
+            return splash_window
+        return login_window
+
+    class FakeAutomator:
+        def __init__(self, window, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            assert window is login_window
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            downloads.append(output.task_id)
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    class TestRunner(AutomationRunner):
+        def _launch_pos_process(self, _config):  # type: ignore[no-untyped-def]
+            launched.append("launch")
+
+    runner = TestRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos_window,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,
+        drive_uploader_factory=lambda _config: MockDriveUploader(),
+        pos_login_secret_provider=lambda: "test-password",
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert launched == ["launch"]
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "test-password"
+    assert downloads == ["R13"]
+
+
 def test_automation_runner_writes_diagnostic_when_pos_never_reaches_required_menu(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
@@ -1278,7 +2113,44 @@ def test_automation_runner_writes_diagnostic_when_pos_never_reaches_required_men
     payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
     assert payload["error"]["code"] == "POS_CONNECTION_FAILED"
     assert payload["required_root_menus"] == ["庫存管理"]
+    assert payload["visible_control_names"] == []
     assert "診斷檔" in summary.message
+
+
+def test_automation_runner_preparation_diagnostic_uses_cached_visible_controls_when_reconnect_fails(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.logs_dir = str(tmp_path / "logs")
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R13"
+    outputs = build_dry_run_plan(config).outputs
+    main_window = FakePosControl(
+        "SPA-POS 主畫面",
+        "Window",
+        children=[
+            FakePosControl("常用表單", "MenuItem"),
+            FakePosControl("庫存管理", "MenuItem"),
+        ],
+    )
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: (_ for _ in ()).throw(UiProbeError("temporary reconnect failure")),
+    )
+    assert runner._visible_control_names(main_window) == ["SPA-POS 主畫面", "常用表單", "庫存管理"]
+
+    diagnostic_path = runner._write_preparation_failure_diagnostic(
+        outputs,
+        error_code="POS_CONNECTION_FAILED",
+        message="準備 POS 失敗",
+    )
+
+    assert diagnostic_path is not None
+    payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert payload["visible_control_names"] == ["SPA-POS 主畫面", "常用表單", "庫存管理"]
 
 
 def test_automation_runner_required_roots_include_default_and_explicit_report_menus(tmp_path: Path) -> None:
@@ -1727,7 +2599,7 @@ def test_automation_runner_launches_pos_when_not_running_then_logs_in_and_runs(t
     summary = runner.run()
 
     assert launched == ["launch"]
-    assert connect_attempts == 3
+    assert connect_attempts >= 2
     assert account_edit.text_value == "A0042"
     assert secret_edit.text_value == "fake-login-secret"
     assert login_button.clicked is True

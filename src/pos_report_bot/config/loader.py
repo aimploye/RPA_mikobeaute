@@ -155,6 +155,8 @@ def _merge_app_defaults(config: ProjectConfig, template_defaults: ProjectConfig)
         config.scheduler.daily_time = template_defaults.scheduler.daily_time
     if not config.email.recipients:
         config.email.recipients = list(template_defaults.email.recipients)
+    if _should_enable_google_drive_upload(config, template_defaults):
+        config.google_drive.upload_enabled = True
 
 
 def _should_use_default_pos_executable_path(value: str) -> bool:
@@ -163,6 +165,17 @@ def _should_use_default_pos_executable_path(value: str) -> bool:
         return True
     lowered = normalized.replace("/", "\\").lower()
     return "\\appdata\\local\\apps\\2.0\\" in lowered and lowered.endswith("\\spa1.exe")
+
+
+def _should_enable_google_drive_upload(config: ProjectConfig, template_defaults: ProjectConfig) -> bool:
+    if config.google_drive.upload_enabled or not template_defaults.google_drive.upload_enabled:
+        return False
+    if not any(report.upload_enabled for report in config.reports):
+        return False
+    return any(
+        target.folder_id_or_url.strip() or any(folder_id.strip() for folder_id in target.branches.values())
+        for target in config.drive_targets.targets.values()
+    )
 
 
 def _load_template_defaults(app_config_path: Path) -> ProjectConfig | None:

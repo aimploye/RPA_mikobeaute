@@ -1,4 +1,5 @@
 from datetime import date
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1198,13 +1199,14 @@ def test_automation_runner_rejects_upload_success_without_drive_file_id(tmp_path
     assert summary.failures[0].error_code == "DRIVE_FILE_ID_MISSING"
 
 
-def test_automation_runner_global_drive_upload_disabled_skips_uploader(tmp_path: Path) -> None:
+def test_automation_runner_global_drive_upload_disabled_fails_before_download(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
     config.google_drive.upload_enabled = False
     for report in config.reports:
         report.enabled = report.id == "R01"
     config.drive_targets.targets["R01"].folder_id_or_url = "folder_r01"
+    download_calls = 0
     upload_calls = 0
 
     class FakeAutomator:
@@ -1212,6 +1214,8 @@ def test_automation_runner_global_drive_upload_disabled_skips_uploader(tmp_path:
             pass
 
         def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            nonlocal download_calls
+            download_calls += 1
             output_path = tmp_path / output.output_filename
             output_path.write_bytes(b"excel-bytes")
             return SimpleNamespace(
@@ -1240,10 +1244,61 @@ def test_automation_runner_global_drive_upload_disabled_skips_uploader(tmp_path:
 
     summary = runner.run()
 
+    assert summary.ok is False
+    assert summary.completed == 0
+    assert summary.failures[0].error_code == "GOOGLE_DRIVE_UPLOAD_DISABLED"
+    assert download_calls == 0
+    assert upload_calls == 0
+    assert "Google Drive 總開關目前是關閉" in summary.details
+    state_payload = json.loads(
+        (tmp_path / "state" / date.today().strftime("%Y%m%d") / "run_state_latest.json").read_text(encoding="utf-8")
+    )
+    output_state = next(iter(state_payload["outputs"].values()))
+    assert output_state["error_code"] == "GOOGLE_DRIVE_UPLOAD_DISABLED"
+    assert output_state["status"] == "failed"
+    assert output_state["drive_file_id"] is None
+
+
+def test_automation_runner_global_drive_upload_disabled_allows_explicit_local_only_reports(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    config.google_drive.upload_enabled = False
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+        report.upload_enabled = False
+    download_calls = 0
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            nonlocal download_calls
+            download_calls += 1
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: FakePosControl("SPA-POS"),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
     assert summary.ok is True
     assert summary.completed == 1
-    assert upload_calls == 0
-    assert "已上傳" not in summary.message
+    assert download_calls == 1
 
 
 def test_automation_runner_launches_pos_when_not_running_then_logs_in_and_runs(tmp_path: Path) -> None:

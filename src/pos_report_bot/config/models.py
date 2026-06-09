@@ -54,7 +54,7 @@ class SaveAsSettings(StrictBaseModel):
 
 
 class GoogleDriveSettings(StrictBaseModel):
-    upload_enabled: bool = False
+    upload_enabled: bool = True
     auth_mode: str = "drive_api"
     allow_folder_url_or_id: bool = True
     token_storage: str = "keyring"

@@ -19,6 +19,7 @@ def test_load_project_config_from_template_files() -> None:
     )
     assert config.scheduler.daily_time == "01:00"
     assert config.email.recipients == ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
+    assert config.google_drive.upload_enabled is True
     assert config.save_as.default_extension == ".xls"
     assert config.pos_update.expected_update_weekday == "Thursday"
     assert len(config.reports) == 13
@@ -190,6 +191,7 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     payload["pos"]["executable_path"] = ""
     payload["scheduler"]["daily_time"] = "07:30"
     payload["email"]["recipients"] = []
+    payload["google_drive"]["upload_enabled"] = False
     payload["reports"][0]["output_filename"] = "R01_每日課程服務明細表_新舊客_{start}_{end}.xls"
     payload["reports"][1]["output_filename"] = "user-custom-r02-{start}.xls"
     payload["drive_targets"]["R01"]["folder_id_or_url"] = ""
@@ -205,6 +207,7 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     assert config.pos.executable_path.endswith(".appref-ms")
     assert config.scheduler.daily_time == "01:00"
     assert config.email.recipients == ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
+    assert config.google_drive.upload_enabled is True
     assert reports["R01"].output_filename == "課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
     assert reports["R02"].output_filename == "user-custom-r02-{start}.xls"
     assert config.drive_targets.targets["R01"].folder_id_or_url.endswith("1DibytnRl9054M65TMUVfHNSTIAeQ-ghF")

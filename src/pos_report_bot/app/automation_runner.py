@@ -129,6 +129,24 @@ class AutomationRunner:
         run_state_store = self.run_state_store or RunStateStore.default_for_config(self.config, run_date=self.run_date)
         run_state_store.start_run(plan, app_version=self.app_version)
 
+        upload_preflight_failures = self._google_drive_upload_preflight_failures(plan.outputs)
+        if upload_preflight_failures:
+            preflight_report_failures = [failure for _output, failure in upload_preflight_failures]
+            for output, failure in upload_preflight_failures:
+                run_state_store.mark_failed(
+                    output,
+                    error_code=failure.error_code,
+                    message=failure.message,
+                )
+            summary = self._build_summary(
+                completed=0,
+                total=len(plan.outputs),
+                failures=preflight_report_failures,
+            )
+            run_state_store.finish_run(completed=0, failures=len(preflight_report_failures))
+            self._emit(on_progress, AutomationProgress("finish", summary.message))
+            return summary
+
         self._emit(
             on_progress,
             AutomationProgress("start", f"開始執行 {len(plan.outputs)} 個 POS 報表任務"),
@@ -488,6 +506,29 @@ class AutomationRunner:
 
     def _should_upload(self, output: PlannedOutput) -> bool:
         return output.upload_enabled and self.config.google_drive.upload_enabled
+
+    def _google_drive_upload_preflight_failures(
+        self,
+        outputs: list[PlannedOutput],
+    ) -> list[tuple[PlannedOutput, ReportRunFailure]]:
+        if self.config.google_drive.upload_enabled:
+            return []
+        return [
+            (
+                output,
+                ReportRunFailure(
+                    task_id=output.task_id,
+                    output_filename=output.output_filename,
+                    error_code="GOOGLE_DRIVE_UPLOAD_DISABLED",
+                    message=(
+                        "此報表設定需要上傳 Google Drive，但 Google Drive 總開關目前是關閉；"
+                        "已停止本輪自動化，避免只下載到本機卻被誤判為成功。"
+                    ),
+                ),
+            )
+            for output in outputs
+            if output.upload_enabled
+        ]
 
     def _build_summary(
         self,

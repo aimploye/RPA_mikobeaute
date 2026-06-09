@@ -38,7 +38,7 @@ save_as:
   stable_seconds: 3
 
 google_drive:
-  upload_enabled: false
+  upload_enabled: true
   auth_mode: "drive_api"
   allow_folder_url_or_id: true
   token_storage: "keyring"

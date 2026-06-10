@@ -243,10 +243,14 @@ class ReportWindowAutomator:
             self._set_date_range(output.start_date, output.end_date)
             self._write_action_log_event("phase", phase="apply_branch")
             self._apply_branch(output)
-            self._write_action_log_event("phase", phase="apply_options")
-            self._apply_options(report)
-            self._write_action_log_event("phase", phase="click_view_report")
-            self._click_view_report()
+            if report.id == "R03":
+                self._write_action_log_event("phase", phase="r03_two_step_product_sales_preview")
+                self._run_r03_two_step_product_sales_preview(report)
+            else:
+                self._write_action_log_event("phase", phase="apply_options")
+                self._apply_options(report)
+                self._write_action_log_event("phase", phase="click_view_report")
+                self._click_view_report()
             self._write_action_log_event("phase", phase="export_report_to_excel")
             export_control = None
             export_wait_seconds: float = float(report.max_wait_seconds)
@@ -1111,6 +1115,28 @@ class ReportWindowAutomator:
             return
         for option in report.options.other_conditions:
             self._set_other_condition(option)
+
+    def _run_r03_two_step_product_sales_preview(self, report: ReportConfig) -> None:
+        self._apply_options(report, include_other_conditions=False)
+        self.actions.append("phase:R03:preview:僅含新客")
+        self._click_view_report()
+        if not self._wait_for_report_viewer(timeout_seconds=self.report_generate_wait_seconds):
+            raise ReportAutomationError(
+                "VIEW_REPORT_NOT_TRIGGERED",
+                "R03 已按下第一次「檢視報表」（僅含新客），但未確認報表預覽完成；不能繼續二次篩選。",
+            )
+        self.actions.append("preview_ready:R03:僅含新客")
+        self._set_checkbox("僅含新客", checked=False)
+        for option in report.options.other_conditions:
+            self._set_other_condition(option)
+        self.actions.append("phase:R03:preview:二次篩選")
+        self._click_view_report()
+        if not self._wait_for_report_viewer(timeout_seconds=self.report_generate_wait_seconds):
+            raise ReportAutomationError(
+                "VIEW_REPORT_NOT_TRIGGERED",
+                "R03 已按下第二次「檢視報表」（二次篩選），但未確認報表預覽完成；不能匯出。",
+            )
+        self.actions.append("preview_ready:R03:二次篩選")
 
     def _set_other_condition(self, name: str) -> None:
         if "二次篩選" not in _normalized_text(name):

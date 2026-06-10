@@ -23,6 +23,13 @@ def test_load_project_config_from_template_files() -> None:
     assert config.save_as.default_extension == ".xls"
     assert config.pos_update.expected_update_weekday == "Thursday"
     assert len(config.reports) == 13
+    reports = {report.id: report for report in config.reports}
+    assert sum(1 for report in config.reports if report.enabled) == 12
+    assert reports["R03"].options.check == ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
+    assert reports["R03"].options.other_conditions == ["二次篩選"]
+    assert reports["R03"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
+    assert reports["R04"].enabled is False
+    assert reports["R04"].handler == "placeholder"
     assert [branch.code for branch in config.branches] == [
         "N001",
         "N002",
@@ -141,8 +148,12 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
     for report in reports_data["reports"]:
         if report["id"] == "R02":
             report["options"]["check"] = ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
+        if report["id"] == "R03":
+            report["options"]["check"] = ["顯示分店碼", "顯示客代與電話", "顯示退費", "僅含新客"]
+            report["options"]["other_conditions"] = []
         if report["id"] == "R04":
             report["options"]["check"] = ["顯示分店碼", "顯示客代與電話", "顯示退費"]
+            report["enabled"] = True
         if report["id"] == "R05A":
             report["enabled"] = True
         if report["id"] == "R05B":
@@ -163,7 +174,11 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
     reports = {report.id: report for report in config.reports}
 
     assert reports["R02"].options.check == ["顯示分店碼", "顯示客代與電話", "顯示退費"]
-    assert reports["R04"].options.check == ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
+    assert reports["R03"].options.check == ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
+    assert reports["R03"].options.other_conditions == ["二次篩選"]
+    assert reports["R04"].enabled is False
+    assert reports["R04"].handler == "placeholder"
+    assert reports["R04"].options.check == []
     assert "R05A" not in reports
     assert "R05B" not in reports
     assert reports["R05"].enabled is True
@@ -174,7 +189,7 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
     assert reports["R09"].options.check == ["限區間有消費", "含0元結單"]
     assert reports["R11"].options.check == ["顯示分店碼", "銷售分攤金額", "顯示退費", "僅含新客"]
     assert reports["R06"].options.check == ["清單檢視"]
-    assert reports["R06"].output_filename == "會員剩餘點數殘值統計表-清單檢視{today_yymmdd}-{branch_name}.xls"
+    assert reports["R06"].output_filename == "會員剩餘點數殘值統計表-清單檢視{today}-{branch_name}.xls"
     assert reports["R13"].menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
     assert reports["R13"].options.check == ["顯示課程耗用"]
 
@@ -194,6 +209,20 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     payload["google_drive"]["upload_enabled"] = False
     payload["reports"][0]["output_filename"] = "R01_每日課程服務明細表_新舊客_{start}_{end}.xls"
     payload["reports"][1]["output_filename"] = "user-custom-r02-{start}.xls"
+    legacy_output_filenames = {
+        "R03": "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部-僅新客.xls",
+        "R05": "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls",
+        "R06": "會員剩餘點數殘值統計表-清單檢視{today_yymmdd}-{branch_name}.xls",
+        "R07": "預約資料統計報表-前一天{yesterday_yymmdd}-前一天{yesterday_yymmdd}.xls",
+        "R08": "預約資料統計報表-當天{today_yymmdd}-當天{today_yymmdd}.xls",
+        "R09": "客戶來源與產值報表-.-當天{today_yymmdd}-顯示性別年齡.xls",
+        "R10": "客戶來源與產值報表-.-當天{today_yymmdd}-顯示服務人員.xls",
+        "R11": "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-僅新客.xls",
+        "R12": "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls",
+    }
+    for report in payload["reports"]:
+        if report["id"] in legacy_output_filenames:
+            report["output_filename"] = legacy_output_filenames[report["id"]]
     payload["drive_targets"]["R01"]["folder_id_or_url"] = ""
     payload["drive_targets"]["R02"]["folder_id_or_url"] = "user-r02-folder"
     payload["drive_targets"]["R06"]["branches"]["N003"] = ""
@@ -208,8 +237,17 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     assert config.scheduler.daily_time == "01:00"
     assert config.email.recipients == ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
     assert config.google_drive.upload_enabled is True
-    assert reports["R01"].output_filename == "課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
+    assert reports["R01"].output_filename == "課程服務明細表-{start}-{end}-全部.xls"
     assert reports["R02"].output_filename == "user-custom-r02-{start}.xls"
+    assert reports["R03"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
+    assert reports["R05"].output_filename == "商品課程服務明細表-{start}-{end}-僅新客.xls"
+    assert reports["R06"].output_filename == "會員剩餘點數殘值統計表-清單檢視{today}-{branch_name}.xls"
+    assert reports["R07"].output_filename == "預約資料統計報表-{yesterday}-{yesterday}.xls"
+    assert reports["R08"].output_filename == "預約資料統計報表-{today}-{today}.xls"
+    assert reports["R09"].output_filename == "客戶來源與產值報表-.-{today}-顯示性別年齡.xls"
+    assert reports["R10"].output_filename == "客戶來源與產值報表-.-{today}-顯示服務人員.xls"
+    assert reports["R11"].output_filename == "商品銷售明細表-{start}-{end}-僅新客.xls"
+    assert reports["R12"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
     assert config.drive_targets.targets["R01"].folder_id_or_url.endswith("1DibytnRl9054M65TMUVfHNSTIAeQ-ghF")
     assert config.drive_targets.targets["R02"].folder_id_or_url == "user-r02-folder"
     assert config.drive_targets.targets["R06"].branches["N003"].endswith("1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG")

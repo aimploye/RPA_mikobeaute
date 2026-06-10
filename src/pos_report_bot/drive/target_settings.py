@@ -20,7 +20,7 @@ def make_target_key(task_id: str, branch_code: str | None) -> str:
 def build_drive_target_rows(config: ProjectConfig) -> list[DriveTargetRow]:
     rows: list[DriveTargetRow] = []
     for report in config.reports:
-        if not report.enabled:
+        if not report.enabled or not _is_executable_report(report):
             continue
         if report.branch_mode == "each_branch":
             for branch in config.branches:
@@ -29,6 +29,15 @@ def build_drive_target_rows(config: ProjectConfig) -> list[DriveTargetRow]:
         else:
             rows.append(_row_for_report(config, report))
     return rows
+
+
+def _is_executable_report(report: ReportConfig) -> bool:
+    return bool(
+        report.handler.strip()
+        and report.handler != "placeholder"
+        and report.report_menu_text.strip()
+        and report.output_filename.strip()
+    )
 
 
 def apply_drive_target_values(config: ProjectConfig, values: dict[str, str]) -> None:

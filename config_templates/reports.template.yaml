@@ -9,7 +9,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
+    output_filename: "課程服務明細表-{start}-{end}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -30,7 +30,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
+    output_filename: "商品銷售明細表-{start}-{end}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -51,34 +51,34 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部-僅新客.xls"
+    output_filename: "商品銷售明細表-{start}-{end}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示分店碼", "顯示客代與電話", "顯示退費", "僅含新客"]
+      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
       uncheck: ["不列明細"]
-      other_conditions: []
+      other_conditions: ["二次篩選"]
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"
 
   - id: "R04"
-    enabled: true
+    enabled: false
     frequency: "daily"
-    name: "每日 商品銷售明細表 二次篩選"
-    handler: "product_sales_detail"
-    report_menu_text: "商品銷售明細表"
+    name: "R04 保留空號（停用）"
+    handler: "placeholder"
+    report_menu_text: ""
     branch_mode: "all"
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls"
+    output_filename: ""
     drive_folder_id: ""
-    upload_enabled: true
+    upload_enabled: false
     options:
-      check: ["顯示銷售分店", "顯示客代與電話", "顯示退費"]
-      uncheck: ["不列明細"]
-      other_conditions: ["二次篩選"]
+      check: []
+      uncheck: []
+      other_conditions: []
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"
@@ -93,7 +93,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls"
+    output_filename: "商品課程服務明細表-{start}-{end}-僅新客.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -114,7 +114,7 @@ reports:
     date_range:
       start: "2024/01/01"
       end: "{yesterday}"
-    output_filename: "會員剩餘點數殘值統計表-清單檢視{today_yymmdd}-{branch_name}.xls"
+    output_filename: "會員剩餘點數殘值統計表-清單檢視{today}-{branch_name}.xls"
     upload_enabled: true
     branch_drive_folder_ids:
       N001: ""
@@ -141,7 +141,7 @@ reports:
     date_range:
       start: "{yesterday}"
       end: "{yesterday}"
-    output_filename: "預約資料統計報表-前一天{yesterday_yymmdd}-前一天{yesterday_yymmdd}.xls"
+    output_filename: "預約資料統計報表-{yesterday}-{yesterday}.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -162,7 +162,7 @@ reports:
     date_range:
       start: "{today}"
       end: "{today}"
-    output_filename: "預約資料統計報表-當天{today_yymmdd}-當天{today_yymmdd}.xls"
+    output_filename: "預約資料統計報表-{today}-{today}.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -183,7 +183,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "客戶來源與產值報表-.-當天{today_yymmdd}-顯示性別年齡.xls"
+    output_filename: "客戶來源與產值報表-.-{today}-顯示性別年齡.xls"
     drive_folder_id: ""
     upload_enabled: true
     variant: "gender_age"
@@ -205,7 +205,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "客戶來源與產值報表-.-當天{today_yymmdd}-顯示服務人員.xls"
+    output_filename: "客戶來源與產值報表-.-{today}-顯示服務人員.xls"
     drive_folder_id: ""
     upload_enabled: true
     variant: "service_staff"
@@ -227,7 +227,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-僅新客.xls"
+    output_filename: "商品銷售明細表-{start}-{end}-僅新客.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -248,7 +248,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls"
+    output_filename: "商品銷售明細表-{start}-{end}-全部.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:

@@ -19,7 +19,7 @@ def test_build_drive_target_rows_lists_all_enabled_outputs() -> None:
 
     rows = build_drive_target_rows(config)
 
-    assert len(rows) == 18
+    assert len(rows) == 17
     assert rows[0].target_key == "R01"
     assert rows[0].task_id == "R01"
     assert rows[0].branch_code is None
@@ -32,6 +32,16 @@ def test_build_drive_target_rows_lists_all_enabled_outputs() -> None:
         "R06_N006",
     ]
     assert any(row.target_key == "R13" for row in rows)
+
+
+def test_build_drive_target_rows_skips_r04_placeholder_even_if_enabled() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    r04 = next(report for report in config.reports if report.id == "R04")
+    r04.enabled = True
+
+    rows = build_drive_target_rows(config)
+
+    assert "R04" not in {row.target_key for row in rows}
 
 
 def test_apply_drive_target_values_persists_and_removes_missing_targets(tmp_path: Path) -> None:
@@ -48,7 +58,7 @@ def test_apply_drive_target_values_persists_and_removes_missing_targets(tmp_path
     plan = build_dry_run_plan(reloaded, today=date(2026, 5, 13))
     payload = plan.to_payload()
 
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 17
     assert payload["counts"]["missing_drive_targets"] == 0
     assert all(output.drive_target_status == "configured" for output in plan.outputs)
     assert next(

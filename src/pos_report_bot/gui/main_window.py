@@ -573,7 +573,7 @@ class SettingsMainWindow(QMainWindow):
         for spec in drive_specs:
             drive_form.addRow(spec.label, self._create_setting_editor(spec))
         layout.addLayout(drive_form)
-        layout.addWidget(QLabel("18 個輸出項目的 Google Drive folder ID / URL"))
+        layout.addWidget(QLabel("啟用報表輸出項目的 Google Drive folder ID / URL"))
 
         table = QTableWidget()
         table.setObjectName("drive_target_table")
@@ -1354,10 +1354,10 @@ class SettingsMainWindow(QMainWindow):
 
     def _set_all_reports_enabled(self) -> None:
         for report in self.config.reports:
-            report.enabled = True
+            report.enabled = report.handler != "placeholder"
             checkbox = self.findChild(QCheckBox, f"report_{report.id}_enabled")
             if checkbox is not None:
-                checkbox.setChecked(True)
+                checkbox.setChecked(report.enabled)
 
     def _report_menu_entry_text(self, report: Any) -> str:
         if report.menu_path:

@@ -27,7 +27,7 @@ def build_dry_run_plan(config: ProjectConfig, *, today: date | None = None) -> D
     outputs: list[PlannedOutput] = []
 
     for report in config.reports:
-        if not report.enabled:
+        if not report.enabled or not _is_executable_report(report):
             continue
         if report.branch_mode == "each_branch":
             for branch in config.branches:
@@ -37,6 +37,15 @@ def build_dry_run_plan(config: ProjectConfig, *, today: date | None = None) -> D
             outputs.append(_build_output(config, report, base_date, branch=None))
 
     return DryRunPlan(outputs=outputs)
+
+
+def _is_executable_report(report: ReportConfig) -> bool:
+    return bool(
+        report.handler.strip()
+        and report.handler != "placeholder"
+        and report.report_menu_text.strip()
+        and report.output_filename.strip()
+    )
 
 
 def _build_output(

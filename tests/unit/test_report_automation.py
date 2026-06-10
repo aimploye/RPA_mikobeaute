@@ -1559,10 +1559,11 @@ def test_report_automation_selects_product_sales_allocation_option_alias_from_kn
     assert "select_option:顯示銷售分攤金額" in result.actions
 
 
-def test_report_automation_opens_other_conditions_before_secondary_filter(tmp_path: Path) -> None:
+def test_report_automation_runs_r03_two_step_product_sales_flow(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
-    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R04")
-    report = next(item for item in config.reports if item.id == "R04")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R03")
+    report = next(item for item in config.reports if item.id == "R03")
+    new_customer = FakePosControl("僅含新客", "CheckBox", automation_id="cK_ShowOnlyNewCust")
     other_conditions = FakePosControl(
         "其他條件...",
         "Static",
@@ -1580,6 +1581,7 @@ def test_report_automation_opens_other_conditions_before_secondary_filter(tmp_pa
             FakePosControl("顯示銷售分店", "CheckBox"),
             FakePosControl("顯示客代與電話", "ComboBox", automation_id="cM_ShowCostPrice"),
             FakePosControl("顯示退費", "CheckBox"),
+            new_customer,
             FakePosControl("不列明細", "CheckBox", automation_id="K_NoItemList"),
             other_conditions,
             FakePosControl("檢視報表", "Button"),
@@ -1593,14 +1595,36 @@ def test_report_automation_opens_other_conditions_before_secondary_filter(tmp_pa
 
     assert result.ok is True
     assert other_conditions.clicked is True
-    assert "click:其他條件" in result.actions
-    assert "check:二次篩選" in result.actions
+    assert new_customer.toggle_state == 0
+    _assert_action_milestones_in_order(
+        result.actions,
+        [
+            "check:顯示銷售分店",
+            "select_option:顯示客代與電話",
+            "check:顯示退費",
+            "check:僅含新客",
+            "uncheck:不列明細",
+            "phase:R03:preview:僅含新客",
+            lambda action: action.startswith("target:檢視報表:"),
+            "click:檢視報表",
+            "preview_ready:R03:僅含新客",
+            "uncheck:僅含新客",
+            "click:其他條件",
+            "check:二次篩選",
+            "phase:R03:preview:二次篩選",
+            lambda action: action.startswith("target:檢視報表:"),
+            "click:檢視報表",
+            "preview_ready:R03:二次篩選",
+            "click:匯出",
+            "click:匯出格式:Excel",
+        ],
+    )
 
 
 def test_report_automation_uses_fast_other_conditions_path_before_global_scan(tmp_path: Path) -> None:
     class ExplodingDescendantsWindow(FakePosControl):
         def descendants(self) -> list[FakePosControl]:
-            raise AssertionError("R04 secondary filter must not globally scan the full POS tree before opening 其他條件")
+            raise AssertionError("secondary filter must not globally scan the full POS tree before opening 其他條件")
 
     secondary_filter = FakePosControl("二次\r\n篩選", "CheckBox", automation_id="cK_ReQuery")
     report_form = FakePosControl(
@@ -3763,8 +3787,8 @@ def test_report_automation_accepts_hidden_export_menu_after_geometry_click(tmp_p
 
 def test_report_automation_treats_empty_report_viewer_as_unconfirmed_view_report(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
-    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R03")
-    report = next(item for item in config.reports if item.id == "R03")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R02")
+    report = next(item for item in config.reports if item.id == "R02")
     report_viewer = FakePosControl(
         "ReportToolBar",
         "Pane",
@@ -3788,7 +3812,6 @@ def test_report_automation_treats_empty_report_viewer_as_unconfirmed_view_report
             FakePosControl("顯示分店碼", "CheckBox"),
             FakePosControl("顯示客代與電話", "ComboBox"),
             FakePosControl("顯示退費", "CheckBox"),
-            FakePosControl("僅含新客", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
             report_viewer,
@@ -4678,6 +4701,12 @@ def test_report_automation_keeps_success_when_post_save_close_raises_com_error(t
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R03")
     report = next(item for item in config.reports if item.id == "R03")
+    other_conditions = FakePosControl(
+        "其他條件...",
+        "Static",
+        automation_id="L_OtherWhere",
+        on_click=lambda: window.children_controls.append(FakePosControl("二次\r\n篩選", "CheckBox", automation_id="cK_ReQuery")),
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -4691,6 +4720,7 @@ def test_report_automation_keeps_success_when_post_save_close_raises_com_error(t
             FakePosControl("顯示退費", "CheckBox"),
             FakePosControl("僅含新客", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
+            other_conditions,
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
             FakePosControl("Excel", "MenuItem"),

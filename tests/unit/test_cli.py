@@ -37,8 +37,9 @@ def test_dry_run_cli_outputs_json_plan() -> None:
 
     assert payload["mode"] == "dry_run"
     assert payload["status"] == "success"
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 17
     assert payload["counts"]["missing_drive_targets"] == 0
+    assert "R04" not in {output["task_id"] for output in payload["outputs"]}
     assert any(
         output["task_id"] == "R06" and output["branch_code"] == "N006"
         for output in payload["outputs"]
@@ -72,7 +73,8 @@ def test_dry_run_cli_can_write_summary(tmp_path: Path) -> None:
 
     assert summary_path.parent == tmp_path
     assert summary["status"] == "success"
-    assert len(summary["outputs"]) == 18
+    assert len(summary["outputs"]) == 17
+    assert "R04" not in {output["task_id"] for output in summary["outputs"]}
     assert summary["outputs"][0]["status"] == "skipped"
     assert summary["outputs"][0]["drive_folder_id"] == "1DibytnRl9054M65TMUVfHNSTIAeQ-ghF"
 

@@ -57,7 +57,7 @@ def test_pyside_settings_window_can_be_created() -> None:
     assert tabs.count() == 10
     table = window.findChild(QTableWidget, "drive_target_table")
     assert table is not None
-    assert table.rowCount() == 18
+    assert table.rowCount() == 17
     window.close()
 
 
@@ -300,8 +300,9 @@ def test_settings_window_can_fill_all_drive_targets_and_dry_run_has_no_missing()
     window.fill_all_drive_targets_for_testing(prefix="folder")
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 17
     assert payload["counts"]["missing_drive_targets"] == 0
+    assert "R04" not in {output["task_id"] for output in payload["outputs"]}
     window.close()
 
 
@@ -313,8 +314,9 @@ def test_settings_window_can_trigger_dry_run_without_pos() -> None:
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
     assert payload["mode"] == "dry_run"
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 17
     assert payload["counts"]["missing_drive_targets"] == 0
+    assert "R04" not in {output["task_id"] for output in payload["outputs"]}
     window.close()
 
 
@@ -330,7 +332,8 @@ def test_dry_run_button_updates_status_and_result() -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert window.last_dry_run_payload is not None
-    assert window.last_dry_run_payload["counts"]["outputs"] == 18
+    assert window.last_dry_run_payload["counts"]["outputs"] == 17
+    assert "R04" not in {output["task_id"] for output in window.last_dry_run_payload["outputs"]}
     assert "Dry-run 完成" in window.statusBar().currentMessage()
     window.close()
 

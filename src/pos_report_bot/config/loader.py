@@ -13,24 +13,59 @@ from pos_report_bot.config.models import (
 )
 
 LEGACY_REPORT_OUTPUT_FILENAMES: dict[str, set[str]] = {
-    "R01": {"R01_每日課程服務明細表_新舊客_{start}_{end}.xls"},
-    "R02": {"R02_每日商品銷售明細表_新舊客_{start}_{end}.xls"},
-    "R03": {"R03_每日商品銷售明細表_僅新客_{start}_{end}.xls"},
+    "R01": {
+        "R01_每日課程服務明細表_新舊客_{start}_{end}.xls",
+        "課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部.xls",
+    },
+    "R02": {
+        "R02_每日商品銷售明細表_新舊客_{start}_{end}.xls",
+        "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls",
+    },
+    "R03": {
+        "R03_每日商品銷售明細表_僅新客_{start}_{end}.xls",
+        "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部-僅新客.xls",
+        "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls",
+    },
     "R04": {"R04_每日商品銷售明細表_二次篩選_{start}_{end}.xls"},
     "R05": {
         "R05_諮詢師課程明細_二次篩選_{start}_{end}.xls",
         "R05_商品銷售明細_課程服務明細_二次篩選_{start}_{end}.xls",
+        "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls",
+        "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-僅新客.xls",
     },
     "R06": {
         "R06_{branch_code}_會員剩餘點數殘值統計表_{end}.xls",
         "R06_{branch_name}_會員剩餘點數殘值統計表_{end}.xls",
+        "會員剩餘點數殘值統計表-清單檢視{today_yymmdd}-{branch_name}.xls",
     },
-    "R07": {"R07_每日預約_截至前一日_{start}.xls"},
-    "R08": {"R08_每日預約_當日應到_{start}.xls"},
-    "R09": {"R09_客戶來源與產值_性別年齡_{start}_{end}.xls"},
-    "R10": {"R10_客戶來源與產值_服務人員_{start}_{end}.xls"},
-    "R11": {"R11_商品銷售明細_新客分攤金額_{start}_{end}.xls"},
-    "R12": {"R12_商品銷售明細_二次篩選分攤金額_{start}_{end}.xls"},
+    "R07": {
+        "R07_每日預約_截至前一日_{start}.xls",
+        "預約資料統計報表-前一天{yesterday_yymmdd}-前一天{yesterday_yymmdd}.xls",
+        "預約資料統計報表-{yesterday_yymmdd}-{yesterday_yymmdd}.xls",
+    },
+    "R08": {
+        "R08_每日預約_當日應到_{start}.xls",
+        "預約資料統計報表-當天{today_yymmdd}-當天{today_yymmdd}.xls",
+        "預約資料統計報表-{today_yymmdd}-{today_yymmdd}.xls",
+    },
+    "R09": {
+        "R09_客戶來源與產值_性別年齡_{start}_{end}.xls",
+        "客戶來源與產值報表-.-當天{today_yymmdd}-顯示性別年齡.xls",
+        "客戶來源與產值報表-.-{today_yymmdd}-顯示性別年齡.xls",
+    },
+    "R10": {
+        "R10_客戶來源與產值_服務人員_{start}_{end}.xls",
+        "客戶來源與產值報表-.-當天{today_yymmdd}-顯示服務人員.xls",
+        "客戶來源與產值報表-.-{today_yymmdd}-顯示服務人員.xls",
+    },
+    "R11": {
+        "R11_商品銷售明細_新客分攤金額_{start}_{end}.xls",
+        "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-僅新客.xls",
+    },
+    "R12": {
+        "R12_商品銷售明細_二次篩選分攤金額_{start}_{end}.xls",
+        "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls",
+    },
     "R13": {"R13_沙貨耗材領用查詢表_{start}_{end}.xls"},
 }
 
@@ -234,10 +269,23 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
     uncheck = list(report.options.uncheck)
     other_conditions = list(report.options.other_conditions)
 
-    if report.id in {"R02", "R03", "R05A", "R11", "R12"}:
+    if report.id in {"R02", "R05A", "R11", "R12"}:
         check = _replace_option(check, "顯示銷售分店", "顯示分店碼")
-    if report.id == "R04":
+    if report.id == "R03":
         check = _replace_option(check, "顯示分店碼", "顯示銷售分店")
+        check = _append_missing_options(check, ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"])
+        uncheck = _append_missing_options(uncheck, ["不列明細"])
+        other_conditions = _append_missing_options(other_conditions, ["二次篩選"])
+    if report.id == "R04":
+        report.enabled = False
+        report.name = "R04 保留空號（停用）"
+        report.handler = "placeholder"
+        report.report_menu_text = ""
+        report.output_filename = ""
+        report.upload_enabled = False
+        check = []
+        uncheck = []
+        other_conditions = []
     if report.id in {"R11", "R12"}:
         check = _replace_option(check, "顯示銷售分攤金額", "銷售分攤金額")
     if report.id == "R05":
@@ -319,7 +367,7 @@ def _make_r05_report_from_legacy(
             "report_menu_text": "課程服務明細表",
             "branch_mode": "all",
             "date_range": source.date_range.model_dump(mode="json"),
-            "output_filename": "商品課程服務明細表-{start_yymmdd}-{end_yymmdd}-全部-二次篩選.xls",
+            "output_filename": "商品課程服務明細表-{start}-{end}-僅新客.xls",
             "drive_folder_id": (legacy_r05b or source).drive_folder_id,
             "upload_enabled": source.upload_enabled,
             "options": {

@@ -56,6 +56,7 @@ def default_config_path() -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pos_report_bot")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--dry-run", action="store_true", help="展開報表任務但不操作 POS")
     parser.add_argument("--run-enabled", action="store_true", help="執行設定中已啟用的報表任務，用於 Windows 排程")

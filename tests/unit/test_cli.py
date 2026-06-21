@@ -5,6 +5,8 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from pos_report_bot.app import cli
 from pos_report_bot.pos.save_as_handler import (
     DesktopWindowProbeRecord,
@@ -16,6 +18,14 @@ from tests.unit.test_report_automation import FakePosControl
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_version_cli_outputs_current_version(capsys) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == "pos_report_bot 2.1.0"
 
 
 def test_install_scheduler_cli_retries_elevated_and_requests_diagnostic_dir(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]

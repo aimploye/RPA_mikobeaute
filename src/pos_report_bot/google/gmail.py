@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 from email.message import EmailMessage
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -22,7 +24,14 @@ class GmailOAuthSender:
         self.oauth = oauth
         self.build_func = build_func
 
-    def send(self, settings: EmailSettings, *, subject: str, body: str) -> GmailSendResult:
+    def send(
+        self,
+        settings: EmailSettings,
+        *,
+        subject: str,
+        body: str,
+        attachments: list[Path] | None = None,
+    ) -> GmailSendResult:
         if not settings.recipients:
             return GmailSendResult(ok=False, error_code="GMAIL_RECIPIENTS_MISSING", message="尚未設定 Gmail 收件人。")
 
@@ -34,6 +43,21 @@ class GmailOAuthSender:
             message["From"] = settings.username
         message["Subject"] = subject
         message.set_content(body)
+        for attachment in attachments or []:
+            if not attachment.exists() or not attachment.is_file():
+                return GmailSendResult(
+                    ok=False,
+                    error_code="GMAIL_ATTACHMENT_MISSING",
+                    message=f"Gmail API 附件不存在：{attachment}",
+                )
+            guessed_type, _encoding = mimetypes.guess_type(str(attachment))
+            maintype, subtype = (guessed_type or "application/octet-stream").split("/", 1)
+            message.add_attachment(
+                attachment.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=attachment.name,
+            )
         encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
 
         try:

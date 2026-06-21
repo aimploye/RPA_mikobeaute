@@ -8,7 +8,7 @@ drive_targets:
   R02:
     folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"
   R03:
-    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1iIwcWtj4Vs5yFf4YN_iU2pnkbMNWj9sl"
   R04:
     folder_id_or_url: ""
   R05:
@@ -34,4 +34,6 @@ drive_targets:
   R12:
     folder_id_or_url: "https://drive.google.com/drive/u/6/folders/138OFGxT7UghB5HkjIsUsXIkT6vOpqoXl"
   R13:
-    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1ti3TAtYg7anbwglrR2eSzT-TkPYme3Ys"
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1wIz37SF8Qi3gdceLrfmKpt3lUiktbm9z"
+  R14:
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1iqRNYGHuBFWHBLqmFpfFKJ5PqNvZAgYW"

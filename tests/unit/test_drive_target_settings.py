@@ -19,7 +19,7 @@ def test_build_drive_target_rows_lists_all_enabled_outputs() -> None:
 
     rows = build_drive_target_rows(config)
 
-    assert len(rows) == 17
+    assert len(rows) == 18
     assert rows[0].target_key == "R01"
     assert rows[0].task_id == "R01"
     assert rows[0].branch_code is None
@@ -32,6 +32,7 @@ def test_build_drive_target_rows_lists_all_enabled_outputs() -> None:
         "R06_N006",
     ]
     assert any(row.target_key == "R13" for row in rows)
+    assert any(row.target_key == "R14" for row in rows)
 
 
 def test_build_drive_target_rows_skips_r04_placeholder_even_if_enabled() -> None:
@@ -58,13 +59,14 @@ def test_apply_drive_target_values_persists_and_removes_missing_targets(tmp_path
     plan = build_dry_run_plan(reloaded, today=date(2026, 5, 13))
     payload = plan.to_payload()
 
-    assert payload["counts"]["outputs"] == 17
+    assert payload["counts"]["outputs"] == 18
     assert payload["counts"]["missing_drive_targets"] == 0
     assert all(output.drive_target_status == "configured" for output in plan.outputs)
     assert next(
         output for output in plan.outputs if output.task_id == "R06" and output.branch_code == "N006"
     ).drive_folder_id == "folder_R06_N006"
     assert next(output for output in plan.outputs if output.task_id == "R13").drive_folder_id == "folder_R13"
+    assert next(output for output in plan.outputs if output.task_id == "R14").drive_folder_id == "folder_R14"
 
 
 def test_make_target_key_uses_branch_code_for_branch_outputs() -> None:

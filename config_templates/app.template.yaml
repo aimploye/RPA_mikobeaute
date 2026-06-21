@@ -34,8 +34,12 @@ save_as:
   save_button_text: "存檔"
   default_extension: ".xls"
   overwrite_policy: "rename_unique" # rename_unique | overwrite | fail
-  wait_timeout_seconds: 60
+  wait_timeout_seconds: 300
   stable_seconds: 3
+  recovery_search_dirs:
+    - "%USERPROFILE%\\Downloads"
+    - "D:\\Download"
+    - "D:\\Download\\記錄檔"
 
 google_drive:
   upload_enabled: true
@@ -45,17 +49,34 @@ google_drive:
   client_secret_path: ""
 
 email:
-  enabled: false
+  enabled: true
   smtp_host: ""
   smtp_port: 587
   use_tls: true
   username: ""
   recipients:
     - "joe.little7208@gmail.com"
-    - "jamie.yeh@bebetterone.com"
+    - "mickey.chen@mikobeaute.com"
   cc: []
   notify_on_failure: true
   notify_on_success_summary: true
+
+r14_email:
+  enabled: true
+  recipients:
+    - "joe.little7208@gmail.com"
+    - "mickey.chen@mikobeaute.com"
+    - "rae.hsu@mikobeaute.com"
+    - "miko_03@mikobeaute.com"
+    - "bbone_pu@bebetterone.com"
+  cc: []
+  subject_template: "{date}耗材領用報表"
+  body: |
+    Hi,
+
+    附件為本日耗材領用報表，請您查收。
+
+    RPA程式
 
 scheduler:
   enabled: false
@@ -77,7 +98,7 @@ pos_update:
   resume_unfinished_tasks: true
 
 pos_recovery:
-  enabled: false
+  enabled: true
   health_check_interval_seconds: 5
   restart_delay_seconds: 5
   max_restarts_per_run: 2
@@ -85,3 +106,10 @@ pos_recovery:
   relaunch_after_kill: true
   retry_current_task_after_restart: true
   credential_keyring_service: "POSReportBot POS"
+
+r14_transform:
+  template_path: ""
+  template_search_dir: "C:\\ProgramData\\POSReportBot\\templates"
+  raw_search_dir: ""
+  raw_filename_glob: "診所stock status - * demand planning-*-rawdata.xls"
+  output_extension: ".xlsx"

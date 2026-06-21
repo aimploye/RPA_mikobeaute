@@ -1,9 +1,11 @@
 from enum import StrEnum
 from importlib import import_module
+import os
 from pathlib import Path
+import shutil
 import sys
-from time import monotonic, sleep
-from typing import Any, Callable, cast
+from time import monotonic, sleep, time
+from typing import Any, Callable, Sequence, cast
 
 from pydantic import BaseModel, Field
 
@@ -135,8 +137,9 @@ class WindowsSaveAsHandler:
         save_button_text: str = "存檔",
         default_extension: str = ".xls",
         overwrite_policy: OverwritePolicy = OverwritePolicy.RENAME_UNIQUE,
-        wait_timeout_seconds: int = 60,
+        wait_timeout_seconds: int = 300,
         stable_seconds: int = 3,
+        recovery_search_dirs: Sequence[str | Path] | None = None,
     ) -> None:
         self.dialog_title_contains = dialog_title_contains
         self.filename_label = filename_label
@@ -145,6 +148,7 @@ class WindowsSaveAsHandler:
         self.overwrite_policy = overwrite_policy
         self.wait_timeout_seconds = wait_timeout_seconds
         self.stable_seconds = stable_seconds
+        self.recovery_search_dirs = [str(path) for path in recovery_search_dirs or []]
         self._keyboard_sender: Any | None = None
         self._clipboard_setter: Any | None = None
         self._action_logger: Callable[[str], None] | None = None
@@ -174,6 +178,9 @@ class WindowsSaveAsHandler:
                 message=f"File already exists: {output_path}",
             )
         target.parent.mkdir(parents=True, exist_ok=True)
+        recovery_directories = self._recovery_directories(target)
+        directory_snapshot = self._directory_snapshot(recovery_directories)
+        save_wall_time = time()
 
         try:
             dialog_started_at = monotonic()
@@ -181,6 +188,18 @@ class WindowsSaveAsHandler:
             try:
                 dialog = self._wait_for_dialog()
             except SaveAsDialogTimeoutError as exc:
+                if self._observed_export_progress(exc.observed_windows):
+                    self._log_action("skip:另存新檔鍵盤盲填:export_progress_still_visible")
+                    return SaveResult(
+                        status=SaveStatus.FAILED,
+                        output_path=target,
+                        error_code="EXPORT_PROGRESS_TIMEOUT",
+                        message=(
+                            "POS 正在匯出超過 "
+                            f"{self.wait_timeout_seconds} 秒，尚未出現另存新檔視窗；"
+                            "請檢查 POS 是否卡在匯出進度視窗。"
+                        ),
+                    )
                 self._log_action(f"fallback:另存新檔鍵盤盲填:reason={exc}")
                 self._set_filename_by_blind_keyboard(str(target))
                 self._log_action(f"wait_result:另存新檔視窗:elapsed={int(monotonic() - dialog_started_at)}s:blind_keyboard")
@@ -214,6 +233,13 @@ class WindowsSaveAsHandler:
             f"wait_result:檔案穩定:elapsed={int(monotonic() - validation_started_at)}s:ok={validation.ok}"
         )
         if not validation.ok:
+            recovered = self._recover_unexpected_saved_file(
+                target,
+                before_snapshot=directory_snapshot,
+                save_wall_time=save_wall_time,
+            )
+            if recovered is not None:
+                return recovered
             return SaveResult(
                 status=SaveStatus.FAILED,
                 output_path=target,
@@ -221,6 +247,137 @@ class WindowsSaveAsHandler:
                 message=validation.message,
             )
         return SaveResult(status=status, output_path=target, message="Windows SaveAs completed")
+
+    def _recovery_directories(self, target: Path) -> list[Path]:
+        raw_paths: list[str | Path] = [
+            target.parent,
+            *self.recovery_search_dirs,
+            Path.cwd(),
+        ]
+        for env_name in ("USERPROFILE", "HOME"):
+            home = os.environ.get(env_name)
+            if home:
+                raw_paths.append(Path(home) / "Downloads")
+        directories: list[Path] = []
+        seen: set[str] = set()
+        for raw_path in raw_paths:
+            expanded = os.path.expandvars(os.path.expanduser(str(raw_path)))
+            path = Path(expanded)
+            try:
+                normalized = str(path.resolve()) if path.exists() else str(path)
+            except OSError:
+                normalized = str(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                if path.is_dir():
+                    directories.append(path)
+            except OSError:
+                continue
+        return directories
+
+    def _directory_snapshot(self, directories: list[Path]) -> dict[Path, tuple[int, int]]:
+        snapshot: dict[Path, tuple[int, int]] = {}
+        for directory in directories:
+            try:
+                paths = list(directory.iterdir())
+            except OSError:
+                continue
+            for path in paths:
+                try:
+                    if not path.is_file():
+                        continue
+                    stat = path.stat()
+                except OSError:
+                    continue
+                snapshot[path] = (int(stat.st_mtime_ns), int(stat.st_size))
+        return snapshot
+
+    def _recover_unexpected_saved_file(
+        self,
+        target: Path,
+        *,
+        before_snapshot: dict[Path, tuple[int, int]],
+        save_wall_time: float,
+    ) -> SaveResult | None:
+        candidates = self._unexpected_saved_file_candidates(
+            target,
+            before_snapshot=before_snapshot,
+            save_wall_time=save_wall_time,
+        )
+        if not candidates:
+            self._log_action("skip:另存新檔非預期檔名復原:none")
+            return None
+        if len(candidates) > 1:
+            names = ",".join(path.name for path in candidates[:5])
+            self._log_action(f"skip:另存新檔非預期檔名復原:ambiguous:{names}")
+            return None
+        source = candidates[0]
+        try:
+            shutil.move(str(source), str(target))
+        except OSError as exc:
+            self._log_action(f"skip:另存新檔非預期檔名復原:rename_failed:{source.name}:{exc}")
+            return None
+        validation = validate_file(
+            target,
+            wait_timeout_seconds=0,
+            stable_checks=max(self.stable_seconds, 1),
+            stable_interval_seconds=1,
+        )
+        if not validation.ok:
+            self._log_action(f"skip:另存新檔非預期檔名復原:target_invalid:{validation.status.value}")
+            return None
+        self._log_action(f"recover:另存新檔非預期檔名:{source.name}->{target.name}")
+        return SaveResult(
+            status=SaveStatus.RENAMED,
+            output_path=target,
+            message=f"Windows SaveAs completed after renaming unexpected output file: {source.name}",
+        )
+
+    def _unexpected_saved_file_candidates(
+        self,
+        target: Path,
+        *,
+        before_snapshot: dict[Path, tuple[int, int]],
+        save_wall_time: float,
+    ) -> list[Path]:
+        suffixes = {target.suffix.lower(), self.default_extension.lower(), ".xls"}
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        for directory in self._recovery_directories(target):
+            try:
+                paths = list(directory.iterdir())
+            except OSError:
+                continue
+            for path in paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                if path == target:
+                    continue
+                if not path.suffix or path.suffix.lower() not in suffixes:
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    stat = path.stat()
+                except OSError:
+                    continue
+                previous = before_snapshot.get(path)
+                changed = previous is None or previous != (int(stat.st_mtime_ns), int(stat.st_size))
+                recent = stat.st_mtime >= save_wall_time - 5
+                if not changed and not recent:
+                    continue
+                validation = validate_file(
+                    path,
+                    wait_timeout_seconds=0,
+                    stable_checks=1,
+                    stable_interval_seconds=0.2,
+                )
+                if validation.ok:
+                    candidates.append(path)
+        return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
 
     def _log_action(self, action: str) -> None:
         if self._action_logger is not None:
@@ -333,6 +490,16 @@ class WindowsSaveAsHandler:
                 observed_windows=observed_windows,
             )
         raise SaveAsDialogTimeoutError("等待另存新檔視窗逾時", observed_windows=observed_windows)
+
+    def _observed_export_progress(self, records: list[DesktopWindowProbeRecord]) -> bool:
+        for record in records:
+            title = record.title or ""
+            child_text = " ".join(record.child_windows)
+            if "正在匯出" in title:
+                return True
+            if "請稍候" in child_text and ("取消" in child_text or "ExportDialog" in title):
+                return True
+        return False
 
     def _fast_foreground_window_handle(self) -> int | None:
         if not sys.platform.startswith("win"):

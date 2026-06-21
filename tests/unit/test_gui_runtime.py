@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QCheckBox,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -23,6 +25,7 @@ import pos_report_bot.gui.main_window as main_window  # noqa: E402
 from pos_report_bot.gui.main_window import SettingsMainWindow  # noqa: E402
 from pos_report_bot.pos.save_as_handler import MockSaveAsHandler  # noqa: E402
 from pos_report_bot.pos.ui_probe import ControlProbeRecord, UiProbeReport  # noqa: E402
+from pos_report_bot.scheduler.windows_task_scheduler import SchedulerCommandResult  # noqa: E402
 from tests.unit.test_report_automation import FakePosControl  # noqa: E402
 from tests.unit.test_ui_probe import FakeControl  # noqa: E402
 
@@ -54,10 +57,70 @@ def test_pyside_settings_window_can_be_created() -> None:
     assert window.windowTitle() == "POSReportBot 設定中心"
     tabs = window.findChild(QTabWidget)
     assert tabs is not None
-    assert tabs.count() == 10
+    assert tabs.count() == 11
     table = window.findChild(QTableWidget, "drive_target_table")
     assert table is not None
-    assert table.rowCount() == 17
+    assert table.rowCount() == 18
+    window.close()
+
+
+def test_settings_window_defaults_enable_reports_drive_and_email() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    report_title = window.findChild(QLabel, "reports_title")
+    drive_enabled = window.findChild(QCheckBox, "setting_google_drive_upload_enabled")
+    email_enabled = window.findChild(QCheckBox, "setting_email_enabled")
+    r01_enabled = window.findChild(QCheckBox, "report_R01_enabled")
+    r14_enabled = window.findChild(QCheckBox, "report_R14_enabled")
+    r04_enabled = window.findChild(QCheckBox, "report_R04_enabled")
+    drive_table = window.findChild(QTableWidget, "drive_target_table")
+
+    assert report_title is not None
+    assert report_title.text() == "報表任務設定 - 已啟用 13 項"
+    assert drive_enabled is not None and drive_enabled.isChecked()
+    assert email_enabled is not None and email_enabled.isChecked()
+    assert r01_enabled is not None and r01_enabled.isChecked()
+    assert r14_enabled is not None and r14_enabled.isChecked()
+    assert r04_enabled is not None and not r04_enabled.isChecked()
+    assert drive_table is not None
+    assert drive_table.rowCount() == 18
+    task_ids = {
+        drive_table.item(row, 1).text()
+        for row in range(drive_table.rowCount())
+        if drive_table.item(row, 1) is not None
+    }
+    assert {"R01", "R13", "R14"} <= task_ids
+    window.close()
+
+
+def test_settings_window_skips_tray_icon_when_system_tray_unavailable(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    monkeypatch.setattr(main_window.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: False))
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+
+    window = SettingsMainWindow(config)
+
+    assert window._tray_icon is None
+    window.close()
+
+
+def test_settings_window_tray_activation_restores_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    monkeypatch.setattr(main_window.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config)
+
+    assert window._tray_icon is not None
+    window.hide()
+    assert not window.isVisible()
+
+    window._handle_tray_activated(main_window.QSystemTrayIcon.ActivationReason.Trigger)
+    _process_events_until(lambda: window.isVisible())
+
+    assert window.isVisible()
+    assert not window.isMinimized()
     window.close()
 
 
@@ -230,6 +293,114 @@ def test_email_and_schedule_settings_pages_save_typed_values(tmp_path: Path) -> 
     window.close()
 
 
+def test_settings_window_scheduler_failure_includes_diagnostic_path(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.logs_dir = str(tmp_path / "logs")
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+    captured = {}
+
+    def fake_install_task(settings, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return SchedulerCommandResult(
+            ok=False,
+            command=["schtasks"],
+            error_code="WINDOWS_SCHEDULER_ACCESS_DENIED",
+            returncode=1,
+            stderr="錯誤: 存取被拒。",
+            message="failed",
+            diagnostic_path=str(tmp_path / "logs" / date.today().strftime("%Y%m%d") / "scheduler_install_failure.json"),
+        )
+
+    monkeypatch.setattr(main_window, "install_task", fake_install_task)
+
+    result = window._handle_scheduler_action("安裝 Windows Task Scheduler")
+
+    assert result.ok is False
+    assert result.error_code == "WINDOWS_SCHEDULER_ACCESS_DENIED"
+    assert result.details is not None
+    assert "diagnostic_path:" in result.details
+    assert "scheduler_install_failure.json" in result.details
+    assert captured["retry_elevated_on_access_denied"] is True
+    assert captured["diagnostic_dir"] == tmp_path / "logs" / date.today().strftime("%Y%m%d")
+    window.close()
+
+
+def test_settings_window_scheduler_status_uses_inspect_details(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+    captured = {}
+
+    def fake_inspect_task(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return SchedulerCommandResult(
+            ok=True,
+            command=["powershell.exe"],
+            message="已讀取排程狀態：POSReportBot Daily Reports，last_result=0x00041303（任務尚未執行過）",
+            details={
+                "TaskName": "POSReportBot Daily Reports",
+                "NextRunTime": "2026-06-15T01:10:00",
+                "LastTaskResultHex": "0x00041303",
+                "LastTaskResultHint": "任務尚未執行過",
+            },
+        )
+
+    monkeypatch.setattr(main_window, "inspect_task", fake_inspect_task)
+
+    result = window._handle_scheduler_action("檢查排程狀態")
+
+    assert result.ok is True
+    assert captured["task_name"] == "POSReportBot Daily Reports"
+    assert "任務尚未執行過" in result.message
+    assert result.details is not None
+    details = result.details
+    assert "details:" in details
+    assert "LastTaskResultHex" in details
+    assert json.loads(details.split("details:\n", 1)[1])["NextRunTime"] == "2026-06-15T01:10:00"
+    window.close()
+
+
+def test_settings_window_saving_schedule_warns_to_reinstall_existing_task(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+
+    result = window._handle_scheduler_action("儲存排程設定")
+
+    assert result.ok is True
+    assert "請再按「安裝 Windows Task Scheduler」" in result.message
+    window.close()
+
+
+def test_r14_email_settings_page_saves_typed_values(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+
+    enabled = window.findChild(QCheckBox, "setting_r14_email_enabled")
+    recipients = window.findChild(QLineEdit, "setting_r14_email_recipients")
+    subject = window.findChild(QLineEdit, "setting_r14_email_subject_template")
+    body = window.findChild(QPlainTextEdit, "setting_r14_email_body")
+    assert enabled is not None
+    assert recipients is not None
+    assert subject is not None
+    assert body is not None
+
+    enabled.setChecked(True)
+    recipients.setText("r14-a@example.com, r14-b@example.com")
+    subject.setText("R14 {date} custom")
+    body.setPlainText("custom body\n{filename}")
+    saved_path = window.save_settings(tmp_path / "app.yaml")
+    reloaded = load_project_config(saved_path)
+
+    assert reloaded.r14_email.enabled is True
+    assert reloaded.r14_email.recipients == ["r14-a@example.com", "r14-b@example.com"]
+    assert reloaded.r14_email.subject_template == "R14 {date} custom"
+    assert reloaded.r14_email.body == "custom body\n{filename}"
+    window.close()
+
+
 def test_branch_settings_table_saves_editable_values(tmp_path: Path) -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
@@ -300,7 +471,7 @@ def test_settings_window_can_fill_all_drive_targets_and_dry_run_has_no_missing()
     window.fill_all_drive_targets_for_testing(prefix="folder")
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
-    assert payload["counts"]["outputs"] == 17
+    assert payload["counts"]["outputs"] == 18
     assert payload["counts"]["missing_drive_targets"] == 0
     assert "R04" not in {output["task_id"] for output in payload["outputs"]}
     window.close()
@@ -314,7 +485,7 @@ def test_settings_window_can_trigger_dry_run_without_pos() -> None:
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
     assert payload["mode"] == "dry_run"
-    assert payload["counts"]["outputs"] == 17
+    assert payload["counts"]["outputs"] == 18
     assert payload["counts"]["missing_drive_targets"] == 0
     assert "R04" not in {output["task_id"] for output in payload["outputs"]}
     window.close()
@@ -332,7 +503,7 @@ def test_dry_run_button_updates_status_and_result() -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert window.last_dry_run_payload is not None
-    assert window.last_dry_run_payload["counts"]["outputs"] == 17
+    assert window.last_dry_run_payload["counts"]["outputs"] == 18
     assert "R04" not in {output["task_id"] for output in window.last_dry_run_payload["outputs"]}
     assert "Dry-run 完成" in window.statusBar().currentMessage()
     window.close()
@@ -661,6 +832,32 @@ def test_report_page_can_enable_only_r01_for_single_report_dry_run() -> None:
     window.close()
 
 
+def test_report_page_enable_all_refreshes_drive_targets_and_persists(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        report.enabled = report.id == "R14"
+    window = SettingsMainWindow(config, settings_path=tmp_path / "app.yaml")
+
+    title = window.findChild(QLabel, "reports_title")
+    drive_table = window.findChild(QTableWidget, "drive_target_table")
+    enable_all = window.findChild(QPushButton, "reports_啟用全部報表")
+    assert title is not None
+    assert title.text() == "報表任務設定 - 已啟用 1 項"
+    assert drive_table is not None
+    assert drive_table.rowCount() == 1
+    assert enable_all is not None
+
+    enable_all.click()
+    reloaded = load_project_config(tmp_path / "app.yaml")
+
+    assert title.text() == "報表任務設定 - 已啟用 13 項"
+    assert drive_table.rowCount() == 18
+    assert sum(1 for report in reloaded.reports if report.enabled) == 13
+    assert next(report for report in reloaded.reports if report.id == "R14").enabled is True
+    window.close()
+
+
 def test_dashboard_execute_enabled_reports_runs_real_automation_path(
     monkeypatch, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
@@ -706,7 +903,7 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
 
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
-    assert "已完成 1 個 POS 報表下載" in window.statusBar().currentMessage()
+    assert "已完成 1 個報表任務下載" in window.statusBar().currentMessage()
     assert len(list(dated_downloads_dir.glob("課程服務明細表-*.xls"))) == 1
     assert (tmp_path / "state" / date.today().strftime("%Y%m%d") / "run_state_latest.json").exists()
     window.close()

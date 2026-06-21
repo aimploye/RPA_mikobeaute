@@ -22,6 +22,7 @@ def test_settings_pages_cover_required_sections_without_importing_pyside() -> No
         "reports",
         "drive",
         "email",
+        "r14_email",
         "schedule",
         "diagnostics",
     ]
@@ -53,5 +54,5 @@ def test_settings_pages_reflect_loaded_config_counts() -> None:
     branches = next(page for page in pages if page.page_id == "branches")
     reports = next(page for page in pages if page.page_id == "reports")
 
-    assert branches.badge == "6 enabled"
-    assert reports.badge == "12 enabled"
+    assert branches.badge == "已啟用 6 項"
+    assert reports.badge == "已啟用 13 項"

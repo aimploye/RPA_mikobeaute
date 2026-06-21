@@ -5,14 +5,13 @@ import os
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from pos_report_bot import __version__
-from pos_report_bot.app.automation_runner import AutomationRunner
+from pos_report_bot.app.automation_runner import LOCAL_REPORT_HANDLERS, AutomationRunner
 from pos_report_bot.config.loader import load_project_config
 from pos_report_bot.config.writer import user_config_path
 from pos_report_bot.core.summary import build_dry_run_summary, write_run_summary
-from pos_report_bot.gui.main_window import launch_settings_gui
 from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
 from pos_report_bot.pos.save_as_handler import (
     OverwritePolicy,
@@ -23,10 +22,11 @@ from pos_report_bot.pos.ui_probe import UiProbeError, actual_window_backend, con
 from pos_report_bot.reports.planner import build_dry_run_plan
 from pos_report_bot.scheduler.windows_task_scheduler import (
     DEFAULT_TASK_NAME,
+    inspect_task,
     install_task,
-    query_task,
     remove_task,
 )
+from pos_report_bot.startup_diagnostics import write_scheduler_startup_event
 from pos_report_bot.storage.runtime_paths import RuntimePaths
 
 
@@ -76,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def launch_settings_gui(config: Any, *, settings_path: Path) -> int:
+    from pos_report_bot.gui.main_window import launch_settings_gui as _launch_settings_gui
+
+    return _launch_settings_gui(config, settings_path=settings_path)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -104,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _scheduler_result_to_exit_code(remove_task(task_name=args.scheduler_task_name))
 
     if args.query_scheduler:
-        return _scheduler_result_to_exit_code(query_task(task_name=args.scheduler_task_name))
+        return _scheduler_result_to_exit_code(inspect_task(task_name=args.scheduler_task_name))
 
     if not args.dry_run:
         parser.print_help()
@@ -133,10 +139,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None = None) -> int:
     run_date = date.fromisoformat(today) if today else date.today()
     config = load_project_config(config_path)
+    report = next((item for item in config.reports if item.id == task_id), None)
+    if report is not None:
+        for item in config.reports:
+            item.enabled = item.id == task_id
     plan = build_dry_run_plan(config, today=run_date)
     runtime_paths = RuntimePaths.from_config(config, run_date=run_date)
     output = next((item for item in plan.outputs if item.task_id == task_id), None)
-    report = next((item for item in config.reports if item.id == task_id), None)
     if output is None or report is None:
         print(
             json.dumps(
@@ -151,6 +160,29 @@ def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None =
             )
         )
         return 1
+
+    if report.handler in LOCAL_REPORT_HANDLERS:
+        for item in config.reports:
+            item.enabled = item.id == task_id
+        summary = AutomationRunner(
+            config,
+            settings_path=config_path,
+            app_version=__version__,
+            run_source="manual_single_task",
+            run_date=run_date,
+        ).run()
+        payload = {
+            "ok": summary.ok,
+            "completed": summary.completed,
+            "skipped": summary.skipped,
+            "total": summary.total,
+            "message": summary.message,
+            "error_code": summary.error_code,
+            "details": summary.details,
+            "failures": [asdict(failure) for failure in summary.failures],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if summary.ok else 1
 
     try:
         window = connect_pos_window(
@@ -209,13 +241,74 @@ def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None =
 
 
 def _run_enabled_pos_tasks(config_path: Path, *, run_source: str = "manual_cli") -> int:
-    config = load_project_config(config_path)
-    summary = AutomationRunner(
-        config,
-        settings_path=config_path,
-        app_version=__version__,
+    startup_path = write_scheduler_startup_event(config_path=config_path, run_source=run_source, phase="cli_entry")
+    try:
+        config = load_project_config(config_path)
+    except Exception as exc:
+        failure_path = write_scheduler_startup_event(
+            config_path=config_path,
+            run_source=run_source,
+            phase="config_load_failed",
+            error_code="CONFIG_LOAD_FAILED",
+            message=str(exc),
+            exc=exc,
+        )
+        payload = {
+            "ok": False,
+            "completed": 0,
+            "skipped": 0,
+            "total": 0,
+            "message": f"排程啟動後讀取設定檔失敗：{exc}",
+            "error_code": "CONFIG_LOAD_FAILED",
+            "details": str(config_path),
+            "scheduler_startup_path": str(failure_path or startup_path) if failure_path or startup_path else None,
+            "failures": [],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1
+    startup_path = write_scheduler_startup_event(
+        config_path=config_path,
         run_source=run_source,
-    ).run()
+        phase="config_loaded",
+        config=config,
+    ) or startup_path
+    try:
+        summary = AutomationRunner(
+            config,
+            settings_path=config_path,
+            app_version=__version__,
+            run_source=run_source,
+        ).run()
+    except Exception as exc:
+        failure_path = write_scheduler_startup_event(
+            config_path=config_path,
+            run_source=run_source,
+            phase="runner_failed",
+            config=config,
+            error_code="RUNNER_FAILED",
+            message=str(exc),
+            exc=exc,
+        )
+        payload = {
+            "ok": False,
+            "completed": 0,
+            "skipped": 0,
+            "total": 0,
+            "message": f"排程啟動後執行自動化失敗：{exc}",
+            "error_code": "RUNNER_FAILED",
+            "details": str(config_path),
+            "scheduler_startup_path": str(failure_path or startup_path) if failure_path or startup_path else None,
+            "failures": [],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1
+    finish_path = write_scheduler_startup_event(
+        config_path=config_path,
+        run_source=run_source,
+        phase="runner_finished",
+        config=config,
+        message=summary.message,
+    )
     payload = {
         "ok": summary.ok,
         "completed": summary.completed,
@@ -224,6 +317,7 @@ def _run_enabled_pos_tasks(config_path: Path, *, run_source: str = "manual_cli")
         "message": summary.message,
         "error_code": summary.error_code,
         "details": summary.details,
+        "scheduler_startup_path": str(finish_path or startup_path) if finish_path or startup_path else None,
         "failures": [asdict(failure) for failure in summary.failures],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -232,11 +326,14 @@ def _run_enabled_pos_tasks(config_path: Path, *, run_source: str = "manual_cli")
 
 def _install_scheduler_from_cli(config_path: Path, *, task_name: str) -> int:
     config = load_project_config(config_path)
+    runtime_paths = RuntimePaths.from_config(config, run_date=date.today())
     result = install_task(
         config.scheduler,
         task_name=task_name,
         python_exe=str(Path(sys.executable)),
         config_path=str(config_path),
+        retry_elevated_on_access_denied=True,
+        diagnostic_dir=runtime_paths.logs_dir,
     )
     return _scheduler_result_to_exit_code(result)
 

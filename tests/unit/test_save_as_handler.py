@@ -6,6 +6,7 @@ from pos_report_bot.pos.save_as_handler import (
     DesktopWindowProbeRecord,
     MockSaveAsHandler,
     OverwritePolicy,
+    SaveAsDialogTimeoutError,
     SaveStatus,
     WindowsSaveAsHandler,
     _NativeSaveAsDialog,
@@ -415,6 +416,77 @@ def test_windows_save_as_save_uses_blind_keyboard_when_dialog_handle_is_not_dete
     assert clipboard_values == [str(target)]
     assert sent_keys[-1] == "{ENTER}"
     assert any(action.startswith("fallback:另存新檔鍵盤盲填:") for action in actions)
+
+
+def test_windows_save_as_does_not_blind_type_while_pos_export_is_still_running(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    handler = WindowsSaveAsHandler(wait_timeout_seconds=300)
+    target = tmp_path / "R13.xls"
+    actions: list[str] = []
+    sent_keys: list[str] = []
+    handler.set_action_logger(actions.append)
+    handler._keyboard_sender = lambda keys, **_kwargs: sent_keys.append(keys)  # type: ignore[attr-defined]
+    handler._wait_for_dialog = lambda: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+        SaveAsDialogTimeoutError(
+            "等待另存新檔視窗逾時",
+            observed_windows=[
+                DesktopWindowProbeRecord(
+                    handle=300,
+                    title="正在匯出",
+                    control_type="Window",
+                    class_name="WindowsForms10.Window.8.app.0.2bf8098_r8_ad1",
+                    rectangle={"left": 410, "top": 300, "right": 610, "bottom": 390},
+                    enabled=True,
+                    visible=True,
+                    is_foreground=True,
+                    child_windows=[
+                        "WindowsForms10.BUTTON.app.0.2bf8098_r8_ad1/取消",
+                        "WindowsForms10.STATIC.app.0.2bf8098_r8_ad1/請稍候...",
+                    ],
+                )
+            ],
+        )
+    )
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    result = handler.save(target)
+
+    assert result.error_code == "EXPORT_PROGRESS_TIMEOUT"
+    assert "正在匯出超過 300 秒" in result.message
+    assert sent_keys == []
+    assert "skip:另存新檔鍵盤盲填:export_progress_still_visible" in actions
+
+
+def test_windows_save_as_recovers_when_pos_uses_unexpected_filename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    misplaced_dir = tmp_path / "記錄檔"
+    misplaced_dir.mkdir()
+    handler = WindowsSaveAsHandler(
+        wait_timeout_seconds=0,
+        stable_seconds=1,
+        recovery_search_dirs=[misplaced_dir],
+    )
+    target = tmp_path / "會員剩餘點數殘值統計表-清單檢視20260618-忠孝健康7F.xls"
+    unexpected = misplaced_dir / "SurplusValue_Report.xls"
+    actions: list[str] = []
+    handler.set_action_logger(actions.append)
+    handler._wait_for_dialog = lambda: object()  # type: ignore[attr-defined]
+    handler._set_filename = lambda _dialog, _filename: None  # type: ignore[attr-defined]
+    handler._click_save = lambda _dialog: unexpected.write_bytes(b"real-xls-content")  # type: ignore[attr-defined]
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    result = handler.save(target)
+
+    assert result.error_code is None
+    assert result.status == SaveStatus.RENAMED
+    assert result.output_path == target
+    assert target.read_bytes() == b"real-xls-content"
+    assert not unexpected.exists()
+    assert any(action.startswith("recover:另存新檔非預期檔名:") for action in actions)
 
 
 def test_windows_save_as_probe_marks_filename_and_save_button() -> None:

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import json
 import re
 import sys
+import traceback
 from time import monotonic, sleep
 from typing import Any, Protocol
 
@@ -57,6 +58,8 @@ OPTION_ALIASES = {
     "顯示客代電話": ("顯示客代與電話",),
     "顯示銷售分攤金額": ("銷售分攤金額",),
     "銷售分攤金額": ("顯示銷售分攤金額",),
+    "顯示明細中需包含組合的子商品": ("顯示明細中需包\r\n含組合的子商品",),
+    "顯示明細中需包\r\n含組合的子商品": ("顯示明細中需包含組合的子商品",),
     "二次篩選": ("二次\r\n篩選",),
     "清單顯示": ("清單檢視",),
     "清單檢視": ("清單顯示",),
@@ -82,12 +85,23 @@ OPTION_CHECKBOX_AUTOMATION_IDS = {
     "含0元結單": ("cK_IncSale0money",),
     "└含0元結單": ("cK_IncSale0money",),
     "顯示課程耗用": ("cK_ShowClassTake",),
+    "顯示明細中需包含組合的子商品": ("cK_SubItemYN",),
+    "顯示明細中需包\r\n含組合的子商品": ("cK_SubItemYN",),
 }
 REPORT_TITLE_ALIASES = {
     "預約紀錄查詢統計表": ("預約記錄查詢統計表", "預約資料統計報表", "預約紀錄查詢的統計表"),
     "沙貨耗材領用查詢表": ("沙貨耗品領用查詢報表", "沙貨耗品領用報表"),
 }
 DEFAULT_REPORT_ROOT_MENU = "統計報表"
+POS_MAIN_READY_TEXTS = ("登入檢查完成", "請從上方選單選取")
+POS_MENU_SHELL_TOKENS = ("menustrip",)
+POS_KNOWN_ROOT_MENUS = (
+    "常用表單",
+    "維護設定",
+    DEFAULT_REPORT_ROOT_MENU,
+    "庫存管理",
+    "系統",
+)
 
 
 class SaveAsHandler(Protocol):
@@ -194,6 +208,8 @@ class ReportWindowAutomator:
         self.pos_health_check_interval_seconds = pos_health_check_interval_seconds
         self.export_wait_log_interval_seconds = 10.0
         self.export_fast_scan_record_limit = 120
+        self.view_report_no_response_retry_seconds = 30.0
+        self.disabled_export_geometry_fallback_seconds = 30.0
         self.actions: list[str] = []
         self.last_action_log_path: Path | None = None
         self.last_probe_log_path: Path | None = None
@@ -205,6 +221,7 @@ class ReportWindowAutomator:
         self._active_report_title: str | None = None
         self._active_report_form: Any | None = None
         self._report_view_requested = False
+        self._export_format_menu_confirmed = False
         self._maximized_report_form_for_option: Any | None = None
         self._desktop_report_viewer_cache: dict[str, tuple[float, list[Any]]] = {}
         self._export_fast_scan_hit_limit = False
@@ -246,6 +263,9 @@ class ReportWindowAutomator:
             if report.id == "R03":
                 self._write_action_log_event("phase", phase="r03_two_step_product_sales_preview")
                 self._run_r03_two_step_product_sales_preview(report)
+            elif report.id == "R11":
+                self._write_action_log_event("phase", phase="r11_two_step_product_sales_preview")
+                self._run_r11_two_step_product_sales_preview(report)
             else:
                 self._write_action_log_event("phase", phase="apply_options")
                 self._apply_options(report)
@@ -289,8 +309,8 @@ class ReportWindowAutomator:
                 self._cleanup_transient_ui_after_error()
                 if close_after_success:
                     self._close_report_viewer_safely(report.report_menu_text, reason=save_result.error_code)
-                    if report.id == "R05":
-                        self._close_report_viewer_safely("商品銷售明細表", reason=save_result.error_code)
+                if report.id == "R05":
+                    self._close_report_viewer_safely("商品銷售明細表", reason=save_result.error_code)
                 return ReportDownloadResult(
                     ok=False,
                     task_id=output.task_id,
@@ -316,6 +336,25 @@ class ReportWindowAutomator:
                 message=save_result.message,
             )
         except ReportAutomationError as exc:
+            if exc.error_code != "EXPORT_MENU_OPEN_FAILED" and self._unexpected_exception_is_export_pattern_failure(exc):
+                self._cleanup_transient_ui_after_error()
+                if close_after_success:
+                    self._close_report_viewer_safely(report.report_menu_text, reason="EXPORT_MENU_OPEN_FAILED")
+                    self._close_r05_product_reference_after_error(report, reason="EXPORT_MENU_OPEN_FAILED")
+                detail = _exception_detail(exc)
+                message = (
+                    "匯出選單開啟失敗：POS ReportViewer 匯出控制項的 UIA pattern 暫時不可用；"
+                    f"已分類為可重試錯誤。原始錯誤代碼：{exc.error_code}；原始錯誤：{detail}"
+                )
+                self._write_action_log_event("error", error_code="EXPORT_MENU_OPEN_FAILED", message=message)
+                wrapped = ReportAutomationError(
+                    "EXPORT_MENU_OPEN_FAILED",
+                    message,
+                    actions=list(self.actions),
+                )
+                wrapped.diagnostic_path = self.write_failure_diagnostic(output, report, wrapped)
+                self._write_run_probe(output, report, status="failed", error_code=wrapped.error_code)
+                raise wrapped from exc
             if exc.error_code == "VIEW_REPORT_NOT_TRIGGERED":
                 exc.actions = list(self.actions)
                 exc.diagnostic_path = self.write_failure_diagnostic(output, report, exc)
@@ -323,6 +362,7 @@ class ReportWindowAutomator:
                 self._cleanup_transient_ui_after_error()
                 if close_after_success:
                     self._close_report_viewer_safely(report.report_menu_text, reason=exc.error_code)
+                    self._close_r05_product_reference_after_error(report, reason=exc.error_code)
                 message = exc.message
                 if exc.diagnostic_path is not None:
                     message = f"{message} 診斷檔：{exc.diagnostic_path}"
@@ -338,6 +378,7 @@ class ReportWindowAutomator:
                 self._cleanup_transient_ui_after_error()
                 if close_after_success:
                     self._close_report_viewer_safely(report.report_menu_text, reason=exc.error_code)
+                    self._close_r05_product_reference_after_error(report, reason=exc.error_code)
                 exc.actions = list(self.actions)
                 exc.diagnostic_path = self.write_failure_diagnostic(output, report, exc)
                 self._write_run_probe(output, report, status="no_report_data", error_code=exc.error_code)
@@ -355,24 +396,51 @@ class ReportWindowAutomator:
             self._cleanup_transient_ui_after_error()
             if close_after_success:
                 self._close_report_viewer_safely(report.report_menu_text, reason=exc.error_code)
+                self._close_r05_product_reference_after_error(report, reason=exc.error_code)
             self._write_action_log_event("error", error_code=exc.error_code, message=exc.message)
             exc.actions = list(self.actions)
             exc.diagnostic_path = self.write_failure_diagnostic(output, report, exc)
             self._write_run_probe(output, report, status="failed", error_code=exc.error_code)
             raise
         except Exception as exc:
+            if self._unexpected_exception_is_export_pattern_failure(exc):
+                self._cleanup_transient_ui_after_error()
+                if close_after_success:
+                    self._close_report_viewer_safely(report.report_menu_text, reason="EXPORT_MENU_OPEN_FAILED")
+                    self._close_r05_product_reference_after_error(report, reason="EXPORT_MENU_OPEN_FAILED")
+                detail = _exception_detail(exc)
+                message = (
+                    "匯出選單開啟失敗：POS ReportViewer 匯出控制項的 UIA pattern 暫時不可用；"
+                    f"已分類為可重試錯誤。原始錯誤：{detail}"
+                )
+                self._write_action_log_event("error", error_code="EXPORT_MENU_OPEN_FAILED", message=message)
+                wrapped = ReportAutomationError(
+                    "EXPORT_MENU_OPEN_FAILED",
+                    message,
+                    actions=list(self.actions),
+                )
+                wrapped.diagnostic_path = self.write_failure_diagnostic(output, report, wrapped)
+                self._write_run_probe(output, report, status="failed", error_code=wrapped.error_code)
+                raise wrapped from exc
             self._cleanup_transient_ui_after_error()
             if close_after_success:
                 self._close_report_viewer_safely(report.report_menu_text, reason="UNEXPECTED_AUTOMATION_ERROR")
-            self._write_action_log_event("error", error_code="UNEXPECTED_AUTOMATION_ERROR", message=str(exc))
+                self._close_r05_product_reference_after_error(report, reason="UNEXPECTED_AUTOMATION_ERROR")
+            detail = _exception_detail(exc)
+            self._write_action_log_event("error", error_code="UNEXPECTED_AUTOMATION_ERROR", message=detail)
             wrapped = ReportAutomationError(
                 "UNEXPECTED_AUTOMATION_ERROR",
-                f"自動化過程發生未預期錯誤：{exc}",
+                f"自動化過程發生未預期錯誤：{detail}",
                 actions=list(self.actions),
             )
             wrapped.diagnostic_path = self.write_failure_diagnostic(output, report, wrapped)
             self._write_run_probe(output, report, status="failed", error_code=wrapped.error_code)
             raise wrapped from exc
+
+    def _unexpected_exception_is_export_pattern_failure(self, exc: Exception) -> bool:
+        if not _is_pywinauto_pattern_error(exc):
+            return False
+        return any(_action_indicates_export_phase(action) for action in self.actions)
 
     def _cleanup_transient_ui_after_error(self) -> None:
         try:
@@ -398,6 +466,10 @@ class ReportWindowAutomator:
             message = _action_text(str(exc))
             self.actions.append(f"skip_close_report_viewer:{reason}:{message}")
             return False
+
+    def _close_r05_product_reference_after_error(self, report: ReportConfig, *, reason: str) -> None:
+        if report.id == "R05":
+            self._close_report_viewer_safely("商品銷售明細表", reason=reason)
 
     def _wait_for_export_progress_to_finish_safely(self, *, timeout_seconds: float) -> bool:
         try:
@@ -437,6 +509,11 @@ class ReportWindowAutomator:
         self._report_view_requested = False
         self._maximized_report_form_for_option = None
         self._desktop_report_viewer_cache.clear()
+        if self._window_session_invalid():
+            raise ReportAutomationError(
+                "POS_SESSION_INVALID",
+                "SPA-POS 視窗連線已失效，只剩不可見的空白視窗控制項；必須重新連接或重啟 POS 後才能開啟報表。",
+            )
         if previous_form is not None and self._control_name_matches_report_title(previous_form, report_menu_text):
             previous_controls = self._control_scope(previous_form)
             if len(self._date_input_controls(previous_controls)) >= 2:
@@ -446,7 +523,19 @@ class ReportWindowAutomator:
         menu_select_ok = self._try_menu_select(menu_path)
         if menu_select_ok and self._wait_for_report_screen_inputs(report_menu_text):
             self._remember_active_report_form(report_menu_text)
-            return
+            if self._active_report_form is not None:
+                active_form_name = _normalized_text(self._control_name(self._active_report_form))
+                if not active_form_name or self._control_name_matches_report_title(
+                    self._active_report_form,
+                    report_menu_text,
+                ):
+                    return
+                self.actions.append(
+                    f"reject:menu_select_opened_wrong_report:"
+                    f"expected={report_menu_text}:actual={_action_text(active_form_name)}"
+                )
+                self._active_report_form = None
+                self._report_view_requested = False
         if (
             not menu_select_ok
             and menu_select_available
@@ -482,6 +571,47 @@ class ReportWindowAutomator:
                 f"已嘗試開啟「{report_menu_text}」，但 POS 畫面沒有出現報表日期欄位；不能繼續假裝已進入報表。",
             )
         self._remember_active_report_form(report_menu_text)
+
+    def _window_session_invalid(self) -> bool:
+        controls = self._all_controls()
+        if len(controls) != 1:
+            return False
+        root = controls[0]
+        if root is not self.window:
+            return False
+        if _normalized_text(self._control_name(root)):
+            return False
+        if self._is_visible(root):
+            return False
+        rect = _rect_to_dict(_safe_call(root, "rectangle", default=None))
+        return not _rect_has_area(rect)
+
+    def _main_shell_ready_but_root_menus_not_enumerated(self) -> bool:
+        controls = self._all_controls()
+        has_menu_shell = False
+        has_ready_text = False
+        has_root_menu = False
+        normalized_root_menus = {_normalized_text(menu) for menu in POS_KNOWN_ROOT_MENUS}
+
+        for control in controls:
+            name = self._control_name(control)
+            normalized_name = _normalized_text(name)
+            haystack = " ".join(
+                (
+                    name,
+                    self._control_type(control),
+                    self._control_class_name(control),
+                    self._control_automation_id(control),
+                )
+            ).lower()
+            if any(token in haystack for token in POS_MENU_SHELL_TOKENS):
+                has_menu_shell = True
+            if any(text in name for text in POS_MAIN_READY_TEXTS):
+                has_ready_text = True
+            if normalized_name in normalized_root_menus:
+                has_root_menu = True
+
+        return has_menu_shell and has_ready_text and not has_root_menu
 
     def _set_date_range(self, start_date: str, end_date: str) -> None:
         edits = self._date_input_controls()
@@ -565,20 +695,19 @@ class ReportWindowAutomator:
                 return True
 
         for control in selectors:
-            if self._expand_control(control):
-                expanded_item = self._find_control(value)
-                if expanded_item is not None:
-                    self._click(expanded_item, f"branch:{value}")
-                    if require_verified and not self._branch_control_value_matches(control, expected_values):
-                        selected_text = self._selected_control_text(control) or ""
-                        self.actions.append(
-                            f"verify_branch_failed:{value}:selected={_action_text(selected_text)}"
-                        )
-                        continue
-                    verified_text = self._selected_control_text(control)
-                    if verified_text:
-                        self.actions.append(f"verify_branch:{value}:{_action_text(verified_text)}")
-                    return True
+            expanded_item = self._expand_control_until_value_visible(control, value)
+            if expanded_item is not None:
+                self._click(expanded_item, f"branch:{value}")
+                if require_verified and not self._branch_control_value_matches(control, expected_values):
+                    selected_text = self._selected_control_text(control) or ""
+                    self.actions.append(
+                        f"verify_branch_failed:{value}:selected={_action_text(selected_text)}"
+                    )
+                    continue
+                verified_text = self._selected_control_text(control)
+                if verified_text:
+                    self.actions.append(f"verify_branch:{value}:{_action_text(verified_text)}")
+                return True
 
         self._log_branch_selector_candidates(selectors, value)
         if required:
@@ -1106,6 +1235,34 @@ class ReportWindowAutomator:
                 continue
         return False
 
+    def _expand_control_until_value_visible(self, control: Any, value: str) -> Any | None:
+        for method_name in ("expand", "click_input", "click"):
+            method = getattr(control, method_name, None)
+            if method is None:
+                continue
+            try:
+                self._focus_window()
+                method()
+                self._wait_after_action()
+            except Exception:
+                continue
+            expanded_item = self._find_control(value)
+            if expanded_item is not None:
+                self.actions.append(f"open_dropdown:{value}:{method_name}")
+                return expanded_item
+        if self._click_dropdown_arrow_by_geometry(control, f"branch_dropdown:{value}"):
+            expanded_item = self._find_control(value)
+            if expanded_item is not None:
+                return expanded_item
+        self._focus_control_without_click(control)
+        for keys in ("%{DOWN}", "{F4}", "{SPACE}"):
+            if not self._send_keyboard(keys, f"open_branch_dropdown:{value}:{keys}"):
+                continue
+            expanded_item = self._find_control(value)
+            if expanded_item is not None:
+                return expanded_item
+        return None
+
     def _apply_options(self, report: ReportConfig, *, include_other_conditions: bool = True) -> None:
         for option in report.options.check:
             self._set_checkbox(option, checked=True)
@@ -1117,26 +1274,43 @@ class ReportWindowAutomator:
             self._set_other_condition(option)
 
     def _run_r03_two_step_product_sales_preview(self, report: ReportConfig) -> None:
+        self._run_two_step_new_customer_then_secondary_filter_preview(
+            report,
+            task_id="R03",
+            first_failure_message="R03 已按下第一次「檢視報表」（僅含新客），但未確認報表預覽完成；不能繼續二次篩選。",
+            second_failure_message="R03 已按下第二次「檢視報表」（二次篩選），但未確認報表預覽完成；不能匯出。",
+        )
+
+    def _run_r11_two_step_product_sales_preview(self, report: ReportConfig) -> None:
+        self._run_two_step_new_customer_then_secondary_filter_preview(
+            report,
+            task_id="R11",
+            first_failure_message="R11 已按下第一次「檢視報表」（僅含新客分攤金額），但未確認報表預覽完成；不能繼續二次篩選。",
+            second_failure_message="R11 已按下第二次「檢視報表」（二次篩選分攤金額），但未確認報表預覽完成；不能匯出。",
+        )
+
+    def _run_two_step_new_customer_then_secondary_filter_preview(
+        self,
+        report: ReportConfig,
+        *,
+        task_id: str,
+        first_failure_message: str,
+        second_failure_message: str,
+    ) -> None:
         self._apply_options(report, include_other_conditions=False)
-        self.actions.append("phase:R03:preview:僅含新客")
+        self.actions.append(f"phase:{task_id}:preview:僅含新客")
         self._click_view_report()
         if not self._wait_for_report_viewer(timeout_seconds=self.report_generate_wait_seconds):
-            raise ReportAutomationError(
-                "VIEW_REPORT_NOT_TRIGGERED",
-                "R03 已按下第一次「檢視報表」（僅含新客），但未確認報表預覽完成；不能繼續二次篩選。",
-            )
-        self.actions.append("preview_ready:R03:僅含新客")
+            raise ReportAutomationError("VIEW_REPORT_NOT_TRIGGERED", first_failure_message)
+        self.actions.append(f"preview_ready:{task_id}:僅含新客")
         self._set_checkbox("僅含新客", checked=False)
         for option in report.options.other_conditions:
             self._set_other_condition(option)
-        self.actions.append("phase:R03:preview:二次篩選")
+        self.actions.append(f"phase:{task_id}:preview:二次篩選")
         self._click_view_report()
         if not self._wait_for_report_viewer(timeout_seconds=self.report_generate_wait_seconds):
-            raise ReportAutomationError(
-                "VIEW_REPORT_NOT_TRIGGERED",
-                "R03 已按下第二次「檢視報表」（二次篩選），但未確認報表預覽完成；不能匯出。",
-            )
-        self.actions.append("preview_ready:R03:二次篩選")
+            raise ReportAutomationError("VIEW_REPORT_NOT_TRIGGERED", second_failure_message)
+        self.actions.append(f"preview_ready:{task_id}:二次篩選")
 
     def _set_other_condition(self, name: str) -> None:
         if "二次篩選" not in _normalized_text(name):
@@ -1506,6 +1680,14 @@ class ReportWindowAutomator:
                 if attempt == 0:
                     self._wait_after_action()
                     continue
+                if error_code == "REPORT_ROOT_MENU_NOT_FOUND" and self._main_shell_ready_but_root_menus_not_enumerated():
+                    backend = str(getattr(self.window, "_pos_report_bot_backend", "") or "unknown")
+                    self.actions.append(f"pos_main_shell_ready_but_root_menu_not_enumerated:{name}:backend={backend}")
+                    raise ReportAutomationError(
+                        "POS_SESSION_INVALID",
+                        f"SPA-POS 已在主畫面，但目前 automation backend={backend} 沒有列出根選單「{name}」；"
+                        "需要重新連接或重啟 POS 後重試。",
+                    )
                 raise ReportAutomationError(error_code, f"找不到控制項：{name}")
             try:
                 self._click(control, name)
@@ -1979,9 +2161,10 @@ class ReportWindowAutomator:
                 "EXPORT_BUTTON_NOT_READY",
                 "報表已按下「檢視報表」，但工具列的「匯出」沒有啟用；不能假裝已下載。",
             )
+        self._export_format_menu_confirmed = False
         if self._open_export_menu(export_control):
             return
-        self._select_export_format()
+        self._select_export_format(require_confirmed_menu=self._export_format_menu_confirmed)
 
     @staticmethod
     def _retry_export_wait_seconds(wait_seconds: float) -> float:
@@ -2007,31 +2190,35 @@ class ReportWindowAutomator:
             except ReportAutomationError as exc:
                 click_error = exc
                 self.actions.append("retry:匯出:控制項點擊失敗")
-            state = self._export_menu_or_save_dialog_state(timeout_seconds=0.8)
+            state = self._safe_export_menu_or_save_dialog_state("click", timeout_seconds=0.8)
             if state == "save_as":
                 return True
             if state == "format_menu":
+                self._export_format_menu_confirmed = True
                 return False
             state = self._activate_export_menu_by_pattern(export_control)
             if state == "save_as":
                 return True
             if state == "format_menu":
+                self._export_format_menu_confirmed = True
                 return False
 
         if self._click_export_dropdown_by_geometry(export_control, "匯出:dropdown"):
-            state = self._export_menu_or_save_dialog_state(timeout_seconds=0.8)
+            state = self._safe_export_menu_or_save_dialog_state("dropdown_geometry", timeout_seconds=0.8)
             if state == "save_as":
                 return True
             if state == "format_menu":
+                self._export_format_menu_confirmed = True
                 return False
             if self._select_default_export_format_from_possible_menu("匯出:dropdown"):
                 return True
 
         if self._click_control_center_by_geometry(export_control, "匯出:retry"):
-            state = self._export_menu_or_save_dialog_state(timeout_seconds=0.8)
+            state = self._safe_export_menu_or_save_dialog_state("retry_geometry", timeout_seconds=0.8)
             if state == "save_as":
                 return True
             if state == "format_menu":
+                self._export_format_menu_confirmed = True
                 return False
             if self._select_default_export_format_from_possible_menu("匯出:retry"):
                 return True
@@ -2046,10 +2233,11 @@ class ReportWindowAutomator:
         for keys in ("%{DOWN}", "{ENTER}", "{SPACE}", "{DOWN}"):
             if not self._send_keyboard(keys, f"open_export_menu_by_keyboard:{keys}"):
                 continue
-            state = self._export_menu_or_save_dialog_state(timeout_seconds=0.8)
+            state = self._safe_export_menu_or_save_dialog_state(f"keyboard:{keys}", timeout_seconds=0.8)
             if state == "save_as":
                 return True
             if state == "format_menu":
+                self._export_format_menu_confirmed = True
                 return False
 
         if click_error is not None:
@@ -2064,25 +2252,50 @@ class ReportWindowAutomator:
                 self.actions.append(f"skip:匯出:{label}:{_action_text(str(exc))}")
                 continue
             self.actions.append(f"activate:匯出:{label}")
-            state = self._export_menu_or_save_dialog_state(timeout_seconds=1.5)
+            state = self._safe_export_menu_or_save_dialog_state(label, timeout_seconds=1.5)
             if state is not None:
                 return state
         return None
 
+    def _safe_export_menu_or_save_dialog_state(self, context: str, *, timeout_seconds: float) -> str | None:
+        try:
+            return self._export_menu_or_save_dialog_state(timeout_seconds=timeout_seconds)
+        except ReportAutomationError:
+            raise
+        except Exception as exc:
+            detail = _exception_detail(exc)
+            self.actions.append(f"skip:匯出狀態偵測:{context}:{_action_text(detail)}")
+            return None
+
     def _export_menu_activation_callbacks(self, export_control: Any) -> list[tuple[str, Any]]:
         callbacks: list[tuple[str, Any]] = []
         for method_name in ("expand", "invoke"):
-            method = getattr(export_control, method_name, None)
+            try:
+                method = getattr(export_control, method_name, None)
+            except Exception as exc:
+                detail = _action_text(_exception_detail(exc))
+                self.actions.append(f"skip:匯出:{method_name}:{detail}")
+                continue
             if callable(method):
                 callbacks.append((method_name, method))
-        expand_pattern = getattr(export_control, "iface_expand_collapse", None)
-        expand = getattr(expand_pattern, "Expand", None)
-        if callable(expand):
-            callbacks.append(("iface_expand_collapse.Expand", expand))
-        invoke_pattern = getattr(export_control, "iface_invoke", None)
-        invoke = getattr(invoke_pattern, "Invoke", None)
-        if callable(invoke):
-            callbacks.append(("iface_invoke.Invoke", invoke))
+        for pattern_name, method_name in (
+            ("iface_expand_collapse", "Expand"),
+            ("iface_invoke", "Invoke"),
+        ):
+            try:
+                pattern = getattr(export_control, pattern_name, None)
+            except Exception as exc:
+                detail = _action_text(_exception_detail(exc))
+                self.actions.append(f"skip:匯出:{pattern_name}:{detail}")
+                continue
+            try:
+                method = getattr(pattern, method_name, None)
+            except Exception as exc:
+                detail = _action_text(_exception_detail(exc))
+                self.actions.append(f"skip:匯出:{pattern_name}.{method_name}:{detail}")
+                continue
+            if callable(method):
+                callbacks.append((f"{pattern_name}.{method_name}", method))
         return callbacks
 
     def _refresh_export_control_before_click(self, export_control: Any) -> Any:
@@ -2138,9 +2351,10 @@ class ReportWindowAutomator:
             return "format_menu"
         return None
 
-    def _retry_view_report_for_export(self) -> bool:
-        self.actions.append("retry:檢視報表:匯出未啟用")
-        sleep(2.0)
+    def _retry_view_report_for_export(self, *, reason: str = "匯出未啟用", delay_seconds: float = 2.0) -> bool:
+        self.actions.append(f"retry:檢視報表:{reason}")
+        if delay_seconds > 0:
+            sleep(delay_seconds)
         return self._force_click_view_report(require_confirmed_response=False)
 
     def _force_click_view_report(self, *, require_confirmed_response: bool = True) -> bool:
@@ -2176,11 +2390,21 @@ class ReportWindowAutomator:
     def _wait_for_export_button(self, export_control: Any | None, *, timeout_seconds: float) -> Any | None:
         started_at = monotonic()
         deadline = started_at + timeout_seconds
-        disabled_toolbar_export_after = started_at + min(2.0, max(0.5, timeout_seconds * 0.1))
+        disabled_export_delay = min(
+            max(self.disabled_export_geometry_fallback_seconds, 0.0),
+            max(timeout_seconds * 0.8, 0.0),
+        )
+        disabled_toolbar_export_after = started_at + disabled_export_delay
+        no_response_retry_after = started_at + min(
+            max(self.view_report_no_response_retry_seconds, 0.0),
+            max(timeout_seconds * 0.1, 1.0),
+        )
         next_wait_log = started_at
         first_health_check_after = started_at + max(self.pos_health_check_interval_seconds, 1.0)
         self.actions.append(f"wait_start:匯出啟用:timeout={int(timeout_seconds)}s")
         checked_disabled_toolbar_export = False
+        logged_disabled_toolbar_wait = False
+        retried_view_report_no_response = False
         self._export_fast_scan_hit_limit = False
         if self._dismiss_no_data_warning():
             self.actions.append("dismiss_warning:目前並無符合的療程殘值資料")
@@ -2204,18 +2428,40 @@ class ReportWindowAutomator:
                     "NO_REPORT_DATA",
                     "POS 顯示目前並無符合的療程殘值資料；已按下確定並跳過此輸出。",
                 )
+            if (
+                self._report_view_requested
+                and not retried_view_report_no_response
+                and now >= no_response_retry_after
+                and not self._report_viewer_is_present()
+            ):
+                retried_view_report_no_response = True
+                self._retry_view_report_for_export(reason="匯出等待無預覽回應", delay_seconds=0)
             control = export_control
             if control is not None:
                 if self._is_enabled(control):
                     self._log_export_target((control, -1, "initial"), "匯出")
                     return control
-            toolbar_record = self._find_visible_report_toolbar_export_record_fast(max_depth=6)
+            toolbar_record = self._find_visible_report_toolbar_export_record_with_fallback(max_depth=6)
             if toolbar_record is not None and self._is_enabled(toolbar_record[0]):
                 self._log_export_target(toolbar_record, "匯出")
                 return toolbar_record[0]
+            if (
+                toolbar_record is not None
+                and toolbar_record[2] == "report_toolbar"
+                and not self._is_enabled(toolbar_record[0])
+                and not logged_disabled_toolbar_wait
+                and now < disabled_toolbar_export_after
+            ):
+                logged_disabled_toolbar_wait = True
+                self.actions.append(
+                    "wait:匯出控制項:UIA停用但ReportViewer工具列可見:"
+                    f"fallback_after={int(disabled_export_delay)}s"
+                )
             if monotonic() >= disabled_toolbar_export_after and not checked_disabled_toolbar_export:
                 checked_disabled_toolbar_export = True
-                disabled_toolbar_record = toolbar_record or self._find_visible_report_toolbar_export_record_fast(max_depth=6)
+                disabled_toolbar_record = toolbar_record or self._find_visible_report_toolbar_export_record_with_fallback(
+                    max_depth=6
+                )
                 if disabled_toolbar_record is not None and disabled_toolbar_record[2] == "report_toolbar":
                     if self._export_fast_scan_hit_limit:
                         self.actions.append("skip:匯出控制項:快速搜尋達上限不可直接接受停用匯出")
@@ -2232,7 +2478,9 @@ class ReportWindowAutomator:
         if export_control is not None and self._is_enabled(export_control):
             self._log_export_target((export_control, -1, "initial"), "匯出")
             return export_control
-        final_record = self._find_visible_report_toolbar_export_record_fast(max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH)
+        final_record = self._find_visible_report_toolbar_export_record_with_fallback(
+            max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH
+        )
         if final_record is not None:
             if self._is_enabled(final_record[0]):
                 self._log_export_target(final_record, "匯出")
@@ -2247,8 +2495,10 @@ class ReportWindowAutomator:
                     self.actions.append("accept:匯出控制項:UIA停用但ReportViewer工具列可見")
                     self._log_export_target(final_record, "匯出")
                     return final_record[0]
+                else:
+                    self.actions.append("skip:匯出控制項:ReportViewer工具列疑似空白且匯出停用")
         if not checked_disabled_toolbar_export:
-            disabled_toolbar_record = self._find_visible_report_toolbar_export_record_fast(
+            disabled_toolbar_record = self._find_visible_report_toolbar_export_record_with_fallback(
                 max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH,
             )
             if (
@@ -2266,6 +2516,22 @@ class ReportWindowAutomator:
                 self._log_export_target(disabled_toolbar_record, "匯出")
                 return disabled_toolbar_record[0]
         return None
+
+    def _find_visible_report_toolbar_export_record_with_fallback(
+        self,
+        *,
+        max_depth: int | None = None,
+    ) -> tuple[Any, int, str] | None:
+        self._export_fast_scan_hit_limit = False
+        record = self._find_visible_report_toolbar_export_record_fast(max_depth=max_depth)
+        if not self._export_fast_scan_hit_limit:
+            return record
+        full_record = self._find_visible_report_toolbar_export_record(max_depth=max_depth)
+        if full_record is None:
+            return record
+        self.actions.append("fallback:匯出控制項:快速搜尋達上限改用完整工具列搜尋")
+        self._export_fast_scan_hit_limit = False
+        return full_record
 
     def _report_viewer_looks_empty(
         self,
@@ -2381,10 +2647,7 @@ class ReportWindowAutomator:
         max_depth: int | None = None,
     ) -> tuple[Any, int, str] | None:
         search_depth = max_depth if max_depth is not None else EXPORT_BUTTON_FAST_SEARCH_DEPTH
-        scopes: list[tuple[str, Any]] = []
-        if self._active_report_form is not None:
-            scopes.append(("active_form", self._active_report_form))
-        scopes.append(("window", self.window))
+        scopes = self._export_search_scopes()
 
         best_record: tuple[Any, int, str] | None = None
         visited = 0
@@ -2417,11 +2680,27 @@ class ReportWindowAutomator:
 
                 if depth >= search_depth or self._looks_like_report_content_subtree(control):
                     continue
-                children = list(_safe_call(control, "children", default=[]))
-                for child in children[:40]:
-                    queue.append((child, depth + 1, is_toolbar or self._looks_like_report_toolbar(child)))
+                children = self._export_priority_children(control)
+                child_records = [
+                    (child, depth + 1, is_toolbar or self._looks_like_report_toolbar(child)) for child in children[:40]
+                ]
+                if is_toolbar:
+                    queue = child_records + queue
+                else:
+                    queue.extend(child_records)
 
         return best_record
+
+    def _export_priority_children(self, control: Any) -> list[Any]:
+        children = list(_safe_call(control, "children", default=[]))
+        return sorted(children, key=self._export_child_priority, reverse=True)
+
+    def _export_child_priority(self, control: Any) -> tuple[int, int, int]:
+        return (
+            1 if self._looks_like_report_toolbar(control) else 0,
+            1 if self._looks_like_export_button(control) else 0,
+            0 if self._looks_like_report_content_subtree(control) else 1,
+        )
 
     def _export_button_control_records(self, *, max_depth: int | None = None) -> list[tuple[Any, int, str]]:
         scopes = self._export_search_scopes()
@@ -2530,14 +2809,22 @@ class ReportWindowAutomator:
     def _export_search_scopes(self) -> list[tuple[str, Any]]:
         if self._report_view_requested:
             scopes: list[tuple[str, Any]] = []
-            if self._active_report_form is not None:
+            if self._active_report_form is not None and self._control_has_visible_area(self._active_report_form):
                 scopes.append(("active_form", self._active_report_form))
             if self._active_report_title:
                 scopes.extend(
                     ("desktop_report_viewer", report_viewer)
                     for report_viewer in self._desktop_report_viewer_windows(self._active_report_title)
                 )
-            scopes.append(("window", self.window))
+            if self._window_title_looks_stale_for_active_report():
+                self.actions.append(
+                    "skip:匯出搜尋:stale_window_title:"
+                    f"expected={_action_text(self._active_report_title or '')}:"
+                    f"actual={_action_text(self._control_name(self.window))}"
+                )
+                return scopes
+            if all(self.window is not scope for _, scope in scopes):
+                scopes.append(("window", self.window))
             return scopes
 
         scopes = []
@@ -2549,6 +2836,25 @@ class ReportWindowAutomator:
                 scopes.append(("report_form", report_form))
         scopes.append(("window", self.window))
         return scopes
+
+    def _control_has_visible_area(self, control: Any) -> bool:
+        if not self._is_visible(control):
+            return False
+        raw_rect = _safe_call(control, "rectangle", default=None)
+        if raw_rect is None:
+            return True
+        rect = _rect_to_dict(raw_rect)
+        return _rect_has_area(rect)
+
+    def _window_title_looks_stale_for_active_report(self) -> bool:
+        if not self._active_report_title:
+            return False
+        title = self._control_name(self.window)
+        if "[" not in title and "]" not in title:
+            return False
+        normalized_title = _normalized_text(title)
+        title_candidates = [_normalized_text(candidate) for candidate in _report_title_candidates(self._active_report_title)]
+        return not any(_control_text_matches(expected, normalized_title) for expected in title_candidates)
 
     def _report_form_has_export_context(self, control: Any) -> bool:
         if self._looks_like_export_button(control) or self._looks_like_report_toolbar(control):
@@ -2639,9 +2945,16 @@ class ReportWindowAutomator:
             sleep(0.5)
         return self._find_enabled_control(name)
 
-    def _select_export_format(self) -> None:
+    def _select_export_format(self, *, require_confirmed_menu: bool = True) -> None:
         if self._activate_visible_export_format(timeout_seconds=self.export_format_wait_seconds):
             return
+        if not require_confirmed_menu:
+            self._send_keyboard("{ESC}", "cleanup:export_menu_not_opened:ESC")
+            raise ReportAutomationError(
+                "EXPORT_MENU_NOT_OPENED",
+                "已點擊報表工具列的「匯出」，但未確認匯出格式選單、另存新檔視窗或 POS 匯出進度有出現；"
+                "為避免對未知焦點送出鍵盤操作，已停止並交由重試/復原流程處理。",
+            )
         if self._send_keyboard("{ENTER}", "select_export_format_by_keyboard:ENTER"):
             if self._save_as_dialog_opened():
                 return
@@ -3353,7 +3666,10 @@ class ReportWindowAutomator:
                 invoked = False
         if not invoked:
             detail = f"：{last_error}" if last_error is not None else ""
-            raise ReportAutomationError("CONTROL_NOT_CLICKABLE", f"控制項無法點擊：{action_name}{detail}")
+            error = ReportAutomationError("CONTROL_NOT_CLICKABLE", f"控制項無法點擊：{action_name}{detail}")
+            if last_error is not None:
+                raise error from last_error
+            raise error
         self.actions.append(f"click:{action_name}")
         self._wait_after_action()
 
@@ -3370,6 +3686,9 @@ class ReportWindowAutomator:
         return self._click_screen_point(x, y, f"{action_name}:geometry")
 
     def _click_export_dropdown_by_geometry(self, control: Any, action_name: str) -> bool:
+        return self._click_dropdown_arrow_by_geometry(control, action_name)
+
+    def _click_dropdown_arrow_by_geometry(self, control: Any, action_name: str) -> bool:
         rect = _rect_to_dict(_safe_call(control, "rectangle", default=None))
         if not _rect_has_area(rect):
             return False
@@ -4072,7 +4391,10 @@ class ReportWindowAutomator:
 
 
 def _safe_call(control: Any, method_name: str, *, default: Any) -> Any:
-    method = getattr(control, method_name, None)
+    try:
+        method = getattr(control, method_name, None)
+    except Exception:
+        return default
     if method is None:
         return default
     try:
@@ -4213,6 +4535,38 @@ def _safe_filename_token(value: str) -> str:
 
 def _action_text(value: str) -> str:
     return " ".join(str(value).split())[:120]
+
+
+def _exception_detail(exc: BaseException) -> str:
+    message = str(exc).strip()
+    detail = f"{type(exc).__name__}: {message}" if message else f"{type(exc).__name__}: {exc!r}"
+    exception_only = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    if exception_only and exception_only != type(exc).__name__ and exception_only not in detail:
+        detail = f"{detail}; {exception_only}"
+    return detail[:1000]
+
+
+def _is_pywinauto_pattern_error(exc: BaseException) -> bool:
+    detail = _exception_detail(exc)
+    return "NoPatternInterfaceError" in detail
+
+
+def _action_indicates_export_phase(action: str) -> bool:
+    return action.startswith(
+        (
+            "wait_start:匯出",
+            "wait:匯出",
+            "target:匯出",
+            "refresh:匯出",
+            "click:匯出",
+            "activate:匯出",
+            "skip:匯出",
+            "limit:匯出快速搜尋",
+            "fallback:匯出控制項",
+            "open_export_menu_by_keyboard:",
+            "select_export_format_by_keyboard:",
+        )
+    )
 
 
 def _rect_to_dict(rect: Any) -> dict[str, int]:

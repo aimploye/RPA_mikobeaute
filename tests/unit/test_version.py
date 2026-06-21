@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_project_version_sources_are_consistent() -> None:
-    expected = "1.1.0"
+    expected = "2.1.0"
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     pyproject_template = tomllib.loads((ROOT / "pyproject.template.toml").read_text(encoding="utf-8"))
     installer_script = (ROOT / "installer" / "POSReportBot.iss").read_text(encoding="utf-8")

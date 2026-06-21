@@ -231,9 +231,9 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示分店碼", "銷售分攤金額", "顯示退費", "僅含新客"]
+      check: ["顯示分店碼", "銷售分攤金額", "顯示明細中需包含組合的子商品", "顯示退費", "僅含新客"]
       uncheck: ["不列明細"]
-      other_conditions: []
+      other_conditions: ["二次篩選"]
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"
@@ -252,7 +252,7 @@ reports:
     drive_folder_id: ""
     upload_enabled: true
     options:
-      check: ["顯示分店碼", "銷售分攤金額", "顯示退費"]
+      check: ["顯示分店碼", "銷售分攤金額", "顯示明細中需包含組合的子商品", "顯示退費"]
       uncheck: ["不列明細"]
       other_conditions: ["二次篩選"]
     max_wait_seconds: 300
@@ -270,7 +270,7 @@ reports:
     date_range:
       start: "{month_start}"
       end: "{yesterday}"
-    output_filename: "診所stock status - {today_year} demand planning-{today_mmdd}.xls"
+    output_filename: "診所stock status - {end_year} demand planning-{end_mmdd}-rawdata.xls"
     drive_folder_id: ""
     upload_enabled: true
     options:
@@ -280,3 +280,24 @@ reports:
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"
+
+  - id: "R14"
+    enabled: true
+    frequency: "daily"
+    name: "每日 診所 stock status demand planning"
+    handler: "r14_inventory_demand_planning"
+    report_menu_text: "R13 raw data 轉換"
+    branch_mode: "all"
+    date_range:
+      start: "{month_start}"
+      end: "{yesterday}"
+    output_filename: "診所stock status - {end_year} demand planning-{end_mmdd}.xlsx"
+    drive_folder_id: ""
+    upload_enabled: true
+    options:
+      check: []
+      uncheck: []
+      other_conditions: []
+    max_wait_seconds: 300
+    retry_count: 1
+    real_pos_validation_status: "local_transform"

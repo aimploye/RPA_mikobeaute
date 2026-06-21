@@ -7,10 +7,12 @@ import yaml
 from pos_report_bot.config.models import (
     BranchConfig,
     DriveTargetsConfig,
+    PosRecoverySettings,
     ProjectConfig,
     ReportConfig,
     TaskDriveTarget,
 )
+from pos_report_bot.drive.folder_id import parse_drive_folder_id
 
 LEGACY_REPORT_OUTPUT_FILENAMES: dict[str, set[str]] = {
     "R01": {
@@ -66,7 +68,16 @@ LEGACY_REPORT_OUTPUT_FILENAMES: dict[str, set[str]] = {
         "R12_商品銷售明細_二次篩選分攤金額_{start}_{end}.xls",
         "商品銷售明細表-{start_yymmdd}-{end_yymmdd}-全部.xls",
     },
-    "R13": {"R13_沙貨耗材領用查詢表_{start}_{end}.xls"},
+    "R13": {
+        "R13_沙貨耗材領用查詢表_{start}_{end}.xls",
+        "診所stock status - {today_year} demand planning-{today_mmdd}.xls",
+        "診所stock status - {end_year} demand planning-{end_mmdd}.xls",
+    },
+}
+
+LEGACY_DRIVE_TARGET_FOLDER_IDS: dict[str, set[str]] = {
+    # Older shipped defaults accidentally sent R03 into the R02 Drive folder.
+    "R03": {"1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"},
 }
 
 
@@ -89,7 +100,7 @@ def load_project_config(app_config_path: Path) -> ProjectConfig:
     branches_data = load_yaml(_companion_config_path(template_dir, "branches"))
     drive_targets_data = load_yaml(_companion_config_path(template_dir, "drive_targets"))
 
-    target_items = drive_targets_data.get("drive_targets", {})
+    target_items = _extract_drive_target_items(drive_targets_data.get("drive_targets", {}))
     if not isinstance(target_items, dict):
         raise ValueError("drive_targets must be a mapping")
 
@@ -103,7 +114,7 @@ def load_project_config(app_config_path: Path) -> ProjectConfig:
 
 
 def _companion_config_path(config_dir: Path, name: str) -> Path:
-    for filename in (f"{name}.template.yaml", f"{name}.yaml"):
+    for filename in (f"{name}.yaml", f"{name}.template.yaml"):
         path = config_dir / filename
         if path.exists():
             return path
@@ -111,7 +122,7 @@ def _companion_config_path(config_dir: Path, name: str) -> Path:
 
 
 def _load_consolidated_config(data: dict[str, Any]) -> ProjectConfig:
-    target_items = data.get("drive_targets", {})
+    target_items = _extract_drive_target_items(data.get("drive_targets", {}))
     if not isinstance(target_items, dict):
         raise ValueError("drive_targets must be a mapping")
 
@@ -140,6 +151,8 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
     if template_defaults is None:
         return config
 
+    stale_r14_only_defaults = _looks_like_r14_only_stale_defaults(config, template_defaults)
+
     existing_report_ids = {report.id for report in config.reports}
     for report in template_defaults.reports:
         if report.id not in existing_report_ids:
@@ -151,6 +164,9 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
         default_report = default_reports_by_id.get(report.id)
         if default_report is None:
             continue
+        if stale_r14_only_defaults and report.handler != "placeholder":
+            report.enabled = default_report.enabled
+            report.upload_enabled = default_report.upload_enabled
         if _should_update_report_output_filename(report, default_report):
             report.output_filename = default_report.output_filename
 
@@ -167,13 +183,61 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
         existing_target = config.drive_targets.targets[task_id]
         if not existing_target.folder_id_or_url.strip() and target.folder_id_or_url.strip():
             existing_target.folder_id_or_url = target.folder_id_or_url
+        elif _should_update_drive_target_folder(task_id, existing_target, target):
+            existing_target.folder_id_or_url = target.folder_id_or_url
         for branch_code, folder_id_or_url in target.branches.items():
             if folder_id_or_url.strip() and not existing_target.branches.get(branch_code, "").strip():
                 existing_target.branches[branch_code] = folder_id_or_url
 
-    _merge_app_defaults(config, template_defaults)
+    _merge_app_defaults(config, template_defaults, stale_r14_only_defaults=stale_r14_only_defaults)
 
     return config
+
+
+def _looks_like_r14_only_stale_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> bool:
+    report_ids = {report.id for report in config.reports}
+    if report_ids != {"R14"}:
+        template_report_ids = {report.id for report in template_defaults.reports}
+        enabled_ids = {report.id for report in config.reports if report.enabled}
+        if report_ids != template_report_ids or enabled_ids != {"R14"}:
+            return False
+        if config.google_drive.upload_enabled or config.email.enabled:
+            return False
+        return _drive_targets_look_like_template_or_empty(config, template_defaults)
+    return set(config.drive_targets.targets) <= {"R14"}
+
+
+def _drive_targets_look_like_template_or_empty(config: ProjectConfig, template_defaults: ProjectConfig) -> bool:
+    for task_id, target in config.drive_targets.targets.items():
+        default_target = template_defaults.drive_targets.targets.get(task_id)
+        if default_target is None:
+            return False
+        if target.folder_id_or_url and target.folder_id_or_url != default_target.folder_id_or_url:
+            return False
+        for branch_code, value in target.branches.items():
+            default_value = default_target.branches.get(branch_code, "")
+            if value and value != default_value:
+                return False
+    return True
+
+
+def _should_update_drive_target_folder(
+    task_id: str,
+    existing_target: TaskDriveTarget,
+    default_target: TaskDriveTarget,
+) -> bool:
+    current_id = _safe_drive_folder_id(existing_target.folder_id_or_url)
+    default_id = _safe_drive_folder_id(default_target.folder_id_or_url)
+    if not current_id or not default_id or current_id == default_id:
+        return False
+    return current_id in LEGACY_DRIVE_TARGET_FOLDER_IDS.get(task_id, set())
+
+
+def _safe_drive_folder_id(value: str) -> str | None:
+    try:
+        return parse_drive_folder_id(value)
+    except ValueError:
+        return None
 
 
 def _should_update_report_output_filename(report: ReportConfig, default_report: ReportConfig) -> bool:
@@ -183,15 +247,51 @@ def _should_update_report_output_filename(report: ReportConfig, default_report: 
     return current in LEGACY_REPORT_OUTPUT_FILENAMES.get(report.id, set()) and current != default_report.output_filename
 
 
-def _merge_app_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+def _merge_app_defaults(config: ProjectConfig, template_defaults: ProjectConfig, *, stale_r14_only_defaults: bool = False) -> None:
     if _should_use_default_pos_executable_path(config.pos.executable_path):
         config.pos.executable_path = template_defaults.pos.executable_path
     if config.scheduler.daily_time in {"", "07:30"}:
         config.scheduler.daily_time = template_defaults.scheduler.daily_time
+    if stale_r14_only_defaults:
+        config.google_drive.upload_enabled = template_defaults.google_drive.upload_enabled
+        config.email.enabled = template_defaults.email.enabled
+    if config.save_as.wait_timeout_seconds == 60 and template_defaults.save_as.wait_timeout_seconds > 60:
+        config.save_as.wait_timeout_seconds = template_defaults.save_as.wait_timeout_seconds
     if not config.email.recipients:
         config.email.recipients = list(template_defaults.email.recipients)
-    if _should_enable_google_drive_upload(config, template_defaults):
-        config.google_drive.upload_enabled = True
+    _merge_pos_recovery_defaults(config, template_defaults)
+    _merge_r14_transform_defaults(config, template_defaults)
+    _merge_r14_email_defaults(config, template_defaults)
+
+
+def _merge_pos_recovery_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    if config.pos_recovery.enabled or not template_defaults.pos_recovery.enabled:
+        return
+    old_default = PosRecoverySettings(enabled=False)
+    current = config.pos_recovery.model_dump(mode="json")
+    legacy_default = old_default.model_dump(mode="json")
+    current_without_enabled = {key: value for key, value in current.items() if key != "enabled"}
+    legacy_without_enabled = {key: value for key, value in legacy_default.items() if key != "enabled"}
+    if current_without_enabled == legacy_without_enabled:
+        config.pos_recovery.enabled = True
+
+
+def _merge_r14_transform_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    if not config.r14_transform.template_search_dir.strip():
+        config.r14_transform.template_search_dir = template_defaults.r14_transform.template_search_dir
+    if not config.r14_transform.raw_filename_glob.strip():
+        config.r14_transform.raw_filename_glob = template_defaults.r14_transform.raw_filename_glob
+    if not config.r14_transform.output_extension.strip():
+        config.r14_transform.output_extension = template_defaults.r14_transform.output_extension
+
+
+def _merge_r14_email_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    if not config.r14_email.recipients:
+        config.r14_email.recipients = list(template_defaults.r14_email.recipients)
+    if not config.r14_email.subject_template.strip():
+        config.r14_email.subject_template = template_defaults.r14_email.subject_template
+    if not config.r14_email.body.strip():
+        config.r14_email.body = template_defaults.r14_email.body
 
 
 def _should_use_default_pos_executable_path(value: str) -> bool:
@@ -200,17 +300,6 @@ def _should_use_default_pos_executable_path(value: str) -> bool:
         return True
     lowered = normalized.replace("/", "\\").lower()
     return "\\appdata\\local\\apps\\2.0\\" in lowered and lowered.endswith("\\spa1.exe")
-
-
-def _should_enable_google_drive_upload(config: ProjectConfig, template_defaults: ProjectConfig) -> bool:
-    if config.google_drive.upload_enabled or not template_defaults.google_drive.upload_enabled:
-        return False
-    if not any(report.upload_enabled for report in config.reports):
-        return False
-    return any(
-        target.folder_id_or_url.strip() or any(folder_id.strip() for folder_id in target.branches.values())
-        for target in config.drive_targets.targets.values()
-    )
 
 
 def _load_template_defaults(app_config_path: Path) -> ProjectConfig | None:
@@ -228,7 +317,7 @@ def _load_template_defaults(app_config_path: Path) -> ProjectConfig | None:
             drive_targets_data = load_yaml(drive_targets_path)
         except Exception:
             continue
-        target_items = drive_targets_data.get("drive_targets", {})
+        target_items = _extract_drive_target_items(drive_targets_data.get("drive_targets", {}))
         if not isinstance(target_items, dict):
             continue
         return ProjectConfig(
@@ -288,6 +377,14 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
         other_conditions = []
     if report.id in {"R11", "R12"}:
         check = _replace_option(check, "顯示銷售分攤金額", "銷售分攤金額")
+        check = _insert_option_after(
+            check,
+            "顯示明細中需包含組合的子商品",
+            after="銷售分攤金額",
+            before="顯示退費",
+        )
+        if report.id == "R11":
+            other_conditions = _append_missing_options(other_conditions, ["二次篩選"])
     if report.id == "R05":
         check = _replace_option(check, "顯示分店碼", "顯示銷售分店")
         check = _remove_options(check, {"顯示客代與電話", "顯示客代電話", "顯示退費"})
@@ -321,6 +418,12 @@ def _load_drive_targets(items: dict[str, Any]) -> dict[str, TaskDriveTarget]:
     targets.pop("R05A", None)
     targets.pop("R05B", None)
     return targets
+
+
+def _extract_drive_target_items(value: Any) -> Any:
+    if isinstance(value, dict) and isinstance(value.get("targets"), dict):
+        return value["targets"]
+    return value
 
 
 def _migrate_legacy_r05_reports(reports: list[ReportConfig]) -> list[ReportConfig]:
@@ -395,4 +498,16 @@ def _append_missing_options(values: list[str], add_values: list[str]) -> list[st
     for value in add_values:
         if value not in result:
             result.append(value)
+    return result
+
+
+def _insert_option_after(values: list[str], value: str, *, after: str, before: str | None = None) -> list[str]:
+    result = [item for item in values if item != value]
+    if after in result:
+        result.insert(result.index(after) + 1, value)
+        return result
+    if before is not None and before in result:
+        result.insert(result.index(before), value)
+        return result
+    result.append(value)
     return result

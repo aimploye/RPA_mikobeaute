@@ -49,8 +49,9 @@ class SaveAsSettings(StrictBaseModel):
     save_button_text: str = "存檔"
     default_extension: str = ".xls"
     overwrite_policy: Literal["rename_unique", "overwrite", "fail"] = "rename_unique"
-    wait_timeout_seconds: int = 60
+    wait_timeout_seconds: int = 300
     stable_seconds: int = 3
+    recovery_search_dirs: list[str] = Field(default_factory=list)
 
 
 class GoogleDriveSettings(StrictBaseModel):
@@ -62,17 +63,36 @@ class GoogleDriveSettings(StrictBaseModel):
 
 
 class EmailSettings(StrictBaseModel):
-    enabled: bool = False
+    enabled: bool = True
     smtp_host: str = ""
     smtp_port: int = 587
     use_tls: bool = True
     username: str = ""
     recipients: list[str] = Field(
-        default_factory=lambda: ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
+        default_factory=lambda: ["joe.little7208@gmail.com", "mickey.chen@mikobeaute.com"]
     )
     cc: list[str] = Field(default_factory=list)
     notify_on_failure: bool = True
     notify_on_success_summary: bool = True
+
+
+R14_EMAIL_DEFAULT_RECIPIENTS = [
+    "joe.little7208@gmail.com",
+    "mickey.chen@mikobeaute.com",
+    "rae.hsu@mikobeaute.com",
+    "miko_03@mikobeaute.com",
+    "bbone_pu@bebetterone.com",
+]
+R14_EMAIL_DEFAULT_SUBJECT_TEMPLATE = "{date}耗材領用報表"
+R14_EMAIL_DEFAULT_BODY = "Hi,\n\n附件為本日耗材領用報表，請您查收。\n\nRPA程式\n"
+
+
+class R14EmailSettings(StrictBaseModel):
+    enabled: bool = True
+    recipients: list[str] = Field(default_factory=lambda: list(R14_EMAIL_DEFAULT_RECIPIENTS))
+    cc: list[str] = Field(default_factory=list)
+    subject_template: str = R14_EMAIL_DEFAULT_SUBJECT_TEMPLATE
+    body: str = R14_EMAIL_DEFAULT_BODY
 
 
 class SchedulerSettings(StrictBaseModel):
@@ -97,7 +117,7 @@ class PosUpdateSettings(StrictBaseModel):
 
 
 class PosRecoverySettings(StrictBaseModel):
-    enabled: bool = False
+    enabled: bool = True
     health_check_interval_seconds: int = 5
     restart_delay_seconds: int = 5
     max_restarts_per_run: int = 2
@@ -105,6 +125,14 @@ class PosRecoverySettings(StrictBaseModel):
     relaunch_after_kill: bool = True
     retry_current_task_after_restart: bool = True
     credential_keyring_service: str = "POSReportBot POS"
+
+
+class R14TransformSettings(StrictBaseModel):
+    template_path: str = ""
+    template_search_dir: str = ""
+    raw_search_dir: str = ""
+    raw_filename_glob: str = "診所stock status - * demand planning-*-rawdata.xls"
+    output_extension: str = ".xlsx"
 
 
 class BranchConfig(StrictBaseModel):
@@ -168,6 +196,8 @@ class ProjectConfig(StrictBaseModel):
     scheduler: SchedulerSettings
     pos_update: PosUpdateSettings
     pos_recovery: PosRecoverySettings = Field(default_factory=PosRecoverySettings)
+    r14_transform: R14TransformSettings = Field(default_factory=R14TransformSettings)
+    r14_email: R14EmailSettings = Field(default_factory=R14EmailSettings)
     reports: list[ReportConfig]
     branches: list[BranchConfig]
     drive_targets: DriveTargetsConfig

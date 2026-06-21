@@ -8,7 +8,7 @@ from pos_report_bot.reports.planner import build_dry_run_plan
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_dry_run_expands_r01_to_r13_with_r06_branch_outputs() -> None:
+def test_dry_run_expands_default_reports_with_r06_branch_outputs() -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
 
     plan = build_dry_run_plan(config, today=date(2026, 5, 13))
@@ -25,11 +25,12 @@ def test_dry_run_expands_r01_to_r13_with_r06_branch_outputs() -> None:
         "R09",
         "R10",
         "R11",
-        "R12",
-        "R13",
-    } == task_ids
+            "R12",
+            "R13",
+            "R14",
+        } == task_ids
     assert len([output for output in plan.outputs if output.task_id == "R06"]) == 6
-    assert len(plan.outputs) == 17
+    assert len(plan.outputs) == 18
 
 
 def test_dry_run_skips_r04_placeholder_even_if_legacy_config_enables_it() -> None:
@@ -51,6 +52,7 @@ def test_dry_run_output_contains_dates_filename_drive_target_and_status() -> Non
         output for output in plan.outputs if output.task_id == "R06" and output.branch_code == "N003"
     )
     r13 = next(output for output in plan.outputs if output.task_id == "R13")
+    r14 = next(output for output in plan.outputs if output.task_id == "R14")
 
     assert r01.start_date == "2026/05/01"
     assert r01.end_date == "2026/05/12"
@@ -69,9 +71,13 @@ def test_dry_run_output_contains_dates_filename_drive_target_and_status() -> Non
     assert r13.start_date == "2026/05/01"
     assert r13.end_date == "2026/05/12"
     assert r13.menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
-    assert r13.output_filename == "診所stock status - 2026 demand planning-0513.xls"
-    assert r13.drive_folder_id == "1ti3TAtYg7anbwglrR2eSzT-TkPYme3Ys"
+    assert r13.output_filename == "診所stock status - 2026 demand planning-0512-rawdata.xls"
+    assert r13.drive_folder_id == "1wIz37SF8Qi3gdceLrfmKpt3lUiktbm9z"
     assert r13.drive_target_status == "configured"
+    assert r14.end_date == "2026/05/12"
+    assert r14.output_filename == "診所stock status - 2026 demand planning-0512.xlsx"
+    assert r14.drive_folder_id == "1iqRNYGHuBFWHBLqmFpfFKJ5PqNvZAgYW"
+    assert r14.real_pos_validation_status == "local_transform"
 
 
 def test_default_output_filenames_match_requested_report_naming_rules() -> None:
@@ -100,8 +106,25 @@ def test_default_output_filenames_match_requested_report_naming_rules() -> None:
         "R10": "客戶來源與產值報表-.-20260513-顯示服務人員.xls",
         "R11": "商品銷售明細表-20260501-20260512-僅新客.xls",
         "R12": "商品銷售明細表-20260501-20260512-全部.xls",
-        "R13": "診所stock status - 2026 demand planning-0513.xls",
+        "R13": "診所stock status - 2026 demand planning-0512-rawdata.xls",
+        "R14": "診所stock status - 2026 demand planning-0512.xlsx",
     }
+
+
+def test_r14_output_filename_uses_query_end_date_when_enabled() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        report.enabled = report.id == "R14"
+
+    plan = build_dry_run_plan(config, today=date(2026, 6, 9))
+
+    assert len(plan.outputs) == 1
+    r14 = plan.outputs[0]
+    assert r14.task_id == "R14"
+    assert r14.start_date == "2026/06/01"
+    assert r14.end_date == "2026/06/08"
+    assert r14.output_filename == "診所stock status - 2026 demand planning-0608.xlsx"
+    assert r14.real_pos_validation_status == "local_transform"
 
 
 def test_month_start_reports_use_yesterdays_month_at_month_boundary() -> None:
@@ -121,7 +144,7 @@ def test_month_start_reports_use_yesterdays_month_at_month_boundary() -> None:
     assert june_first_r01.output_filename == "課程服務明細表-20260501-20260531-全部.xls"
     assert june_first_r13.start_date == "2026/05/01"
     assert june_first_r13.end_date == "2026/05/31"
-    assert june_first_r13.output_filename == "診所stock status - 2026 demand planning-0601.xls"
+    assert june_first_r13.output_filename == "診所stock status - 2026 demand planning-0531-rawdata.xls"
 
     assert june_second_r01.start_date == "2026/06/01"
     assert june_second_r01.end_date == "2026/06/01"

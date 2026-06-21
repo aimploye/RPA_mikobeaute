@@ -1,23 +1,67 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_submodules
 
 
 block_cipher = None
+
+
+EXCLUDED_DATA_FILE_PREFIXES = ("~$", ".~lock")
+EXCLUDED_DATA_FILE_SUFFIXES = (
+    ".bak",
+    ".lck",
+    ".lock",
+    ".swp",
+    ".temp",
+    ".tmp",
+    ".wbk",
+)
+EXCLUDED_DATA_FILE_NAMES = {"Thumbs.db", "desktop.ini"}
+
+
+def _should_collect_data_file(path):
+    name = path.name
+    lowered = name.lower()
+    return (
+        name not in EXCLUDED_DATA_FILE_NAMES
+        and not any(name.startswith(prefix) for prefix in EXCLUDED_DATA_FILE_PREFIXES)
+        and not any(lowered.endswith(suffix) for suffix in EXCLUDED_DATA_FILE_SUFFIXES)
+    )
+
+
+def collect_data_dir(source, destination):
+    root = Path(source)
+    data_files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or not _should_collect_data_file(path):
+            continue
+        relative_parent = path.relative_to(root).parent
+        target_dir = (
+            Path(destination)
+            if str(relative_parent) == "."
+            else Path(destination) / relative_parent
+        )
+        data_files.append((str(path), str(target_dir)))
+    return data_files
+
 
 a = Analysis(
     ["src/pos_report_bot/__main__.py"],
     pathex=["src"],
     binaries=[],
     datas=[
-        ("config_templates", "config_templates"),
-        ("docs", "docs"),
+        *collect_data_dir("config_templates", "config_templates"),
+        *collect_data_dir("docs", "docs"),
     ],
     hiddenimports=[
         *collect_submodules("pos_report_bot"),
         *collect_submodules("google_auth_oauthlib"),
         *collect_submodules("googleapiclient"),
         *collect_submodules("keyring"),
+        *collect_submodules("openpyxl"),
+        *collect_submodules("xlrd"),
     ],
     hookspath=[],
     hooksconfig={},
@@ -39,13 +83,14 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version="installer/windows_version_info.txt",
 )
 coll = COLLECT(
     exe,
@@ -53,7 +98,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="POSReportBot",
 )

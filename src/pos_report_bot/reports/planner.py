@@ -112,6 +112,8 @@ def _format_output_filename(
         start_yymmdd=format_filename_date_short(start),
         end=format_filename_date(end),
         end_yymmdd=format_filename_date_short(end),
+        end_year=format_filename_year(end),
+        end_mmdd=format_filename_month_day(end),
         today=format_filename_date(today),
         today_yymmdd=format_filename_date_short(today),
         today_year=format_filename_year(today),

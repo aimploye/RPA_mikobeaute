@@ -18,18 +18,34 @@ def test_load_project_config_from_template_files() -> None:
         r"台灣凱惠資訊科技有限公司\SPA1\SPA資訊服務應用系統.appref-ms"
     )
     assert config.scheduler.daily_time == "01:00"
-    assert config.email.recipients == ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
+    assert config.email.enabled is True
+    assert config.email.recipients == ["joe.little7208@gmail.com", "mickey.chen@mikobeaute.com"]
+    assert config.pos_recovery.enabled is True
+    assert config.pos_recovery.retry_current_task_after_restart is True
+    assert config.r14_email.recipients == [
+        "joe.little7208@gmail.com",
+        "mickey.chen@mikobeaute.com",
+        "rae.hsu@mikobeaute.com",
+        "miko_03@mikobeaute.com",
+        "bbone_pu@bebetterone.com",
+    ]
+    assert config.r14_email.subject_template == "{date}耗材領用報表"
+    assert "附件為本日耗材領用報表" in config.r14_email.body
     assert config.google_drive.upload_enabled is True
     assert config.save_as.default_extension == ".xls"
+    assert config.save_as.wait_timeout_seconds == 300
     assert config.pos_update.expected_update_weekday == "Thursday"
-    assert len(config.reports) == 13
+    assert len(config.reports) == 14
     reports = {report.id: report for report in config.reports}
-    assert sum(1 for report in config.reports if report.enabled) == 12
+    assert sum(1 for report in config.reports if report.enabled) == 13
     assert reports["R03"].options.check == ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
     assert reports["R03"].options.other_conditions == ["二次篩選"]
     assert reports["R03"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
     assert reports["R04"].enabled is False
     assert reports["R04"].handler == "placeholder"
+    assert reports["R14"].enabled is True
+    assert reports["R14"].handler == "r14_inventory_demand_planning"
+    assert reports["R14"].real_pos_validation_status == "local_transform"
     assert [branch.code for branch in config.branches] == [
         "N001",
         "N002",
@@ -59,7 +75,44 @@ def test_drive_targets_are_loaded_without_secrets() -> None:
     assert "R01" in config.drive_targets.targets
     assert config.drive_targets.targets["R01"].folder_id_or_url.endswith("1DibytnRl9054M65TMUVfHNSTIAeQ-ghF")
     assert config.drive_targets.targets["R06"].branches["N006"].endswith("1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG")
-    assert config.drive_targets.targets["R13"].folder_id_or_url.endswith("1ti3TAtYg7anbwglrR2eSzT-TkPYme3Ys")
+    assert config.drive_targets.targets["R03"].folder_id_or_url.endswith("1iIwcWtj4Vs5yFf4YN_iU2pnkbMNWj9sl")
+    assert config.drive_targets.targets["R13"].folder_id_or_url.endswith("1wIz37SF8Qi3gdceLrfmKpt3lUiktbm9z")
+    assert config.drive_targets.targets["R14"].folder_id_or_url.endswith("1iqRNYGHuBFWHBLqmFpfFKJ5PqNvZAgYW")
+
+
+def test_load_project_config_migrates_legacy_r03_drive_target_from_r02_folder(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["drive_targets"] = {
+        task_id: target.model_dump(mode="json")
+        for task_id, target in original.drive_targets.targets.items()
+    }
+    payload["drive_targets"]["R03"]["folder_id_or_url"] = (
+        "https://drive.google.com/drive/u/6/folders/1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"
+    )
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.drive_targets.targets["R02"].folder_id_or_url.endswith("1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC")
+    assert config.drive_targets.targets["R03"].folder_id_or_url.endswith("1iIwcWtj4Vs5yFf4YN_iU2pnkbMNWj9sl")
+
+
+def test_load_project_config_preserves_custom_r03_drive_target(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["drive_targets"] = {
+        task_id: target.model_dump(mode="json")
+        for task_id, target in original.drive_targets.targets.items()
+    }
+    payload["drive_targets"]["R03"]["folder_id_or_url"] = "user-r03-folder"
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.drive_targets.targets["R03"].folder_id_or_url == "user-r03-folder"
 
 
 def test_load_project_config_from_installed_config_filenames(tmp_path: Path) -> None:
@@ -76,9 +129,43 @@ def test_load_project_config_from_installed_config_filenames(tmp_path: Path) -> 
     config = load_project_config(config_dir / "app.yaml")
 
     assert config.app.name == "POSReportBot"
-    assert len(config.reports) == 13
+    assert len(config.reports) == 14
     assert len(config.branches) == 6
     assert config.drive_targets.targets["R06"].branches["N006"].endswith("1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG")
+
+
+def test_load_project_config_prefers_user_companion_yaml_over_template_yaml(tmp_path: Path) -> None:
+    config_dir = tmp_path / "POSReportBot" / "config"
+    config_dir.mkdir(parents=True)
+    copyfile(ROOT / "config_templates" / "app.template.yaml", config_dir / "app.yaml")
+    copyfile(ROOT / "config_templates" / "branches.template.yaml", config_dir / "branches.yaml")
+    copyfile(ROOT / "config_templates" / "branches.template.yaml", config_dir / "branches.template.yaml")
+    copyfile(ROOT / "config_templates" / "reports.template.yaml", config_dir / "reports.template.yaml")
+    copyfile(ROOT / "config_templates" / "drive_targets.template.yaml", config_dir / "drive_targets.template.yaml")
+
+    reports_data = yaml.safe_load((ROOT / "config_templates" / "reports.template.yaml").read_text(encoding="utf-8"))
+    for report in reports_data["reports"]:
+        if report["id"] == "R14":
+            report["enabled"] = True
+            report["output_filename"] = "user-r14-{end}.xlsx"
+    (config_dir / "reports.yaml").write_text(
+        yaml.safe_dump(reports_data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    drive_data = yaml.safe_load((ROOT / "config_templates" / "drive_targets.template.yaml").read_text(encoding="utf-8"))
+    drive_data["drive_targets"]["R14"]["folder_id_or_url"] = "user-r14-folder"
+    (config_dir / "drive_targets.yaml").write_text(
+        yaml.safe_dump(drive_data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(config_dir / "app.yaml")
+    reports = {report.id: report for report in config.reports}
+
+    assert reports["R14"].enabled is True
+    assert reports["R14"].output_filename == "user-r14-{end}.xlsx"
+    assert config.drive_targets.targets["R14"].folder_id_or_url == "user-r14-folder"
 
 
 def test_load_project_config_merges_new_template_reports_into_saved_user_config(tmp_path: Path) -> None:
@@ -104,7 +191,79 @@ def test_load_project_config_merges_new_template_reports_into_saved_user_config(
     assert reports["R13"].menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
     assert reports["R13"].options.check == ["顯示課程耗用"]
     assert "R13" in config.drive_targets.targets
-    assert config.drive_targets.targets["R13"].folder_id_or_url.endswith("1ti3TAtYg7anbwglrR2eSzT-TkPYme3Ys")
+    assert config.drive_targets.targets["R13"].folder_id_or_url.endswith("1wIz37SF8Qi3gdceLrfmKpt3lUiktbm9z")
+
+
+def test_load_project_config_migrates_old_save_as_timeout_default(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["save_as"]["wait_timeout_seconds"] = 60
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.save_as.wait_timeout_seconds == 300
+
+
+def test_load_project_config_keeps_custom_save_as_timeout(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["save_as"]["wait_timeout_seconds"] = 180
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.save_as.wait_timeout_seconds == 180
+
+
+def test_load_project_config_repairs_stale_r14_only_installed_defaults(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    r14 = next(report for report in original.reports if report.id == "R14")
+    payload = original.model_dump(mode="json")
+    payload["google_drive"]["upload_enabled"] = False
+    payload["email"]["enabled"] = False
+    payload["reports"] = [r14.model_dump(mode="json")]
+    payload["drive_targets"] = {
+        "R14": original.drive_targets.targets["R14"].model_dump(mode="json"),
+    }
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+    reports = {report.id: report for report in config.reports}
+
+    assert len(config.reports) == 14
+    assert sum(1 for report in config.reports if report.enabled) == 13
+    assert reports["R04"].enabled is False
+    assert reports["R14"].enabled is True
+    assert config.google_drive.upload_enabled is True
+    assert config.email.enabled is True
+    assert "R01" in config.drive_targets.targets
+    assert config.drive_targets.targets["R01"].folder_id_or_url.endswith("1DibytnRl9054M65TMUVfHNSTIAeQ-ghF")
+
+
+def test_load_project_config_repairs_full_saved_config_with_only_r14_enabled(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["google_drive"]["upload_enabled"] = False
+    payload["email"]["enabled"] = False
+    for report in payload["reports"]:
+        report["enabled"] = report["id"] == "R14"
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+    reports = {report.id: report for report in config.reports}
+
+    assert sum(1 for report in config.reports if report.enabled) == 13
+    assert reports["R01"].enabled is True
+    assert reports["R04"].enabled is False
+    assert reports["R14"].enabled is True
+    assert all(report.upload_enabled is True for report in config.reports if report.handler != "placeholder")
+    assert config.google_drive.upload_enabled is True
+    assert config.email.enabled is True
 
 
 def test_load_project_config_prefers_current_templates_over_stale_installed_companion_files(tmp_path: Path) -> None:
@@ -187,11 +346,74 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
     assert reports["R05"].options.other_conditions == ["二次篩選"]
     assert reports["R07"].options.check == []
     assert reports["R09"].options.check == ["限區間有消費", "含0元結單"]
-    assert reports["R11"].options.check == ["顯示分店碼", "銷售分攤金額", "顯示退費", "僅含新客"]
+    assert reports["R11"].options.check == [
+        "顯示分店碼",
+        "銷售分攤金額",
+        "顯示明細中需包含組合的子商品",
+        "顯示退費",
+        "僅含新客",
+    ]
+    assert reports["R11"].options.other_conditions == ["二次篩選"]
     assert reports["R06"].options.check == ["清單檢視"]
     assert reports["R06"].output_filename == "會員剩餘點數殘值統計表-清單檢視{today}-{branch_name}.xls"
     assert reports["R13"].menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
     assert reports["R13"].options.check == ["顯示課程耗用"]
+
+
+def test_load_project_config_migrates_legacy_r13_filename_to_rawdata_filename(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    for report in payload["reports"]:
+        if report["id"] == "R13":
+            report["output_filename"] = "診所stock status - {today_year} demand planning-{today_mmdd}.xls"
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+    reports = {report.id: report for report in config.reports}
+
+    assert reports["R13"].output_filename == "診所stock status - {end_year} demand planning-{end_mmdd}-rawdata.xls"
+
+
+def test_load_project_config_merges_r14_transform_defaults_into_older_user_config(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload.pop("r14_transform", None)
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.r14_transform.template_search_dir == r"C:\ProgramData\POSReportBot\templates"
+    assert config.r14_transform.raw_filename_glob == "診所stock status - * demand planning-*-rawdata.xls"
+    assert config.r14_transform.output_extension == ".xlsx"
+
+
+def test_load_project_config_migrates_legacy_default_pos_recovery_to_enabled(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["pos_recovery"]["enabled"] = False
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.pos_recovery.enabled is True
+    assert config.pos_recovery.retry_current_task_after_restart is True
+
+
+def test_load_project_config_keeps_custom_disabled_pos_recovery(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["pos_recovery"]["enabled"] = False
+    payload["pos_recovery"]["max_restarts_per_run"] = 0
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.pos_recovery.enabled is False
+    assert config.pos_recovery.max_restarts_per_run == 0
 
 
 def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriting_user_edits(
@@ -206,6 +428,13 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     payload["pos"]["executable_path"] = ""
     payload["scheduler"]["daily_time"] = "07:30"
     payload["email"]["recipients"] = []
+    payload["r14_email"] = {
+        "enabled": True,
+        "recipients": [],
+        "cc": [],
+        "subject_template": "",
+        "body": "",
+    }
     payload["google_drive"]["upload_enabled"] = False
     payload["reports"][0]["output_filename"] = "R01_每日課程服務明細表_新舊客_{start}_{end}.xls"
     payload["reports"][1]["output_filename"] = "user-custom-r02-{start}.xls"
@@ -235,8 +464,17 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
 
     assert config.pos.executable_path.endswith(".appref-ms")
     assert config.scheduler.daily_time == "01:00"
-    assert config.email.recipients == ["joe.little7208@gmail.com", "jamie.yeh@bebetterone.com"]
-    assert config.google_drive.upload_enabled is True
+    assert config.email.recipients == ["joe.little7208@gmail.com", "mickey.chen@mikobeaute.com"]
+    assert config.r14_email.recipients == [
+        "joe.little7208@gmail.com",
+        "mickey.chen@mikobeaute.com",
+        "rae.hsu@mikobeaute.com",
+        "miko_03@mikobeaute.com",
+        "bbone_pu@bebetterone.com",
+    ]
+    assert config.r14_email.subject_template == "{date}耗材領用報表"
+    assert config.r14_email.body.startswith("Hi,")
+    assert config.google_drive.upload_enabled is False
     assert reports["R01"].output_filename == "課程服務明細表-{start}-{end}-全部.xls"
     assert reports["R02"].output_filename == "user-custom-r02-{start}.xls"
     assert reports["R03"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
@@ -251,3 +489,28 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     assert config.drive_targets.targets["R01"].folder_id_or_url.endswith("1DibytnRl9054M65TMUVfHNSTIAeQ-ghF")
     assert config.drive_targets.targets["R02"].folder_id_or_url == "user-r02-folder"
     assert config.drive_targets.targets["R06"].branches["N003"].endswith("1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG")
+
+
+def test_load_project_config_preserves_explicit_google_drive_disabled_with_drive_targets(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    payload["google_drive"]["upload_enabled"] = False
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    config = load_project_config(saved_config)
+
+    assert config.google_drive.upload_enabled is False
+    assert any(report.upload_enabled for report in config.reports)
+    assert any(
+        target.folder_id_or_url.strip() or any(folder_id.strip() for folder_id in target.branches.values())
+        for target in config.drive_targets.targets.values()
+    )
+
+
+def test_installer_deploys_r14_template_directory_and_workbook() -> None:
+    installer_text = (ROOT / "installer" / "POSReportBot.iss").read_text(encoding="utf-8")
+
+    assert 'Name: "C:\\ProgramData\\POSReportBot\\templates"' in installer_text
+    assert "..\\config_templates\\templates\\*.xlsx" in installer_text
+    assert (ROOT / "config_templates" / "templates" / "診所stock status - 2026 demand planning-template.xlsx").exists()

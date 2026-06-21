@@ -27,6 +27,7 @@ runtime_dev/state/*
 !runtime_dev/logs/.gitkeep
 !runtime_dev/screenshots/.gitkeep
 !runtime_dev/state/.gitkeep
+C:\\ProgramData\\POSReportBot/
 
 # Secrets
 *.token
@@ -42,4 +43,15 @@ _external/
 # OS
 .DS_Store
 Thumbs.db
+
+# Office/editor temporary lock files
+~$*
+.~lock*
+*.tmp
+*.temp
+*.lock
+*.lck
+*.bak
+*.wbk
+*.swp
 .gstack/

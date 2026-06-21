@@ -6,12 +6,15 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from importlib import import_module
+import json
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -22,9 +25,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -33,7 +39,12 @@ from PySide6.QtWidgets import (
 )
 
 from pos_report_bot import __version__
-from pos_report_bot.app.automation_runner import AutomationProgress, AutomationRunSummary, AutomationRunner
+from pos_report_bot.app.automation_runner import (
+    LOCAL_REPORT_HANDLERS,
+    AutomationProgress,
+    AutomationRunSummary,
+    AutomationRunner,
+)
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
 from pos_report_bot.drive.folder_id import parse_drive_folder_id
@@ -54,7 +65,7 @@ from pos_report_bot.pos.ui_probe import (
     write_probe_report,
 )
 from pos_report_bot.reports.planner import build_dry_run_plan
-from pos_report_bot.scheduler.windows_task_scheduler import DEFAULT_TASK_NAME, install_task, query_task, remove_task
+from pos_report_bot.scheduler.windows_task_scheduler import DEFAULT_TASK_NAME, inspect_task, install_task, remove_task
 from pos_report_bot.storage.runtime_paths import RuntimePaths, dated_runtime_dir
 
 ReportAutomationError = _ReportAutomationError
@@ -102,10 +113,13 @@ class AutomationRunWorker(QObject):
 class SettingFieldSpec:
     label: str
     path: str
-    widget: Literal["text", "bool", "int", "combo", "list"]
+    widget: Literal["text", "bool", "int", "combo", "list", "multiline"]
     options: tuple[str, ...] = ()
     minimum: int = 0
     maximum: int = 9999
+
+
+SettingEditor = QLineEdit | QCheckBox | QSpinBox | QComboBox | QPlainTextEdit
 
 
 def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
@@ -141,14 +155,14 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             page_id="branches",
             title="分館設定",
             fields=["啟用", "分館代號", "POS 代碼", "POS 顯示文字", "顯示名稱", "備註"],
-            badge=f"{enabled_branches} enabled",
+            badge=f"已啟用 {enabled_branches} 項",
         ),
         SettingsPageContract(
             page_id="reports",
             title="報表任務設定",
             fields=["啟用", "任務代號", "任務名稱", "執行頻率", "報表入口", "分館模式", "日期規則", "輸出檔名規則"],
             actions=["只啟用 R01 測試", "啟用全部報表", "測試上傳", "立即 Dry-run"],
-            badge=f"{enabled_reports} enabled",
+            badge=f"已啟用 {enabled_reports} 項",
         ),
         SettingsPageContract(
             page_id="drive",
@@ -161,6 +175,12 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             title="Email 通知設定",
             fields=["啟用通知", "SMTP host", "SMTP port", "TLS/SSL", "SMTP username", "收件人", "CC"],
             actions=["測試寄信"],
+        ),
+        SettingsPageContract(
+            page_id="r14_email",
+            title="R14 報表寄送設定",
+            fields=["啟用 R14 報表寄送", "收件人", "CC", "預設主旨", "預設內容"],
+            actions=["儲存設定"],
         ),
         SettingsPageContract(
             page_id="schedule",
@@ -192,11 +212,13 @@ class SettingsMainWindow(QMainWindow):
         self._drive_target_table: QTableWidget | None = None
         self._branches_table: QTableWidget | None = None
         self._reports_table: QTableWidget | None = None
-        self._setting_editors: dict[str, QLineEdit | QCheckBox | QSpinBox | QComboBox] = {}
+        self._setting_editors: dict[str, SettingEditor] = {}
         self._pos_login_secret_editor: QLineEdit | None = None
         self._transient_pos_login_secret: str = ""
+        self._tray_icon: QSystemTrayIcon | None = None
         self.setWindowTitle("POSReportBot 設定中心")
         self.resize(1100, 720)
+        self._setup_tray_icon()
 
         tabs = QTabWidget()
         for page in build_settings_pages(config):
@@ -211,6 +233,52 @@ class SettingsMainWindow(QMainWindow):
             tabs.addTab(widget, page.title)
         self.setCentralWidget(tabs)
         self.statusBar().showMessage("就緒")
+
+    def _setup_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self.setWindowIcon(icon)
+
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("POSReportBot")
+        menu = QMenu(self)
+        show_action = QAction("顯示 POSReportBot", self)
+        show_action.triggered.connect(self.restore_from_tray)
+        quit_action = QAction("結束", self)
+        quit_action.triggered.connect(self._quit_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._handle_tray_activated)
+        tray.show()
+        self._tray_icon = tray
+
+    @Slot()
+    def restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    @Slot()
+    def _quit_from_tray(self) -> None:
+        QApplication.quit()
+
+    @Slot(QSystemTrayIcon.ActivationReason)
+    def _handle_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self.restore_from_tray()
+
+    def changeEvent(self, event: Any) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized() and self._tray_icon is not None:
+            QTimer.singleShot(0, self.hide)
 
     def set_drive_target(self, task_id: str, folder_id_or_url: str) -> None:
         target = self.config.drive_targets.targets.get(task_id)
@@ -240,7 +308,13 @@ class SettingsMainWindow(QMainWindow):
             self.config.scheduler.weekly_enabled = False
             saved_path = save_project_config(self.config, self.settings_path)
             self.settings_path = saved_path
-            return GuiActionResult(ok=True, message=f"排程設定已儲存：每日 {self.config.scheduler.daily_time}，設定檔：{saved_path}")
+            return GuiActionResult(
+                ok=True,
+                message=(
+                    f"排程設定已儲存：每日 {self.config.scheduler.daily_time}，設定檔：{saved_path}。"
+                    "若 Windows Task Scheduler 已安裝，請再按「安裝 Windows Task Scheduler」套用新的每日時間。"
+                ),
+            )
         if action == "安裝 Windows Task Scheduler":
             self._sync_gui_to_config()
             self.config.scheduler.weekly_enabled = False
@@ -252,12 +326,13 @@ class SettingsMainWindow(QMainWindow):
                 python_exe=str(Path(sys.executable)),
                 config_path=str(saved_path),
                 retry_elevated_on_access_denied=True,
+                diagnostic_dir=dated_runtime_dir(self.config.app.logs_dir, run_date=date.today()),
             )
             return self._gui_result_from_scheduler_result(result)
         if action == "移除 Windows Task Scheduler":
             return self._gui_result_from_scheduler_result(remove_task(task_name=DEFAULT_TASK_NAME))
         if action == "檢查排程狀態":
-            return self._gui_result_from_scheduler_result(query_task(task_name=DEFAULT_TASK_NAME))
+            return self._gui_result_from_scheduler_result(inspect_task(task_name=DEFAULT_TASK_NAME))
         return GuiActionResult(ok=False, error_code="UNKNOWN_SCHEDULER_ACTION", message=f"未知排程動作：{action}")
 
     def _gui_result_from_scheduler_result(self, result: Any) -> GuiActionResult:
@@ -269,12 +344,14 @@ class SettingsMainWindow(QMainWindow):
                 f"returncode: {result.returncode}" if result.returncode is not None else "",
                 f"stdout:\n{result.stdout}".strip() if result.stdout else "",
                 f"stderr:\n{result.stderr}".strip() if result.stderr else "",
+                f"details:\n{json.dumps(result.details, ensure_ascii=False, indent=2)}" if getattr(result, "details", None) else "",
+                f"diagnostic_path: {result.diagnostic_path}" if getattr(result, "diagnostic_path", None) else "",
             )
             if part
         )
         return GuiActionResult(
             ok=bool(result.ok),
-            error_code=None if result.ok else "WINDOWS_SCHEDULER_FAILED",
+            error_code=None if result.ok else str(getattr(result, "error_code", None) or "WINDOWS_SCHEDULER_FAILED"),
             message=str(result.message),
             details=details,
         )
@@ -404,7 +481,18 @@ class SettingsMainWindow(QMainWindow):
                 backend=self.config.pos.backend,
             )
             self.last_ui_probe_report = report
-        expected_entries = sorted({item.report_menu_text for item in self.config.reports if item.enabled})
+        expected_entries = sorted(
+            {
+                item.report_menu_text
+                for item in self.config.reports
+                if item.enabled and not self._is_local_report(item)
+            }
+        )
+        if not expected_entries:
+            return GuiActionResult(
+                ok=True,
+                message="目前啟用的任務都不需要 POS 報表入口探測。",
+            )
         found = self._match_report_entries(expected_entries, report)
 
         if len(found) < len(expected_entries):
@@ -691,11 +779,16 @@ class SettingsMainWindow(QMainWindow):
 
         if action == "只啟用 R01 測試":
             self._set_only_report_enabled("R01")
+            self._refresh_reports_title()
+            self._refresh_drive_target_table()
             return GuiActionResult(ok=True, message="已只啟用 R01。接著可按「立即 Dry-run」或「立即執行選取任務」。")
 
         if action == "啟用全部報表":
             self._set_all_reports_enabled()
-            return GuiActionResult(ok=True, message="已啟用全部報表任務。")
+            self._refresh_reports_title()
+            self._refresh_drive_target_table()
+            saved_path = self.save_settings(self.settings_path)
+            return GuiActionResult(ok=True, message=f"已啟用全部報表任務並儲存設定：{saved_path}")
 
         if action == "立即執行選取任務":
             return self.start_enabled_reports_async()
@@ -1027,6 +1120,8 @@ class SettingsMainWindow(QMainWindow):
         for report in self.config.reports:
             if not report.enabled:
                 continue
+            if self._is_local_report(report):
+                continue
             menu_path = self._effective_report_menu_path(report)
             if menu_path:
                 names.append(menu_path[0])
@@ -1142,6 +1237,9 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("日誌資料夾", "app.logs_dir", "text"),
                 SettingFieldSpec("截圖資料夾", "app.screenshots_dir", "text"),
                 SettingFieldSpec("state 資料夾", "app.state_dir", "text"),
+                SettingFieldSpec("R14 模板檔路徑", "r14_transform.template_path", "text"),
+                SettingFieldSpec("R14 模板搜尋資料夾", "r14_transform.template_search_dir", "text"),
+                SettingFieldSpec("R14 raw data 搜尋資料夾", "r14_transform.raw_search_dir", "text"),
             ],
             "pos": [
                 SettingFieldSpec("POS 啟動路徑（.appref-ms 或 SPA1.exe）", "pos.executable_path", "text"),
@@ -1187,6 +1285,13 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("失敗通知", "email.notify_on_failure", "bool"),
                 SettingFieldSpec("成功摘要通知", "email.notify_on_success_summary", "bool"),
             ],
+            "r14_email": [
+                SettingFieldSpec("啟用 R14 報表寄送", "r14_email.enabled", "bool"),
+                SettingFieldSpec("收件人", "r14_email.recipients", "list"),
+                SettingFieldSpec("CC", "r14_email.cc", "list"),
+                SettingFieldSpec("預設主旨", "r14_email.subject_template", "text"),
+                SettingFieldSpec("預設內容", "r14_email.body", "multiline"),
+            ],
             "schedule": [
                 SettingFieldSpec("啟用每日排程", "scheduler.enabled", "bool"),
                 SettingFieldSpec("每日時間", "scheduler.daily_time", "text"),
@@ -1196,7 +1301,7 @@ class SettingsMainWindow(QMainWindow):
         }
         return specs_by_page.get(page_id, [])
 
-    def _create_setting_editor(self, spec: SettingFieldSpec) -> QLineEdit | QCheckBox | QSpinBox | QComboBox:
+    def _create_setting_editor(self, spec: SettingFieldSpec) -> SettingEditor:
         value = self._get_config_value(spec.path)
         object_name = self._editor_object_name(spec.path)
 
@@ -1220,14 +1325,24 @@ class SettingsMainWindow(QMainWindow):
             combo.setCurrentText(str(value))
             self._setting_editors[spec.path] = combo
             return combo
+        if spec.widget == "multiline":
+            plain_editor = QPlainTextEdit(str(value))
+            plain_editor.setObjectName(object_name)
+            plain_editor.setMinimumHeight(120)
+            self._setting_editors[spec.path] = plain_editor
+            return plain_editor
 
-        editor = QLineEdit(self._display_value(value, spec.widget))
-        editor.setObjectName(object_name)
-        self._setting_editors[spec.path] = editor
-        return editor
+        line_editor = QLineEdit(self._display_value(value, spec.widget))
+        line_editor.setObjectName(object_name)
+        self._setting_editors[spec.path] = line_editor
+        return line_editor
 
     def _sync_setting_editors_to_config(self) -> None:
-        specs = [spec for page_id in ["basic", "pos", "login", "drive", "email", "schedule"] for spec in self._field_specs_for_page(page_id)]
+        specs = [
+            spec
+            for page_id in ["basic", "pos", "login", "drive", "email", "r14_email", "schedule"]
+            for spec in self._field_specs_for_page(page_id)
+        ]
         specs_by_path = {spec.path: spec for spec in specs}
         for path, editor in self._setting_editors.items():
             spec = specs_by_path[path]
@@ -1237,6 +1352,8 @@ class SettingsMainWindow(QMainWindow):
                 value = editor.value()
             elif isinstance(editor, QComboBox):
                 value = editor.currentText()
+            elif isinstance(editor, QPlainTextEdit):
+                value = editor.toPlainText()
             else:
                 value = self._parse_text_value(editor.text(), spec.widget)
             self._set_config_value(path, value)
@@ -1359,12 +1476,25 @@ class SettingsMainWindow(QMainWindow):
             if checkbox is not None:
                 checkbox.setChecked(report.enabled)
 
+    def _refresh_reports_title(self) -> None:
+        title = self.findChild(QLabel, "reports_title")
+        if title is None:
+            return
+        enabled_reports = sum(1 for report in self.config.reports if report.enabled)
+        title.setText(f"報表任務設定 - 已啟用 {enabled_reports} 項")
+
+    @staticmethod
+    def _is_local_report(report: Any) -> bool:
+        return str(getattr(report, "handler", "")).strip() in LOCAL_REPORT_HANDLERS
+
     def _report_menu_entry_text(self, report: Any) -> str:
         if report.menu_path:
             return " > ".join(report.menu_path)
         return str(report.report_menu_text)
 
     def _effective_report_menu_path(self, report: Any) -> list[str]:
+        if self._is_local_report(report):
+            return []
         if report.menu_path:
             return [part.strip() for part in report.menu_path if part and part.strip()]
         return ["統計報表", report.report_menu_text]
@@ -1374,9 +1504,8 @@ class SettingsMainWindow(QMainWindow):
 
 
 def launch_settings_gui(config: ProjectConfig, *, settings_path: Path | None = None) -> int:
-    from PySide6.QtWidgets import QApplication
-
     app = QApplication.instance() or QApplication([])
+    QApplication.setQuitOnLastWindowClosed(False)
     window = SettingsMainWindow(config, settings_path=settings_path)
     window.show()
     return int(app.exec())

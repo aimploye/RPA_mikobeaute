@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 DEFAULT_PROBE_MAX_DEPTH = 9
 DEFAULT_PROBE_MAX_CONTROLS = 1000
-DEFAULT_WINDOW_TITLE_FALLBACK_CONTAINS = ("SPA-POS", "帳號登入", "SPA資訊")
+DEFAULT_WINDOW_TITLE_FALLBACK_CONTAINS = ("SPA-POS", "chooseini", "帳號登入", "SPA資訊")
 
 
 class UiProbeError(RuntimeError):
@@ -40,10 +40,12 @@ def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str =
         raise UiProbeError("POS UI probe requires Windows and a running SPA-POS window.")
 
     try:
-        from pywinauto import Application  # type: ignore[import-untyped]
+        import pywinauto  # type: ignore[import-untyped]
     except ImportError as exc:  # pragma: no cover - depends on local installation
         raise UiProbeError("pywinauto is not installed; cannot run POS UI probe.") from exc
 
+    Application = pywinauto.Application
+    Desktop = getattr(pywinauto, "Desktop", None)
     backends = ["uia", "win32"] if backend == "auto" else [backend]
     title_candidates = _window_title_candidates(window_title_contains)
     errors: list[str] = []
@@ -61,10 +63,102 @@ def connect_pos_window(*, window_title_contains: str = "SPA-POS", backend: str =
             except Exception as exc:  # pragma: no cover - real Windows probe only
                 errors.append(f"{candidate_backend}/{title_contains}: {exc}")
 
+    desktop_window = _connect_pos_window_from_desktop(
+        Desktop,
+        backends=backends,
+        title_candidates=title_candidates,
+        errors=errors,
+    )
+    if desktop_window is not None:
+        return desktop_window
+
+    desktop_hints = desktop_window_snapshots(backend=backend, limit=20)
+    desktop_hint_text = ""
+    if desktop_hints:
+        visible_titles = [
+            f"{record.get('backend', '')}/{record.get('title', '')}/{record.get('class_name', '')}"
+            for record in desktop_hints[:10]
+        ]
+        desktop_hint_text = f" Top-level windows: {'; '.join(visible_titles)}."
     raise UiProbeError(
         f"Cannot connect to window containing any of {title_candidates!r}. "
-        f"Tried backends: {', '.join(backends)}. Errors: {'; '.join(errors)}"
+        f"Tried backends: {', '.join(backends)}. Errors: {'; '.join(errors)}.{desktop_hint_text}"
     )
+
+
+def desktop_window_snapshots(*, backend: str = "auto", limit: int = 30) -> list[dict[str, Any]]:
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import pywinauto  # type: ignore[import-untyped]
+    except ImportError:  # pragma: no cover - depends on local installation
+        return []
+    Desktop = getattr(pywinauto, "Desktop", None)
+    if Desktop is None:
+        return []
+    backends = ["uia", "win32"] if backend == "auto" else [backend]
+    records: list[dict[str, Any]] = []
+    for candidate_backend in backends:
+        try:
+            desktop = Desktop(backend=candidate_backend)
+            windows = desktop.windows(visible_only=False)
+        except Exception as exc:  # pragma: no cover - real Windows probe only
+            records.append({"backend": candidate_backend, "error": str(exc)})
+            continue
+        for window in windows:
+            if len(records) >= limit:
+                return records
+            records.append(
+                {
+                    "backend": candidate_backend,
+                    "title": _control_name(window),
+                    "control_type": str(
+                        _safe_call(
+                            window,
+                            "friendly_class_name",
+                            default=_safe_call(window, "control_type", default=""),
+                        )
+                    ),
+                    "class_name": str(_safe_call(window, "class_name", default="")),
+                    "automation_id": str(_safe_call(window, "automation_id", default="")),
+                    "visible": bool(_safe_call(window, "is_visible", default=False)),
+                    "enabled": bool(_safe_call(window, "is_enabled", default=False)),
+                    "rectangle": _rect_to_dict(_safe_call(window, "rectangle", default=None)),
+                }
+            )
+    return records
+
+
+def _connect_pos_window_from_desktop(
+    Desktop: Any,
+    *,
+    backends: list[str],
+    title_candidates: tuple[str, ...],
+    errors: list[str],
+) -> Any | None:
+    if Desktop is None:
+        return None
+    lowered_candidates = tuple(candidate.lower() for candidate in title_candidates)
+    for candidate_backend in backends:
+        try:
+            desktop = Desktop(backend=candidate_backend)
+            windows = desktop.windows(visible_only=False)
+        except Exception as exc:  # pragma: no cover - real Windows probe only
+            errors.append(f"{candidate_backend}/Desktop.windows: {exc}")
+            continue
+        for window in windows:
+            title = _control_name(window)
+            if not title:
+                continue
+            lowered_title = title.lower()
+            if not any(candidate in lowered_title for candidate in lowered_candidates):
+                continue
+            try:
+                setattr(window, "_pos_report_bot_backend", candidate_backend)
+            except Exception:
+                pass
+            return window
+    return None
 
 
 def _window_title_candidates(window_title_contains: str) -> tuple[str, ...]:
@@ -147,7 +241,7 @@ def _record_from_control(control: Any, *, depth: int) -> ControlProbeRecord:
                 default=_safe_call(control, "control_type", default=""),
             )
         ),
-        name=str(_safe_call(control, "window_text", default=_safe_call(control, "texts", default=[""])[0])),
+        name=_control_name(control),
         automation_id=str(_safe_call(control, "automation_id", default="")),
         class_name=str(_safe_call(control, "class_name", default="")),
         rectangle=_rect_to_dict(rect),
@@ -155,6 +249,22 @@ def _record_from_control(control: Any, *, depth: int) -> ControlProbeRecord:
         visible=bool(_safe_call(control, "is_visible", default=False)),
         depth=depth,
     )
+
+
+def _control_name(control: Any) -> str:
+    value = _safe_call(control, "window_text", default="")
+    if value:
+        return str(value)
+
+    texts = _safe_call(control, "texts", default=[])
+    if isinstance(texts, (list, tuple)):
+        for text in texts:
+            if text is not None:
+                return str(text)
+        return ""
+    if texts:
+        return str(texts)
+    return ""
 
 
 def _safe_call(control: Any, method_name: str, *, default: Any) -> Any:

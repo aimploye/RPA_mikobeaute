@@ -3,7 +3,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from pos_report_bot.google.oauth import GoogleOAuthService
+from pos_report_bot.google.oauth import GoogleOAuthReauthRequired, GoogleOAuthService
 
 
 class DriveUploadResult(BaseModel):
@@ -96,6 +96,15 @@ class GoogleDriveUploader:
                     )
                     .execute()
                 )
+        except GoogleOAuthReauthRequired as exc:
+            return DriveUploadResult(
+                success=False,
+                folder_id=folder_id,
+                uploaded_name=name,
+                size=file_path.stat().st_size,
+                error_code=exc.error_code,
+                message=exc.message,
+            )
         except Exception as exc:
             return DriveUploadResult(
                 success=False,

@@ -17,12 +17,14 @@ def test_settings_pages_cover_required_sections_without_importing_pyside() -> No
         "dashboard",
         "basic",
         "pos",
+        "pos_ini",
         "login",
         "branches",
         "reports",
         "drive",
         "email",
         "r14_email",
+        "w02_order",
         "schedule",
         "diagnostics",
     ]
@@ -33,12 +35,16 @@ def test_settings_pages_cover_required_sections_without_importing_pyside() -> No
         "測報表入口",
         "匯出 UI 探測報告",
     ]
+    assert next(page for page in pages if page.page_id == "pos_ini").actions == [
+        "儲存 POS 環境設定",
+    ]
     assert next(page for page in pages if page.page_id == "reports").actions == [
         "只啟用 R01 測試",
         "啟用全部報表",
         "測試上傳",
         "立即 Dry-run",
     ]
+    assert "W02 診斷模式" in next(page for page in pages if page.page_id == "w02_order").fields
     assert next(page for page in pages if page.page_id == "schedule").actions == [
         "儲存排程設定",
         "安裝 Windows Task Scheduler",
@@ -55,4 +61,4 @@ def test_settings_pages_reflect_loaded_config_counts() -> None:
     reports = next(page for page in pages if page.page_id == "reports")
 
     assert branches.badge == "已啟用 6 項"
-    assert reports.badge == "已啟用 13 項"
+    assert reports.badge == "已啟用 15 項"

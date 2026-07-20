@@ -9,8 +9,13 @@ def test_resolve_relative_date_tokens_from_injected_today() -> None:
     today = date(2026, 5, 13)
 
     assert resolve_date_token("{today}", today=today) == date(2026, 5, 13)
+    assert resolve_date_token("{today_plus_30}", today=today) == date(2026, 6, 12)
     assert resolve_date_token("{yesterday}", today=today) == date(2026, 5, 12)
     assert resolve_date_token("{month_start}", today=today) == date(2026, 5, 1)
+
+
+def test_today_plus_30_matches_r04_requested_inclusive_range_example() -> None:
+    assert resolve_date_token("{today_plus_30}", today=date(2026, 7, 8)) == date(2026, 8, 7)
 
 
 def test_month_start_uses_yesterdays_month_for_month_boundary() -> None:

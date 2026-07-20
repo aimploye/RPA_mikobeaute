@@ -40,4 +40,4 @@ def test_update_guard_handle_returns_resume_plan_without_clicking() -> None:
     assert result.requires_restart is True
     assert result.resume_unfinished_tasks is True
     assert result.restart_wait_seconds == 180
-    assert result.max_restart_wait_seconds == 600
+    assert result.max_restart_wait_seconds == 300

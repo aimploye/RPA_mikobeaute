@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QDate, QEvent, QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
@@ -44,6 +45,7 @@ from pos_report_bot.app.automation_runner import (
     AutomationProgress,
     AutomationRunSummary,
     AutomationRunner,
+    forced_weekly_report_ids_for_run_source,
 )
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
 from pos_report_bot.config.writer import save_project_config
@@ -51,7 +53,13 @@ from pos_report_bot.drive.folder_id import parse_drive_folder_id
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
 from pos_report_bot.drive.uploader import GoogleDriveUploader
 from pos_report_bot.google.gmail import GmailOAuthSender
-from pos_report_bot.google.oauth import GoogleOAuthService
+from pos_report_bot.google.oauth import (
+    GOOGLE_DRIVE_PROFILE,
+    GOOGLE_DRIVE_SCOPES,
+    GOOGLE_GMAIL_PROFILE,
+    GOOGLE_GMAIL_SCOPES,
+    GoogleOAuthService,
+)
 from pos_report_bot.pos.launcher import resolve_pos_executable_path
 from pos_report_bot.pos.report_automation import ReportAutomationError as _ReportAutomationError
 from pos_report_bot.pos.report_automation import ReportWindowAutomator
@@ -69,6 +77,11 @@ from pos_report_bot.scheduler.windows_task_scheduler import DEFAULT_TASK_NAME, i
 from pos_report_bot.storage.runtime_paths import RuntimePaths, dated_runtime_dir
 
 ReportAutomationError = _ReportAutomationError
+
+POS_INI_PROFILE_OPTIONS = (
+    ("測試機", r"c:\tkhspa\tkhspa-測試區.ini"),
+    ("正式機", r"c:\tkhspa\tkhspa-正式區.ini"),
+)
 
 
 class SettingsPageContract(BaseModel):
@@ -113,13 +126,13 @@ class AutomationRunWorker(QObject):
 class SettingFieldSpec:
     label: str
     path: str
-    widget: Literal["text", "bool", "int", "combo", "list", "multiline"]
+    widget: Literal["text", "bool", "int", "combo", "list", "multiline", "date"]
     options: tuple[str, ...] = ()
     minimum: int = 0
     maximum: int = 9999
 
 
-SettingEditor = QLineEdit | QCheckBox | QSpinBox | QComboBox | QPlainTextEdit
+SettingEditor = QLineEdit | QCheckBox | QSpinBox | QComboBox | QPlainTextEdit | QDateEdit
 
 
 def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
@@ -146,6 +159,12 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             actions=["測試啟動 POS", "連接已開啟 POS", "探測 POS 畫面元件", "測報表入口", "匯出 UI 探測報告"],
         ),
         SettingsPageContract(
+            page_id="pos_ini",
+            title="POS 環境選擇",
+            fields=["啟用啟動 ini 選擇", "選擇正式機或測試機"],
+            actions=["儲存 POS 環境設定"],
+        ),
+        SettingsPageContract(
             page_id="login",
             title="登入設定",
             fields=["是否需要登入", "帳號", "密碼", "分店/公司代號", "登入按鈕文字", "登入逾時秒數"],
@@ -160,7 +179,7 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
         SettingsPageContract(
             page_id="reports",
             title="報表任務設定",
-            fields=["啟用", "任務代號", "任務名稱", "執行頻率", "報表入口", "分館模式", "日期規則", "輸出檔名規則"],
+            fields=["啟用", "本次執行", "任務代號", "任務名稱", "執行頻率", "報表入口", "分館模式", "日期規則", "輸出檔名規則"],
             actions=["只啟用 R01 測試", "啟用全部報表", "測試上傳", "立即 Dry-run"],
             badge=f"已啟用 {enabled_reports} 項",
         ),
@@ -180,6 +199,21 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             page_id="r14_email",
             title="R14 報表寄送設定",
             fields=["啟用 R14 報表寄送", "收件人", "CC", "預設主旨", "預設內容"],
+            actions=["儲存設定"],
+        ),
+        SettingsPageContract(
+            page_id="w02_order",
+            title="W02設定",
+            fields=[
+                "啟用 W02",
+                "下一次發動日期",
+                "異常收件人",
+                "CC",
+                "預設主旨",
+                "預設內容",
+                "啟用 POS 建單",
+                "W02 診斷模式",
+            ],
             actions=["儲存設定"],
         ),
         SettingsPageContract(
@@ -214,6 +248,8 @@ class SettingsMainWindow(QMainWindow):
         self._reports_table: QTableWidget | None = None
         self._setting_editors: dict[str, SettingEditor] = {}
         self._pos_login_secret_editor: QLineEdit | None = None
+        self._pos_ini_profile_combo: QComboBox | None = None
+        self._pos_ini_selection_enabled_checkbox: QCheckBox | None = None
         self._transient_pos_login_secret: str = ""
         self._tray_icon: QSystemTrayIcon | None = None
         self.setWindowTitle("POSReportBot 設定中心")
@@ -228,6 +264,8 @@ class SettingsMainWindow(QMainWindow):
                 widget = self._build_branches_page_widget(page)
             elif page.page_id == "reports":
                 widget = self._build_reports_page_widget(page)
+            elif page.page_id == "pos_ini":
+                widget = self._build_pos_ini_page_widget(page)
             else:
                 widget = self._build_page_widget(page)
             tabs.addTab(widget, page.title)
@@ -564,12 +602,58 @@ class SettingsMainWindow(QMainWindow):
         layout.addStretch()
         return widget
 
+    def _build_pos_ini_page_widget(self, page: SettingsPageContract) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        title = QLabel(page.title)
+        title.setObjectName(f"{page.page_id}_title")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        enabled_checkbox = QCheckBox()
+        enabled_checkbox.setObjectName("pos_ini_selection_enabled")
+        enabled_checkbox.setChecked(self.config.pos.startup_ini_selection_enabled)
+        self._pos_ini_selection_enabled_checkbox = enabled_checkbox
+        form.addRow("啟用啟動 ini 選擇", enabled_checkbox)
+
+        profile_combo = QComboBox()
+        profile_combo.setObjectName("pos_ini_profile_choice")
+        current_profile = self.config.pos.startup_ini_profile.strip().lower()
+        current_index = 0
+        for index, (label, profile) in enumerate(POS_INI_PROFILE_OPTIONS):
+            profile_combo.addItem(f"{label} - {profile}", profile)
+            if profile.lower() == current_profile:
+                current_index = index
+        profile_combo.setCurrentIndex(current_index)
+        self._pos_ini_profile_combo = profile_combo
+        form.addRow("啟動環境", profile_combo)
+
+        layout.addLayout(form)
+        for action in page.actions:
+            button = QPushButton(action)
+            button.setObjectName(f"{page.page_id}_{action}")
+            button.clicked.connect(
+                lambda _checked=False, page_id=page.page_id, action=action: self.handle_action(page_id, action)
+            )
+            layout.addWidget(button)
+        layout.addStretch()
+        return widget
+
     def _build_branches_page_widget(self, page: SettingsPageContract) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         title = QLabel(f"{page.title} - {page.badge}")
         title.setObjectName(f"{page.page_id}_title")
         layout.addWidget(title)
+        if page.page_id == "reports":
+            layout.addWidget(
+                QLabel(
+                    "啟用＝排程/一般執行是否納入；本次執行＝按下「立即執行選取任務」時才執行，"
+                    "不會修改啟用設定。W02 未到下一次發動日期時預設不勾選。"
+                )
+            )
 
         table = QTableWidget()
         table.setObjectName("branches_table")
@@ -602,9 +686,22 @@ class SettingsMainWindow(QMainWindow):
 
         table = QTableWidget()
         table.setObjectName("reports_table")
-        table.setColumnCount(11)
+        table.setColumnCount(12)
         table.setHorizontalHeaderLabels(
-            ["啟用", "任務代號", "任務名稱", "頻率", "報表入口", "分館模式", "起日規則", "迄日規則", "輸出檔名", "Drive folder ID", "上傳"]
+            [
+                "啟用",
+                "本次執行",
+                "任務代號",
+                "任務名稱",
+                "頻率",
+                "報表入口",
+                "分館模式",
+                "起日規則",
+                "迄日規則",
+                "輸出檔名",
+                "Drive folder ID",
+                "上傳",
+            ]
         )
         table.setRowCount(len(self.config.reports))
         self._reports_table = table
@@ -613,28 +710,33 @@ class SettingsMainWindow(QMainWindow):
             enabled.setObjectName(f"report_{report.id}_enabled")
             enabled.setChecked(report.enabled)
             table.setCellWidget(row_index, 0, enabled)
-            table.setItem(row_index, 1, QTableWidgetItem(report.id))
-            table.setCellWidget(row_index, 2, self._table_line_edit(f"report_{report.id}_name", report.name))
-            table.setCellWidget(row_index, 3, self._table_combo(f"report_{report.id}_frequency", ("daily",), report.frequency))
+            run_selected = QCheckBox()
+            run_selected.setObjectName(f"report_{report.id}_run_selected")
+            run_selected.setChecked(self._default_manual_run_selection(report))
+            run_selected.setToolTip("只影響本次『立即執行選取任務』，不會改變排程啟用設定。")
+            table.setCellWidget(row_index, 1, run_selected)
+            table.setItem(row_index, 2, QTableWidgetItem(report.id))
+            table.setCellWidget(row_index, 3, self._table_line_edit(f"report_{report.id}_name", report.name))
+            table.setCellWidget(row_index, 4, self._table_combo(f"report_{report.id}_frequency", ("daily", "weekly", "biweekly"), report.frequency))
             table.setCellWidget(
                 row_index,
-                4,
+                5,
                 self._table_line_edit(f"report_{report.id}_report_menu_text", self._report_menu_entry_text(report)),
             )
             table.setCellWidget(
                 row_index,
-                5,
+                6,
                 self._table_combo(f"report_{report.id}_branch_mode", ("all", "each_branch", "multi_select", "single"), report.branch_mode),
             )
-            table.setCellWidget(row_index, 6, self._table_line_edit(f"report_{report.id}_date_start", report.date_range.start))
-            table.setCellWidget(row_index, 7, self._table_line_edit(f"report_{report.id}_date_end", report.date_range.end))
-            table.setCellWidget(row_index, 8, self._table_line_edit(f"report_{report.id}_output_filename", report.output_filename))
-            table.setCellWidget(row_index, 9, self._table_line_edit(f"report_{report.id}_drive_folder_id", report.drive_folder_id))
+            table.setCellWidget(row_index, 7, self._table_line_edit(f"report_{report.id}_date_start", report.date_range.start))
+            table.setCellWidget(row_index, 8, self._table_line_edit(f"report_{report.id}_date_end", report.date_range.end))
+            table.setCellWidget(row_index, 9, self._table_line_edit(f"report_{report.id}_output_filename", report.output_filename))
+            table.setCellWidget(row_index, 10, self._table_line_edit(f"report_{report.id}_drive_folder_id", report.drive_folder_id))
             upload_enabled = QCheckBox()
             upload_enabled.setObjectName(f"report_{report.id}_upload_enabled")
             upload_enabled.setChecked(report.upload_enabled)
-            table.setCellWidget(row_index, 10, upload_enabled)
-        self._stretch_table(table, stretch_columns={2, 4, 8, 9})
+            table.setCellWidget(row_index, 11, upload_enabled)
+        self._stretch_table(table, stretch_columns={3, 5, 9, 10})
         layout.addWidget(table)
 
         actions = QWidget()
@@ -799,6 +901,13 @@ class SettingsMainWindow(QMainWindow):
         if page_id == "login" and action == "儲存 POS 憑證":
             return self.store_pos_credential()
 
+        if page_id == "pos_ini" and action == "儲存 POS 環境設定":
+            saved_path = self.save_settings(self.settings_path)
+            return GuiActionResult(
+                ok=True,
+                message=f"POS 環境設定已儲存：{self._pos_ini_profile_label()}，設定檔：{saved_path}",
+            )
+
         if page_id == "schedule":
             return self._handle_scheduler_action(action)
 
@@ -816,13 +925,34 @@ class SettingsMainWindow(QMainWindow):
 
     def execute_enabled_reports(self) -> GuiActionResult:
         self._sync_gui_to_config()
-        return self._gui_result_from_automation_summary(self._build_automation_runner().run())
+        selected_task_ids = self._selected_manual_task_ids()
+        if not selected_task_ids:
+            return GuiActionResult(
+                ok=False,
+                error_code="NO_SELECTED_REPORTS",
+                message="沒有勾選本次要執行的任務。請在報表頁勾選「本次執行」。",
+            )
+        return self._gui_result_from_automation_summary(
+            self._build_automation_runner(selected_task_ids=selected_task_ids).run()
+        )
 
     def start_enabled_reports_async(self) -> GuiActionResult:
         self._sync_gui_to_config()
-        plan = build_dry_run_plan(self.config)
+        run_source = "gui_manual"
+        selected_task_ids = self._selected_manual_task_ids()
+        if not selected_task_ids:
+            return GuiActionResult(
+                ok=False,
+                error_code="NO_SELECTED_REPORTS",
+                message="沒有勾選本次要執行的任務。請在報表頁勾選「本次執行」。",
+            )
+        plan = build_dry_run_plan(
+            self.config,
+            force_weekly_report_ids=forced_weekly_report_ids_for_run_source(run_source) & selected_task_ids,
+            selected_task_ids=selected_task_ids,
+        )
         if not plan.outputs:
-            return GuiActionResult(ok=False, error_code="NO_ENABLED_REPORTS", message="沒有啟用中的報表任務。")
+            return GuiActionResult(ok=False, error_code="NO_SELECTED_REPORTS", message="勾選的任務目前沒有可執行項目。")
         if self._automation_thread is not None:
             return GuiActionResult(
                 ok=False,
@@ -830,7 +960,7 @@ class SettingsMainWindow(QMainWindow):
                 message="已有 POS 報表任務正在背景執行，請等待目前任務完成。",
             )
 
-        worker = AutomationRunWorker(self._build_automation_runner())
+        worker = AutomationRunWorker(self._build_automation_runner(selected_task_ids=selected_task_ids))
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -848,7 +978,7 @@ class SettingsMainWindow(QMainWindow):
             message=f"已開始背景執行 {len(plan.outputs)} 個 POS 報表任務；進度會顯示在狀態列。",
         )
 
-    def _build_automation_runner(self) -> AutomationRunner:
+    def _build_automation_runner(self, *, selected_task_ids: set[str] | None = None) -> AutomationRunner:
         return AutomationRunner(
             self.config,
             settings_path=self.settings_path,
@@ -866,6 +996,7 @@ class SettingsMainWindow(QMainWindow):
             automator_factory=ReportWindowAutomator,
             pos_login_secret_provider=self._current_pos_login_secret,
             run_source="gui_manual",
+            selected_task_ids=selected_task_ids,
         )
 
     def _gui_result_from_automation_summary(self, summary: AutomationRunSummary) -> GuiActionResult:
@@ -976,7 +1107,13 @@ class SettingsMainWindow(QMainWindow):
         test_file = dated_runtime_dir(self.config.app.state_dir, run_date=date.today()) / "google_drive_upload_test.txt"
         test_file.parent.mkdir(parents=True, exist_ok=True)
         test_file.write_text("POSReportBot Google Drive upload test\n", encoding="utf-8")
-        result = GoogleDriveUploader(GoogleOAuthService(self.config)).upload(test_file, folder_id, test_file.name)
+        result = GoogleDriveUploader(
+            GoogleOAuthService(self.config, scopes=GOOGLE_DRIVE_SCOPES, profile=GOOGLE_DRIVE_PROFILE)
+        ).upload(
+            test_file,
+            folder_id,
+            test_file.name,
+        )
         return GuiActionResult(
             ok=result.success,
             error_code=result.error_code,
@@ -985,7 +1122,9 @@ class SettingsMainWindow(QMainWindow):
 
     def test_gmail_send(self) -> GuiActionResult:
         self._sync_gui_to_config()
-        result = GmailOAuthSender(GoogleOAuthService(self.config)).send(
+        result = GmailOAuthSender(
+            GoogleOAuthService(self.config, scopes=GOOGLE_GMAIL_SCOPES, profile=GOOGLE_GMAIL_PROFILE)
+        ).send(
             self.config.email,
             subject="POSReportBot Gmail API 測試",
             body="這是 POSReportBot Gmail API 測試信。",
@@ -1150,8 +1289,13 @@ class SettingsMainWindow(QMainWindow):
         if value:
             return str(value)
         texts = self._safe_probe_call(control, "texts", default=[])
+        if isinstance(texts, (list, tuple)):
+            for text in texts:
+                if text is not None:
+                    return str(text)
+            return ""
         if texts:
-            return str(texts[0])
+            return str(texts)
         return ""
 
     def _safe_probe_call(self, control: Any, method_name: str, *, default: Any) -> Any:
@@ -1224,9 +1368,25 @@ class SettingsMainWindow(QMainWindow):
 
     def _sync_gui_to_config(self) -> None:
         self._sync_setting_editors_to_config()
+        self._sync_pos_ini_page_to_config()
         self._sync_branch_table_to_config()
         self._sync_report_table_to_config()
         self._sync_drive_target_table_to_config()
+
+    def _sync_pos_ini_page_to_config(self) -> None:
+        if self._pos_ini_selection_enabled_checkbox is not None:
+            self.config.pos.startup_ini_selection_enabled = self._pos_ini_selection_enabled_checkbox.isChecked()
+        if self._pos_ini_profile_combo is not None:
+            profile = self._pos_ini_profile_combo.currentData()
+            if profile:
+                self.config.pos.startup_ini_profile = str(profile)
+
+    def _pos_ini_profile_label(self) -> str:
+        profile = self.config.pos.startup_ini_profile.strip().lower()
+        for label, candidate in POS_INI_PROFILE_OPTIONS:
+            if candidate.lower() == profile:
+                return label
+        return self.config.pos.startup_ini_profile
 
     def _field_specs_for_page(self, page_id: str) -> list[SettingFieldSpec]:
         specs_by_page: dict[str, list[SettingFieldSpec]] = {
@@ -1292,6 +1452,16 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("預設主旨", "r14_email.subject_template", "text"),
                 SettingFieldSpec("預設內容", "r14_email.body", "multiline"),
             ],
+            "w02_order": [
+                SettingFieldSpec("啟用 W02", "w02_order.enabled", "bool"),
+                SettingFieldSpec("下一次發動日期", "w02_order.next_run_date", "date"),
+                SettingFieldSpec("異常收件人", "w02_order.recipients", "list"),
+                SettingFieldSpec("CC", "w02_order.cc", "list"),
+                SettingFieldSpec("預設主旨", "w02_order.subject_template", "text"),
+                SettingFieldSpec("預設內容", "w02_order.body", "multiline"),
+                SettingFieldSpec("啟用 POS 建單", "w02_order.pos_submission_enabled", "bool"),
+                SettingFieldSpec("W02 診斷模式", "w02_order.diagnostic_mode", "bool"),
+            ],
             "schedule": [
                 SettingFieldSpec("啟用每日排程", "scheduler.enabled", "bool"),
                 SettingFieldSpec("每日時間", "scheduler.daily_time", "text"),
@@ -1331,6 +1501,15 @@ class SettingsMainWindow(QMainWindow):
             plain_editor.setMinimumHeight(120)
             self._setting_editors[spec.path] = plain_editor
             return plain_editor
+        if spec.widget == "date":
+            date_editor = QDateEdit()
+            date_editor.setObjectName(object_name)
+            date_editor.setCalendarPopup(True)
+            date_editor.setDisplayFormat("yyyy/MM/dd")
+            parsed = self._qdate_from_setting(value)
+            date_editor.setDate(parsed if parsed.isValid() else QDate.currentDate())
+            self._setting_editors[spec.path] = date_editor
+            return date_editor
 
         line_editor = QLineEdit(self._display_value(value, spec.widget))
         line_editor.setObjectName(object_name)
@@ -1340,7 +1519,7 @@ class SettingsMainWindow(QMainWindow):
     def _sync_setting_editors_to_config(self) -> None:
         specs = [
             spec
-            for page_id in ["basic", "pos", "login", "drive", "email", "r14_email", "schedule"]
+            for page_id in ["basic", "pos", "login", "drive", "email", "r14_email", "w02_order", "schedule"]
             for spec in self._field_specs_for_page(page_id)
         ]
         specs_by_path = {spec.path: spec for spec in specs}
@@ -1354,6 +1533,8 @@ class SettingsMainWindow(QMainWindow):
                 value = editor.currentText()
             elif isinstance(editor, QPlainTextEdit):
                 value = editor.toPlainText()
+            elif isinstance(editor, QDateEdit):
+                value = editor.date().toString("yyyy/MM/dd")
             else:
                 value = self._parse_text_value(editor.text(), spec.widget)
             self._set_config_value(path, value)
@@ -1377,6 +1558,15 @@ class SettingsMainWindow(QMainWindow):
         if widget == "list":
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @staticmethod
+    def _qdate_from_setting(value: Any) -> QDate:
+        text = str(value or "").strip()
+        for fmt in ("yyyy/MM/dd", "yyyy-MM-dd"):
+            parsed = QDate.fromString(text, fmt)
+            if parsed.isValid():
+                return parsed
+        return QDate()
 
     def _editor_object_name(self, path: str) -> str:
         return f"setting_{path.replace('.', '_')}"
@@ -1461,6 +1651,29 @@ class SettingsMainWindow(QMainWindow):
                 report.drive_folder_id = drive_folder_id.text()
             if upload_enabled is not None:
                 report.upload_enabled = upload_enabled.isChecked()
+
+    def _selected_manual_task_ids(self) -> set[str]:
+        selected: set[str] = set()
+        for report in self.config.reports:
+            if not report.enabled:
+                continue
+            checkbox = self.findChild(QCheckBox, f"report_{report.id}_run_selected")
+            if checkbox is not None and checkbox.isChecked():
+                selected.add(report.id)
+        return selected
+
+    def _default_manual_run_selection(self, report: Any) -> bool:
+        if not report.enabled:
+            return False
+        if report.id != "W02":
+            return True
+        configured_date = str(self.config.w02_order.next_run_date).strip()
+        for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(configured_date, fmt).date() == date.today()
+            except ValueError:
+                continue
+        return False
 
     def _set_only_report_enabled(self, report_id: str) -> None:
         for report in self.config.reports:

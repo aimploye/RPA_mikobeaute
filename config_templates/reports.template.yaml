@@ -63,18 +63,18 @@ reports:
     real_pos_validation_status: "pending_real_pos_validation"
 
   - id: "R04"
-    enabled: false
+    enabled: true
     frequency: "daily"
-    name: "R04 保留空號（停用）"
-    handler: "placeholder"
-    report_menu_text: ""
-    branch_mode: "all"
+    name: "每日 預約 未來30日"
+    handler: "appointment_record"
+    report_menu_text: "預約紀錄查詢統計表"
+    branch_mode: "multi_select"
     date_range:
-      start: "{month_start}"
-      end: "{yesterday}"
-    output_filename: ""
+      start: "{today}"
+      end: "{today_plus_30}"
+    output_filename: "預約資料統計報表-{start}-{end}.xls"
     drive_folder_id: ""
-    upload_enabled: false
+    upload_enabled: true
     options:
       check: []
       uncheck: []
@@ -281,6 +281,27 @@ reports:
     retry_count: 1
     real_pos_validation_status: "pending_real_pos_validation"
 
+  - id: "W01"
+    enabled: true
+    frequency: "weekly"
+    name: "每週五 R14 Google Sheet 庫存同步"
+    handler: "r14_template_inventory_sync"
+    report_menu_text: "R14 模板庫存同步"
+    branch_mode: "all"
+    date_range:
+      start: "{today}"
+      end: "{today}"
+    output_filename: ""
+    drive_folder_id: ""
+    upload_enabled: false
+    options:
+      check: []
+      uncheck: []
+      other_conditions: []
+    max_wait_seconds: 300
+    retry_count: 1
+    real_pos_validation_status: "local_transform"
+
   - id: "R14"
     enabled: true
     frequency: "daily"
@@ -301,3 +322,25 @@ reports:
     max_wait_seconds: 300
     retry_count: 1
     real_pos_validation_status: "local_transform"
+
+  - id: "W02"
+    enabled: true
+    frequency: "biweekly"
+    name: "雙週五 R14 下單數 POS 分店訂貨"
+    handler: "w02_pos_order_creation"
+    report_menu_text: "分店訂貨單"
+    menu_path: ["庫存管理", "分店訂貨單"]
+    branch_mode: "all"
+    date_range:
+      start: "{today}"
+      end: "{today}"
+    output_filename: ""
+    drive_folder_id: ""
+    upload_enabled: false
+    options:
+      check: []
+      uncheck: []
+      other_conditions: []
+    max_wait_seconds: 300
+    retry_count: 1
+    real_pos_validation_status: "pending_real_pos_validation"

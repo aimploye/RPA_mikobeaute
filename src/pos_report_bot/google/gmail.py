@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 from email.message import EmailMessage
+from html import unescape
 import mimetypes
 from pathlib import Path
+import re
 from typing import Any
 
 from pydantic import BaseModel
@@ -42,7 +44,11 @@ class GmailOAuthSender:
         if settings.username:
             message["From"] = settings.username
         message["Subject"] = subject
-        message.set_content(body)
+        if _contains_html_table(body):
+            message.set_content(_html_to_plain_text(body))
+            message.add_alternative(body, subtype="html")
+        else:
+            message.set_content(body)
         for attachment in attachments or []:
             if not attachment.exists() or not attachment.is_file():
                 return GmailSendResult(
@@ -75,3 +81,15 @@ class GmailOAuthSender:
         from googleapiclient.discovery import build  # type: ignore[import-not-found]
 
         return build
+
+
+def _contains_html_table(body: str) -> bool:
+    return bool(re.search(r"<\s*table\b", body, flags=re.IGNORECASE))
+
+
+def _html_to_plain_text(body: str) -> str:
+    text = re.sub(r"<\s*/\s*(p|tr|table|thead|tbody)\s*>", "\n", body, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/\s*(td|th)\s*>", "\t", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())

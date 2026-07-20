@@ -17,6 +17,8 @@ def test_load_project_config_from_template_files() -> None:
     assert config.pos.executable_path.endswith(
         r"台灣凱惠資訊科技有限公司\SPA1\SPA資訊服務應用系統.appref-ms"
     )
+    assert config.pos.startup_ini_selection_enabled is True
+    assert config.pos.startup_ini_profile == r"c:\tkhspa\tkhspa-測試區.ini"
     assert config.scheduler.daily_time == "01:00"
     assert config.email.enabled is True
     assert config.email.recipients == ["joe.little7208@gmail.com", "mickey.chen@mikobeaute.com"]
@@ -31,18 +33,34 @@ def test_load_project_config_from_template_files() -> None:
     ]
     assert config.r14_email.subject_template == "{date}耗材領用報表"
     assert "附件為本日耗材領用報表" in config.r14_email.body
+    assert config.w02_order.diagnostic_mode is False
+    assert config.r14_inventory_source.enabled is True
+    assert config.r14_inventory_source.sheet_name == "Summary"
+    assert config.r14_inventory_source.item_code_column == "B"
+    assert config.r14_inventory_source.branch_inventory_columns == {
+        "站前4樓": "G",
+        "站前11樓": "H",
+        "忠孝7樓": "I",
+        "忠孝國際醫學3樓": "J",
+        "忠孝健康7樓": "K",
+    }
     assert config.google_drive.upload_enabled is True
     assert config.save_as.default_extension == ".xls"
     assert config.save_as.wait_timeout_seconds == 300
     assert config.pos_update.expected_update_weekday == "Thursday"
-    assert len(config.reports) == 14
+    assert len(config.reports) == 16
     reports = {report.id: report for report in config.reports}
-    assert sum(1 for report in config.reports if report.enabled) == 13
+    assert sum(1 for report in config.reports if report.enabled) == 16
     assert reports["R03"].options.check == ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
     assert reports["R03"].options.other_conditions == ["二次篩選"]
     assert reports["R03"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
-    assert reports["R04"].enabled is False
-    assert reports["R04"].handler == "placeholder"
+    assert reports["R04"].enabled is True
+    assert reports["R04"].handler == "appointment_record"
+    assert reports["R04"].report_menu_text == "預約紀錄查詢統計表"
+    assert reports["R04"].branch_mode == "multi_select"
+    assert reports["R04"].date_range.start == "{today}"
+    assert reports["R04"].date_range.end == "{today_plus_30}"
+    assert reports["R04"].output_filename == "預約資料統計報表-{start}-{end}.xls"
     assert reports["R14"].enabled is True
     assert reports["R14"].handler == "r14_inventory_demand_planning"
     assert reports["R14"].real_pos_validation_status == "local_transform"
@@ -78,6 +96,7 @@ def test_drive_targets_are_loaded_without_secrets() -> None:
     assert config.drive_targets.targets["R03"].folder_id_or_url.endswith("1iIwcWtj4Vs5yFf4YN_iU2pnkbMNWj9sl")
     assert config.drive_targets.targets["R13"].folder_id_or_url.endswith("1wIz37SF8Qi3gdceLrfmKpt3lUiktbm9z")
     assert config.drive_targets.targets["R14"].folder_id_or_url.endswith("1iqRNYGHuBFWHBLqmFpfFKJ5PqNvZAgYW")
+    assert config.drive_targets.targets["R04"].folder_id_or_url.endswith("1B3_KGkQ3nMNA0MMJxWVqLi1EvzKKZhGV")
 
 
 def test_load_project_config_migrates_legacy_r03_drive_target_from_r02_folder(tmp_path: Path) -> None:
@@ -129,7 +148,7 @@ def test_load_project_config_from_installed_config_filenames(tmp_path: Path) -> 
     config = load_project_config(config_dir / "app.yaml")
 
     assert config.app.name == "POSReportBot"
-    assert len(config.reports) == 14
+    assert len(config.reports) == 16
     assert len(config.branches) == 6
     assert config.drive_targets.targets["R06"].branches["N006"].endswith("1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG")
 
@@ -171,7 +190,7 @@ def test_load_project_config_prefers_user_companion_yaml_over_template_yaml(tmp_
 def test_load_project_config_merges_new_template_reports_into_saved_user_config(tmp_path: Path) -> None:
     original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     payload = original.model_dump(mode="json")
-    payload["reports"] = [report for report in payload["reports"] if report["id"] != "R13"]
+    payload["reports"] = [report for report in payload["reports"] if report["id"] not in {"R13", "W01"}]
     payload["reports"][0]["name"] = "使用者自訂 R01 名稱"
     payload["drive_targets"] = {
         task_id: target.model_dump(mode="json")
@@ -190,8 +209,12 @@ def test_load_project_config_merges_new_template_reports_into_saved_user_config(
     assert config.drive_targets.targets["R01"].folder_id_or_url == "user-r01-folder"
     assert reports["R13"].menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
     assert reports["R13"].options.check == ["顯示課程耗用"]
+    assert reports["W01"].frequency == "weekly"
+    assert reports["W01"].handler == "r14_template_inventory_sync"
     assert "R13" in config.drive_targets.targets
     assert config.drive_targets.targets["R13"].folder_id_or_url.endswith("1wIz37SF8Qi3gdceLrfmKpt3lUiktbm9z")
+    report_ids = [report.id for report in config.reports]
+    assert report_ids.index("R13") < report_ids.index("W01") < report_ids.index("R14")
 
 
 def test_load_project_config_migrates_old_save_as_timeout_default(tmp_path: Path) -> None:
@@ -234,9 +257,11 @@ def test_load_project_config_repairs_stale_r14_only_installed_defaults(tmp_path:
     config = load_project_config(saved_config)
     reports = {report.id: report for report in config.reports}
 
-    assert len(config.reports) == 14
-    assert sum(1 for report in config.reports if report.enabled) == 13
-    assert reports["R04"].enabled is False
+    assert len(config.reports) == 16
+    assert sum(1 for report in config.reports if report.enabled) == 16
+    assert reports["R04"].enabled is True
+    assert reports["W01"].enabled is True
+    assert reports["W01"].upload_enabled is False
     assert reports["R14"].enabled is True
     assert config.google_drive.upload_enabled is True
     assert config.email.enabled is True
@@ -257,11 +282,19 @@ def test_load_project_config_repairs_full_saved_config_with_only_r14_enabled(tmp
     config = load_project_config(saved_config)
     reports = {report.id: report for report in config.reports}
 
-    assert sum(1 for report in config.reports if report.enabled) == 13
+    assert sum(1 for report in config.reports if report.enabled) == 16
     assert reports["R01"].enabled is True
-    assert reports["R04"].enabled is False
+    assert reports["R04"].enabled is True
+    assert reports["W01"].enabled is True
+    assert reports["W01"].upload_enabled is False
+    assert reports["W02"].enabled is True
+    assert reports["W02"].upload_enabled is False
     assert reports["R14"].enabled is True
-    assert all(report.upload_enabled is True for report in config.reports if report.handler != "placeholder")
+    assert all(
+        report.upload_enabled is True
+        for report in config.reports
+        if report.handler != "placeholder" and report.id not in {"W01", "W02"}
+    )
     assert config.google_drive.upload_enabled is True
     assert config.email.enabled is True
 
@@ -335,8 +368,13 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
     assert reports["R02"].options.check == ["顯示分店碼", "顯示客代與電話", "顯示退費"]
     assert reports["R03"].options.check == ["顯示銷售分店", "顯示客代與電話", "顯示退費", "僅含新客"]
     assert reports["R03"].options.other_conditions == ["二次篩選"]
-    assert reports["R04"].enabled is False
-    assert reports["R04"].handler == "placeholder"
+    assert reports["R04"].enabled is True
+    assert reports["R04"].handler == "appointment_record"
+    assert reports["R04"].report_menu_text == "預約紀錄查詢統計表"
+    assert reports["R04"].branch_mode == "multi_select"
+    assert reports["R04"].date_range.start == "{today}"
+    assert reports["R04"].date_range.end == "{today_plus_30}"
+    assert reports["R04"].output_filename == "預約資料統計報表-{start}-{end}.xls"
     assert reports["R04"].options.check == []
     assert "R05A" not in reports
     assert "R05B" not in reports
@@ -478,6 +516,7 @@ def test_load_project_config_migrates_empty_or_legacy_defaults_without_overwriti
     assert reports["R01"].output_filename == "課程服務明細表-{start}-{end}-全部.xls"
     assert reports["R02"].output_filename == "user-custom-r02-{start}.xls"
     assert reports["R03"].output_filename == "商品銷售明細表-{start}-{end}-全部.xls"
+    assert reports["R04"].output_filename == "預約資料統計報表-{start}-{end}.xls"
     assert reports["R05"].output_filename == "商品課程服務明細表-{start}-{end}-僅新客.xls"
     assert reports["R06"].output_filename == "會員剩餘點數殘值統計表-清單檢視{today}-{branch_name}.xls"
     assert reports["R07"].output_filename == "預約資料統計報表-{yesterday}-{yesterday}.xls"

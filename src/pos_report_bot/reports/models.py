@@ -26,7 +26,11 @@ class DryRunPlan(BaseModel):
     outputs: list[PlannedOutput]
 
     def to_payload(self) -> dict[str, object]:
-        missing = sum(1 for output in self.outputs if output.drive_target_status == "missing")
+        missing = sum(
+            1
+            for output in self.outputs
+            if output.upload_enabled and output.drive_target_status == "missing"
+        )
         return {
             "mode": self.mode,
             "status": self.status,

@@ -5,7 +5,7 @@ import re
 import sys
 import traceback
 from time import monotonic, sleep
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -26,15 +26,31 @@ MULTI_SELECT_OPTIONAL_BRANCH_LABELS = ("HQ01 營運總部",)
 BRANCH_SELECTOR_TOKENS = ("branch", "store", "shop", "分店", "分館", "querybranch", "querystore")
 BRANCH_PICKER_AUTOMATION_IDS = {"pb_Branch", "cT_Branch"}
 BRANCH_POPUP_GRID_AUTOMATION_ID = "_cPopWinGrid"
+AUTOMATION_LOGIC_FINGERPRINT = "export-v21-r13-confirmed-popup-geometry-20260717"
 EXPORT_BUTTON_TOKENS = ("匯出", "export", "儲存", "save", "存檔")
 EXPORT_FORMAT_TOKENS = ("excel", "xls", "試算表")
 EXPORT_FORMAT_SEARCH_DEPTH = 10
+EXPORT_FORMAT_FAST_SEARCH_DEPTH = 6
+EXPORT_FORMAT_FAST_RECORD_LIMIT = 160
 EXPORT_BUTTON_FAST_SEARCH_DEPTH = 9
 POST_REPORT_SEARCH_DEPTH = 9
 GENERAL_SEARCH_DEPTH = 9
+REPORTS_REQUIRING_ENABLED_EXPORT = {"R01", "R02"}
+REPORTS_REQUIRING_GEOMETRY_ONLY_EXPORT_MENU = {"R01", "R09", "R10"}
+REPORTS_WITH_GEOMETRY_EXPORT_MENU = {"R01", "R09", "R10", "R13"}
+REPORTS_WITH_EXPORT_MENU_FAILURE_PROBE = {"R01", "R09", "R10", "R13"}
+MENU_POPUP_SEARCH_DEPTH = 4
+MENU_POPUP_RECORD_LIMIT = 160
+OTHER_CONDITION_POPUP_SEARCH_DEPTH = 4
+OTHER_CONDITION_POPUP_RECORD_LIMIT = 160
 DIAGNOSTIC_SEARCH_DEPTH = 6
 DIAGNOSTIC_SEARCH_RECORD_LIMIT = 120
 DIAGNOSTIC_RELEVANT_RECORD_LIMIT = 180
+R01_EXPORT_STAGE_DIAGNOSTIC_SECONDS = 300.0
+R01_EXPORT_SAFE_SCAN_MIN_SECONDS = 60.0
+R01_EXPORT_SAFE_SCAN_MAX_SECONDS = 180.0
+GEOMETRY_ONLY_EXPORT_POPUP_WAIT_SECONDS = 2.0
+R13_LONG_EXPORT_TIMEOUT_SECONDS = 900
 VIEW_REPORT_AUTOMATION_IDS = {"B_RunReport", "Bt_Run"}
 OTHER_CONDITION_TOKENS = ("其他條件", "other")
 BRANCH_VALUE_ALIASES = {
@@ -131,6 +147,7 @@ class ReportDownloadResult(BaseModel):
     actions: list[str] = Field(default_factory=list)
     error_code: str | None = None
     message: str = ""
+    diagnostic_path: Path | None = None
 
 
 class ExportControlProbeRecord(BaseModel):
@@ -198,7 +215,14 @@ class ReportWindowAutomator:
         self.output_dir = output_dir
         self.diagnostic_dir = diagnostic_dir
         self.log_dir = self._usable_runtime_dir(log_dir)
-        self.runtime_metadata = runtime_metadata or {}
+        self.runtime_metadata = {
+            "automation_logic_fingerprint": AUTOMATION_LOGIC_FINGERPRINT,
+            "export_format_probe": "desktop-menu-plus-bounded-report-scope",
+            **(runtime_metadata or {}),
+        }
+        # The fingerprint is evidence of the loaded code, not caller-supplied
+        # descriptive metadata; never let a stale caller value disguise it.
+        self.runtime_metadata["automation_logic_fingerprint"] = AUTOMATION_LOGIC_FINGERPRINT
         self.wait_after_click_seconds = wait_after_click_seconds
         self.report_open_wait_seconds = report_open_wait_seconds
         self.report_generate_wait_seconds = report_generate_wait_seconds
@@ -213,6 +237,8 @@ class ReportWindowAutomator:
         self.actions: list[str] = []
         self.last_action_log_path: Path | None = None
         self.last_probe_log_path: Path | None = None
+        self.last_export_menu_probe_path: Path | None = None
+        self.last_export_menu_screenshot_path: Path | None = None
         self._keyboard_sender: Any | None = None
         self._mouse_clicker: Any | None = None
         self._save_as_dialog_probe: Any | None = None
@@ -222,9 +248,18 @@ class ReportWindowAutomator:
         self._active_report_form: Any | None = None
         self._report_view_requested = False
         self._export_format_menu_confirmed = False
+        self._current_report_id: str | None = None
         self._maximized_report_form_for_option: Any | None = None
         self._desktop_report_viewer_cache: dict[str, tuple[float, list[Any]]] = {}
+        self._export_scope_locked_to_active_form = False
         self._export_fast_scan_hit_limit = False
+        self._export_wait_had_fast_scan_limit = False
+        self._export_wait_had_active_scope_scan_limit = False
+        self._export_format_seen_but_not_activated = False
+        self._last_report_toolbar_scope: Any | None = None
+        self._menu_popup_anchor_rect: dict[str, int] | None = None
+        self._export_menu_anchor_rect: dict[str, int] | None = None
+        self._last_export_progress_wait_error: ReportAutomationError | None = None
 
     @staticmethod
     def _usable_runtime_dir(path: Path | None) -> Path | None:
@@ -245,6 +280,7 @@ class ReportWindowAutomator:
             close_after_success = True
         self.actions = self._start_action_log(output, report)
         self._report_view_requested = False
+        self._current_report_id = report.id
         output_path = self.output_dir / output.output_filename
 
         try:
@@ -281,8 +317,12 @@ class ReportWindowAutomator:
             if callable(set_action_logger):
                 set_action_logger(self.actions.append)
             save_started_at = monotonic()
-            self.actions.append(f"wait_start:另存新檔處理:timeout={int(self._save_as_timeout_seconds())}s")
-            save_result = self.save_as_handler.save(output_path)
+            restore_save_as_timeout = self._extend_save_as_timeout_for_report(report)
+            try:
+                self.actions.append(f"wait_start:另存新檔處理:timeout={int(self._save_as_timeout_seconds())}s")
+                save_result = self.save_as_handler.save(output_path)
+            finally:
+                restore_save_as_timeout()
             self.actions.append(
                 f"wait_result:另存新檔處理:elapsed={int(monotonic() - save_started_at)}s:"
                 f"status={save_result.status}:error={save_result.error_code or ''}"
@@ -306,11 +346,22 @@ class ReportWindowAutomator:
                         message="POS 顯示目前並無符合的療程殘值資料；已按下確定並跳過此輸出。",
                     )
                 self._write_run_probe(output, report, status="failed", error_code=save_result.error_code)
+                if save_result.error_code == "EXPORT_PROGRESS_TIMEOUT":
+                    if self._cancel_export_progress_dialog():
+                        self.actions.append("cancel:POS匯出進度視窗:save_as_timeout")
+                    else:
+                        self.actions.append("skip_cancel:POS匯出進度視窗:save_as_timeout:not_found")
                 self._cleanup_transient_ui_after_error()
                 if close_after_success:
                     self._close_report_viewer_safely(report.report_menu_text, reason=save_result.error_code)
                 if report.id == "R05":
                     self._close_report_viewer_safely("商品銷售明細表", reason=save_result.error_code)
+                if save_result.error_code == "EXPORT_PROGRESS_TIMEOUT":
+                    raise ReportAutomationError(
+                        save_result.error_code,
+                        save_result.message,
+                        actions=list(self.actions),
+                    )
                 return ReportDownloadResult(
                     ok=False,
                     task_id=output.task_id,
@@ -320,9 +371,28 @@ class ReportWindowAutomator:
                     message=save_result.message,
                 )
 
-            self._wait_for_export_progress_to_finish_safely(
+            progress_completed = self._wait_for_export_progress_to_finish_safely(
                 timeout_seconds=min(export_wait_seconds, self.export_progress_timeout_seconds)
             )
+            if not progress_completed:
+                progress_error = self._last_export_progress_wait_error or ReportAutomationError(
+                    "EXPORT_PROGRESS_TIMEOUT",
+                    "POS 匯出進度等待未完成；不能假裝報表已成功下載。",
+                )
+                self._write_run_probe(output, report, status="failed", error_code=progress_error.error_code)
+                self._cleanup_transient_ui_after_error()
+                if close_after_success:
+                    self._close_report_viewer_safely(report.report_menu_text, reason=progress_error.error_code)
+                if report.id == "R05":
+                    self._close_report_viewer_safely("商品銷售明細表", reason=progress_error.error_code)
+                return ReportDownloadResult(
+                    ok=False,
+                    task_id=output.task_id,
+                    output_path=save_result.output_path,
+                    actions=self.actions,
+                    error_code=progress_error.error_code,
+                    message=progress_error.message,
+                )
             if close_after_success:
                 self._close_report_viewer_safely(report.report_menu_text, reason="post_save_success")
                 if report.id == "R05":
@@ -461,6 +531,7 @@ class ReportWindowAutomator:
             if closed and self._control_name_matches_report_title(self._active_report_form, report_menu_text):
                 self._active_report_form = None
                 self._report_view_requested = False
+                self._export_scope_locked_to_active_form = False
             return closed
         except Exception as exc:
             message = _action_text(str(exc))
@@ -472,13 +543,19 @@ class ReportWindowAutomator:
             self._close_report_viewer_safely("商品銷售明細表", reason=reason)
 
     def _wait_for_export_progress_to_finish_safely(self, *, timeout_seconds: float) -> bool:
+        self._last_export_progress_wait_error = None
         try:
             self._wait_for_export_progress_to_finish(timeout_seconds=timeout_seconds)
         except ReportAutomationError as exc:
+            self._last_export_progress_wait_error = exc
             message = _action_text(exc.message)
             self.actions.append(f"skip_export_progress_wait:{exc.error_code}:{message}")
             return False
         except Exception as exc:
+            self._last_export_progress_wait_error = ReportAutomationError(
+                "UNEXPECTED_AUTOMATION_ERROR",
+                f"POS 匯出進度等待發生未預期錯誤：{_exception_detail(exc)}",
+            )
             message = _action_text(str(exc))
             self.actions.append(f"skip_export_progress_wait:UNEXPECTED_AUTOMATION_ERROR:{message}")
             return False
@@ -509,6 +586,9 @@ class ReportWindowAutomator:
         self._report_view_requested = False
         self._maximized_report_form_for_option = None
         self._desktop_report_viewer_cache.clear()
+        self._export_scope_locked_to_active_form = False
+        self._last_report_toolbar_scope = None
+        self._menu_popup_anchor_rect = None
         if self._window_session_invalid():
             raise ReportAutomationError(
                 "POS_SESSION_INVALID",
@@ -529,6 +609,7 @@ class ReportWindowAutomator:
                     self._active_report_form,
                     report_menu_text,
                 ):
+                    self._lock_export_scope_if_previous_report_form_open(previous_form, report_menu_text)
                     return
                 self.actions.append(
                     f"reject:menu_select_opened_wrong_report:"
@@ -546,6 +627,7 @@ class ReportWindowAutomator:
         ):
             self.actions.append(f"recover:menu_select_failed_but_report_inputs_visible:{report_menu_text}")
             self._remember_active_report_form(report_menu_text)
+            self._lock_export_scope_if_previous_report_form_open(previous_form, report_menu_text)
             return
         if not menu_select_ok and menu_select_available:
             if self._try_direct_leaf_after_failed_menu_select(report_menu_text, menu_path):
@@ -571,6 +653,7 @@ class ReportWindowAutomator:
                 f"已嘗試開啟「{report_menu_text}」，但 POS 畫面沒有出現報表日期欄位；不能繼續假裝已進入報表。",
             )
         self._remember_active_report_form(report_menu_text)
+        self._lock_export_scope_if_previous_report_form_open(previous_form, report_menu_text)
 
     def _window_session_invalid(self) -> bool:
         controls = self._all_controls()
@@ -708,11 +791,36 @@ class ReportWindowAutomator:
                 if verified_text:
                     self.actions.append(f"verify_branch:{value}:{_action_text(verified_text)}")
                 return True
+            if (
+                value == ALL_BRANCHES_LABEL
+                and self._select_all_branch_with_keyboard_first_item(control, expected_values=expected_values)
+            ):
+                return True
 
         self._log_branch_selector_candidates(selectors, value)
         if required:
             raise ReportAutomationError("BRANCH_CONTROL_NOT_FOUND", f"找不到分店下拉選項：{value}")
         return False
+
+    def _select_all_branch_with_keyboard_first_item(self, control: Any, *, expected_values: list[str]) -> bool:
+        selected_text = self._selected_control_text(control) or self._control_name(control)
+        if self._branch_selected_text_matches(selected_text, expected_values):
+            self.actions.append(f"select_branch:{ALL_BRANCHES_LABEL}:already_selected")
+            self.actions.append(f"verify_branch:{ALL_BRANCHES_LABEL}:{_action_text(selected_text)}")
+            return True
+        self._focus_control(control)
+        if not self._send_keyboard("{HOME}{ENTER}", f"select_branch:{ALL_BRANCHES_LABEL}:keyboard_first_item"):
+            return False
+        if not self._branch_control_value_matches(control, expected_values):
+            selected_text = self._selected_control_text(control) or ""
+            self.actions.append(
+                f"verify_branch_failed:{ALL_BRANCHES_LABEL}:selected={_action_text(selected_text)}"
+            )
+            return False
+        verified_text = self._selected_control_text(control)
+        if verified_text:
+            self.actions.append(f"verify_branch:{ALL_BRANCHES_LABEL}:{_action_text(verified_text)}")
+        return True
 
     def _select_multi_branch_values(self) -> None:
         panel_opened = self._open_branch_multi_select_panel_quick()
@@ -1321,7 +1429,7 @@ class ReportWindowAutomator:
             return
         if not self._open_other_conditions_panel(wait_for_option=name):
             raise ReportAutomationError("OTHER_CONDITION_NOT_FOUND", f"找不到勾選項：{name}")
-        if self._try_set_other_condition_checkbox(name, checked=True):
+        if self._try_set_other_condition_checkbox(name, checked=True, include_popup=True):
             self._restore_report_form_after_option()
             return
         raise ReportAutomationError("OTHER_CONDITION_NOT_FOUND", f"找不到勾選項：{name}")
@@ -1410,8 +1518,20 @@ class ReportWindowAutomator:
         controls: list[Any],
         *,
         automation_ids: set[str] | None = None,
+        require_interactable: bool = False,
     ) -> Any | None:
         automation_ids = automation_ids if automation_ids is not None else set(_option_checkbox_automation_ids(name))
+        if require_interactable:
+            expected = _normalized_text(name)
+            for control in reversed(controls):
+                if not self._is_enabled(control) or not self._is_visible(control):
+                    continue
+                if automation_ids and self._control_automation_id(control) in automation_ids:
+                    return control
+                actual = _normalized_text(self._control_name(control))
+                if _control_text_matches(expected, actual):
+                    return control
+            return None
         if automation_ids:
             for control in reversed(controls):
                 if not self._is_enabled(control) or not self._is_visible(control):
@@ -1420,10 +1540,23 @@ class ReportWindowAutomator:
                     return control
         return self._find_control_in_controls(name, controls)
 
-    def _try_set_other_condition_checkbox(self, name: str, *, checked: bool) -> bool:
-        controls = self._other_condition_search_controls()
+    def _try_set_other_condition_checkbox(
+        self,
+        name: str,
+        *,
+        checked: bool,
+        include_popup: bool = False,
+    ) -> bool:
+        controls = self._other_condition_search_controls(
+            include_popup=include_popup,
+            popup_anchor=self._active_report_form if include_popup else None,
+        )
         for candidate in _option_candidates(name):
-            control = self._find_checkbox_control_in_controls(candidate, controls)
+            control = self._find_checkbox_control_in_controls(
+                candidate,
+                controls,
+                require_interactable=True,
+            )
             if control is None:
                 continue
             current = self._toggle_state(control)
@@ -1439,7 +1572,9 @@ class ReportWindowAutomator:
         if self._active_report_title:
             self._refresh_active_report_form(self._active_report_title, reason="before_other_conditions")
         if wait_for_option and self._find_checkbox_control_in_controls(
-            wait_for_option, self._other_condition_search_controls()
+            wait_for_option,
+            self._other_condition_search_controls(),
+            require_interactable=True,
         ) is not None:
             return True
         controls = self._other_condition_search_controls()
@@ -1460,22 +1595,175 @@ class ReportWindowAutomator:
                     return True
         return False
 
-    def _wait_for_checkbox_control(self, name: str, *, timeout_seconds: float) -> Any | None:
+    def _wait_for_checkbox_control(
+        self,
+        name: str,
+        *,
+        timeout_seconds: float,
+        popup_anchor: Any | None = None,
+    ) -> Any | None:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
-            control = self._find_checkbox_control_in_controls(name, self._other_condition_search_controls())
+            control = self._find_checkbox_control_in_controls(
+                name,
+                self._other_condition_search_controls(
+                    include_popup=popup_anchor is not None,
+                    popup_anchor=popup_anchor,
+                ),
+                require_interactable=True,
+            )
             if control is not None:
                 return control
             sleep(0.15)
-        return self._find_checkbox_control_in_controls(name, self._other_condition_search_controls())
+        return self._find_checkbox_control_in_controls(
+            name,
+            self._other_condition_search_controls(
+                include_popup=popup_anchor is not None,
+                popup_anchor=popup_anchor,
+            ),
+            require_interactable=True,
+        )
 
-    def _other_condition_search_controls(self) -> list[Any]:
+    def _other_condition_search_controls(
+        self,
+        *,
+        include_popup: bool = False,
+        popup_anchor: Any | None = None,
+    ) -> list[Any]:
         controls: list[Any] = []
         if self._active_report_form is not None:
             controls.extend([self._active_report_form])
             controls.extend(self._collect_children(self._active_report_form, max_depth=8))
-            return _dedupe_controls(controls)
-        controls.extend(self._lightweight_controls(max_depth=8))
+        else:
+            controls.extend(self._lightweight_controls(max_depth=8))
+        if include_popup:
+            # The transient popup is the freshest scope.  Put it first so semantic
+            # de-duplication cannot let a stale form node with the same name/id win.
+            popup_controls = self._other_condition_popup_controls(anchor=popup_anchor)
+            controls = popup_controls + controls
+        return _dedupe_controls(controls)
+
+    def _other_condition_popup_controls(self, *, anchor: Any | None) -> list[Any]:
+        controls: list[Any] = []
+        popup_hook = self._direct_window_method("other_condition_popup_controls")
+        if popup_hook is not None:
+            try:
+                try:
+                    popup_roots = popup_hook(anchor)
+                except TypeError:
+                    popup_roots = popup_hook()
+            except Exception as exc:
+                self.actions.append(
+                    f"skip:其他條件:bounded_popup_hook:{_action_text(_exception_detail(exc))}"
+                )
+                popup_roots = []
+            if popup_roots is None:
+                popup_roots = []
+            if not isinstance(popup_roots, (list, tuple)):
+                popup_roots = [popup_roots]
+            controls.extend(
+                self._bounded_control_tree(
+                    list(popup_roots),
+                    max_depth=OTHER_CONDITION_POPUP_SEARCH_DEPTH,
+                    record_limit=OTHER_CONDITION_POPUP_RECORD_LIMIT,
+                )
+            )
+            if controls:
+                self.actions.append(f"probe:其他條件:bounded_popup_hook:controls={len(controls)}")
+                return _dedupe_controls(controls)
+
+        if not sys.platform.startswith("win"):
+            return []
+        try:
+            import win32gui
+        except Exception:
+            return []
+        get_class_name = getattr(win32gui, "GetClassName", None)
+        get_window_rect = getattr(win32gui, "GetWindowRect", None)
+        get_window_text = getattr(win32gui, "GetWindowText", None)
+        get_window = getattr(win32gui, "GetWindow", None)
+        get_parent = getattr(win32gui, "GetParent", None)
+        get_foreground_window = getattr(win32gui, "GetForegroundWindow", None)
+        if not all(
+            callable(func)
+            for func in (
+                get_class_name,
+                get_window_rect,
+                get_window_text,
+                get_window,
+                get_parent,
+                get_foreground_window,
+            )
+        ):
+            return []
+
+        anchor_rect = _rect_to_dict(_safe_call(anchor, "rectangle", default=None))
+        form_rect = _rect_to_dict(_safe_call(self._active_report_form, "rectangle", default=None))
+        window_rect = _rect_to_dict(_safe_call(self.window, "rectangle", default=None))
+        scope_rects = [rect for rect in (anchor_rect, form_rect, window_rect) if _rect_has_area(rect)]
+        main_handle = _control_handle(self.window)
+        try:
+            foreground_handle = int(get_foreground_window()) or None
+        except Exception:
+            foreground_handle = None
+        handles: list[int] = []
+        for handle in self._fast_top_level_window_handles()[:48]:
+            if main_handle is not None and int(handle) == main_handle:
+                continue
+            try:
+                owner = int(get_window(int(handle), 4)) or None
+            except Exception:
+                owner = None
+            try:
+                parent = int(get_parent(int(handle))) or None
+            except Exception:
+                parent = None
+            try:
+                class_name = str(get_class_name(int(handle)) or "")
+                title = str(get_window_text(int(handle)) or "")
+                raw_rect = get_window_rect(int(handle))
+                rect = {
+                    "left": int(raw_rect[0]),
+                    "top": int(raw_rect[1]),
+                    "right": int(raw_rect[2]),
+                    "bottom": int(raw_rect[3]),
+                }
+            except Exception:
+                continue
+            if class_name not in {"#32768", "#32770"} and not class_name.startswith("WindowsForms10.Window."):
+                continue
+            owned_by_main = main_handle is not None and (owner == main_handle or parent == main_handle)
+            owned_by_foreground = foreground_handle is not None and (
+                owner == foreground_handle or parent == foreground_handle
+            )
+            popup_is_foreground = foreground_handle is not None and int(handle) == foreground_handle
+            if not _rect_is_near_any_scope(rect, scope_rects, margin=96):
+                continue
+            if not (owned_by_main or owned_by_foreground or popup_is_foreground):
+                continue
+            if class_name.startswith("WindowsForms10.Window.") and title and not any(
+                token in _normalized_text(title) for token in ("其他", "條件", "二次", "查詢")
+            ):
+                continue
+            handles.append(int(handle))
+            if len(handles) >= 12:
+                break
+
+        for handle in handles:
+            popup = self._wrap_win32_window_handle(handle)
+            if popup is None or not self._is_visible(popup) or not self._is_enabled(popup):
+                continue
+            controls.extend(
+                self._bounded_control_tree(
+                    [popup],
+                    max_depth=OTHER_CONDITION_POPUP_SEARCH_DEPTH,
+                    record_limit=OTHER_CONDITION_POPUP_RECORD_LIMIT,
+                )
+            )
+        if controls:
+            self.actions.append(
+                f"probe:其他條件:bounded_popup_native:handles={len(handles)}:controls={len(controls)}"
+            )
         return _dedupe_controls(controls)
 
     def _activate_other_conditions_control(self, control: Any, *, wait_for_option: str | None) -> bool:
@@ -1497,17 +1785,39 @@ class ReportWindowAutomator:
                     return True
                 if self._active_report_title:
                     self._refresh_active_report_form(self._active_report_title, reason="after_other_conditions_click")
-                if self._wait_for_checkbox_control(wait_for_option, timeout_seconds=8.0) is not None:
+                if self._wait_for_checkbox_control(
+                    wait_for_option,
+                    timeout_seconds=8.0,
+                    popup_anchor=control,
+                ) is not None:
                     return True
             except Exception:
                 continue
+        if wait_for_option is not None:
+            self._focus_control_without_click(control)
+            for keys in ("{ENTER}", "{SPACE}"):
+                if not self._send_keyboard(keys, f"open_other_conditions:{keys}"):
+                    continue
+                self._wait_after_action()
+                if self._active_report_title:
+                    self._refresh_active_report_form(self._active_report_title, reason="after_other_conditions_keyboard")
+                if self._wait_for_checkbox_control(
+                    wait_for_option,
+                    timeout_seconds=4.0,
+                    popup_anchor=control,
+                ) is not None:
+                    return True
         if self._click_control_center_by_geometry(control, "其他條件:geometry"):
             self._wait_after_action()
             if wait_for_option is None:
                 return True
             if self._active_report_title:
                 self._refresh_active_report_form(self._active_report_title, reason="after_other_conditions_geometry")
-            if self._wait_for_checkbox_control(wait_for_option, timeout_seconds=8.0) is not None:
+            if self._wait_for_checkbox_control(
+                wait_for_option,
+                timeout_seconds=8.0,
+                popup_anchor=control,
+            ) is not None:
                 return True
         return False
 
@@ -1670,10 +1980,131 @@ class ReportWindowAutomator:
         self._wait_after_action()
         return True
 
+    def _find_visible_menu_popup_control(self, name: str) -> Any | None:
+        expected = _normalized_text(name)
+        if not expected:
+            return None
+        for control in self._menu_popup_controls():
+            if not self._is_enabled(control) or not self._is_visible(control):
+                continue
+            actual = _normalized_text(self._control_name(control))
+            if not _control_text_matches(expected, actual):
+                continue
+            self.actions.append(f"recover:visible_menu_popup_item:{name}")
+            return control
+        return None
+
+    def _menu_popup_controls(self) -> list[Any]:
+        popup_hook = self._direct_window_method("menu_popup_controls")
+        if popup_hook is not None:
+            try:
+                popup_roots = popup_hook()
+            except Exception as exc:
+                self.actions.append(f"skip:menu_popup_hook:{_action_text(_exception_detail(exc))}")
+                popup_roots = []
+            if popup_roots is None:
+                popup_roots = []
+            if not isinstance(popup_roots, (list, tuple)):
+                popup_roots = [popup_roots]
+            controls = self._bounded_control_tree(
+                list(popup_roots),
+                max_depth=MENU_POPUP_SEARCH_DEPTH,
+                record_limit=MENU_POPUP_RECORD_LIMIT,
+            )
+            if controls:
+                self.actions.append(f"probe:menu_popup_hook:controls={len(controls)}")
+                return _dedupe_controls(controls)
+
+        if not sys.platform.startswith("win"):
+            return []
+        try:
+            import win32gui
+        except Exception:
+            return []
+        get_window = getattr(win32gui, "GetWindow", None)
+        get_parent = getattr(win32gui, "GetParent", None)
+        get_foreground_window = getattr(win32gui, "GetForegroundWindow", None)
+        get_window_rect = getattr(win32gui, "GetWindowRect", None)
+        if not all(callable(func) for func in (get_window, get_parent, get_foreground_window, get_window_rect)):
+            return []
+        pos_handle = _control_handle(self.window)
+        try:
+            foreground_handle = int(get_foreground_window()) or None
+        except Exception:
+            foreground_handle = None
+        anchor_rects = [self._menu_popup_anchor_rect] if self._menu_popup_anchor_rect else []
+        handles: list[int] = []
+        for handle in self._fast_top_level_window_handles(class_name="#32768"):
+            if handle in handles or (pos_handle is not None and int(handle) == pos_handle):
+                continue
+            try:
+                raw_rect = get_window_rect(int(handle))
+                popup_rect = {
+                    "left": int(raw_rect[0]),
+                    "top": int(raw_rect[1]),
+                    "right": int(raw_rect[2]),
+                    "bottom": int(raw_rect[3]),
+                }
+            except Exception:
+                continue
+            near_anchor = _rect_is_near_any_scope(popup_rect, anchor_rects, margin=240)
+            if not near_anchor or not self._popup_window_handle_is_pos_related(
+                int(handle),
+                pos_handle=pos_handle,
+                get_window=get_window,
+                get_parent=get_parent,
+            ):
+                continue
+            handles.append(int(handle))
+        parent_handles: list[int] = []
+        if pos_handle is not None:
+            parent_handles.append(pos_handle)
+        if foreground_handle is not None and (
+            foreground_handle == pos_handle or foreground_handle in handles
+        ):
+            parent_handles.append(foreground_handle)
+        for parent_handle in parent_handles:
+            if parent_handle is None:
+                continue
+            for handle in self._fast_child_window_handles(parent_handle, class_name="#32768"):
+                if handle not in handles:
+                    handles.append(handle)
+        controls: list[Any] = []
+        for handle in handles[:12]:
+            popup = self._wrap_win32_window_handle(handle)
+            if popup is None or not self._is_visible(popup) or not self._is_enabled(popup):
+                continue
+            controls.extend(
+                self._bounded_control_tree(
+                    [popup],
+                    max_depth=MENU_POPUP_SEARCH_DEPTH,
+                    record_limit=MENU_POPUP_RECORD_LIMIT,
+                )
+            )
+        if controls:
+            self.actions.append(f"probe:menu_popup_native:handles={len(handles[:12])}:controls={len(controls)}")
+        return _dedupe_controls(controls)
+
     def _click_named(self, name: str, *, error_code: str) -> None:
         last_error: ReportAutomationError | None = None
         for attempt in range(2):
             control = self._find_control(name)
+            if (
+                error_code in {"REPORT_ROOT_MENU_NOT_FOUND", "REPORT_MENU_NOT_FOUND"}
+                and (
+                    control is None
+                    or not self._is_visible(control)
+                    or not self._is_enabled(control)
+                )
+            ):
+                if control is not None:
+                    if not self._is_visible(control):
+                        self.actions.append(f"skip_click_hidden_menu_item:{name}")
+                    else:
+                        self.actions.append(f"skip_click_disabled_menu_item:{name}")
+                popup_control = self._find_visible_menu_popup_control(name)
+                if popup_control is not None:
+                    control = popup_control
             if control is None:
                 if last_error is not None:
                     raise last_error
@@ -1689,7 +2120,23 @@ class ReportWindowAutomator:
                         "需要重新連接或重啟 POS 後重試。",
                     )
                 raise ReportAutomationError(error_code, f"找不到控制項：{name}")
+            if error_code in {"REPORT_ROOT_MENU_NOT_FOUND", "REPORT_MENU_NOT_FOUND"} and (
+                not self._is_visible(control) or not self._is_enabled(control)
+            ):
+                if not self._is_visible(control):
+                    self.actions.append(f"skip_click_hidden_menu_item:{name}")
+                else:
+                    self.actions.append(f"skip_click_disabled_menu_item:{name}")
+                if last_error is not None:
+                    raise last_error
+                if attempt == 0:
+                    self._wait_after_action()
+                    continue
+                raise ReportAutomationError(error_code, f"找不到可見且啟用控制項：{name}")
             try:
+                if error_code == "REPORT_ROOT_MENU_NOT_FOUND":
+                    anchor_rect = _rect_to_dict(_safe_call(control, "rectangle", default=None))
+                    self._menu_popup_anchor_rect = anchor_rect if _rect_has_area(anchor_rect) else None
                 self._click(control, name)
                 return
             except ReportAutomationError as exc:
@@ -1840,6 +2287,11 @@ class ReportWindowAutomator:
         return min(2.0, max(0.8, self.report_generate_wait_seconds * 0.05))
 
     def _report_viewer_is_present(self) -> bool:
+        if self._should_avoid_geometry_report_viewer_scope():
+            toolbar = self._last_report_toolbar_scope
+            if toolbar is None:
+                return False
+            return self._control_has_visible_area(toolbar)
         if self._find_export_button_control(require_enabled=False) is not None:
             return True
         for control in self._search_controls():
@@ -1855,6 +2307,8 @@ class ReportWindowAutomator:
         return False
 
     def _report_viewer_has_actionable_response(self) -> bool:
+        if self._should_avoid_geometry_report_viewer_scope():
+            return self._report_viewer_is_present()
         if self._find_export_button_control(require_enabled=True) is not None:
             return True
         if self._find_visible_report_toolbar_export_record() is not None:
@@ -1866,9 +2320,11 @@ class ReportWindowAutomator:
     def _wait_for_report_viewer(self, *, timeout_seconds: float) -> bool:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
+            self._raise_no_report_data_if_warning_visible(include_child_scan=True)
             if self._report_viewer_has_actionable_response():
                 return True
             sleep(0.5)
+        self._raise_no_report_data_if_warning_visible(include_child_scan=True)
         return self._report_viewer_has_actionable_response()
 
     def _try_menu_select(self, menu_path_items: list[str]) -> bool:
@@ -2144,12 +2600,18 @@ class ReportWindowAutomator:
     def _export_report_to_excel(self, export_control: Any | None, *, timeout_seconds: float | None = None) -> None:
         initial_export_control = export_control
         wait_seconds = timeout_seconds or self.report_generate_wait_seconds
-        export_control = self._wait_for_export_button(export_control, timeout_seconds=wait_seconds)
+        export_control = self._run_timed_export_stage(
+            "wait_for_export_button",
+            lambda: self._wait_for_export_button(export_control, timeout_seconds=wait_seconds),
+        )
         if export_control is None and self._retry_view_report_for_export():
             retry_wait_seconds = self._retry_export_wait_seconds(wait_seconds)
             self.actions.append(f"wait_budget:匯出重試:timeout={int(retry_wait_seconds)}s")
-            export_control = self._wait_for_export_button(
-                initial_export_control, timeout_seconds=retry_wait_seconds
+            export_control = self._run_timed_export_stage(
+                "retry_wait_for_export_button",
+                lambda: self._wait_for_export_button(
+                    initial_export_control, timeout_seconds=retry_wait_seconds
+                ),
             )
         if export_control is None:
             if self._report_viewer_looks_empty():
@@ -2162,9 +2624,30 @@ class ReportWindowAutomator:
                 "報表已按下「檢視報表」，但工具列的「匯出」沒有啟用；不能假裝已下載。",
             )
         self._export_format_menu_confirmed = False
-        if self._open_export_menu(export_control):
+        if self._run_timed_export_stage("open_export_menu", lambda: self._open_export_menu(export_control)):
             return
-        self._select_export_format(require_confirmed_menu=self._export_format_menu_confirmed)
+        self._run_timed_export_stage(
+            "select_export_format",
+            lambda: self._select_export_format(require_confirmed_menu=self._export_format_menu_confirmed),
+        )
+
+    def _run_timed_export_stage(self, stage: str, action: Callable[[], Any]) -> Any:
+        started_at = monotonic()
+        self.actions.append(f"export_stage_start:{stage}")
+        try:
+            return action()
+        finally:
+            elapsed_seconds = int(monotonic() - started_at)
+            self.actions.append(f"export_stage_result:{stage}:elapsed={elapsed_seconds}s")
+            if (
+                self._current_report_id in REPORTS_REQUIRING_GEOMETRY_ONLY_EXPORT_MENU
+                and elapsed_seconds >= int(R01_EXPORT_STAGE_DIAGNOSTIC_SECONDS)
+            ):
+                self.actions.append(
+                    f"diagnostic:{self._current_report_id}匯出卡住超過固定時間:"
+                    f"stage={stage}:elapsed={elapsed_seconds}s:"
+                    "likely=POS報表預覽或匯出選單仍在忙，尚未進入另存新檔或Google Drive上傳"
+                )
 
     @staticmethod
     def _retry_export_wait_seconds(wait_seconds: float) -> float:
@@ -2174,7 +2657,26 @@ class ReportWindowAutomator:
 
     def _open_export_menu(self, export_control: Any) -> bool:
         click_error: ReportAutomationError | None = None
+        hidden_enter_attempted = False
+        require_confirmed_menu_for_format_fallback = self._current_report_id == "R13"
+        if self._should_use_geometry_only_export_menu():
+            self.actions.append(f"skip:匯出前focus:{self._current_report_id}避免觸碰報表預覽範圍")
+        elif self._export_should_stay_with_active_report_form():
+            self._focus_active_report_form_for_export()
         export_control = self._refresh_export_control_before_click(export_control)
+        self._export_menu_anchor_rect = _rect_to_dict(_safe_call(export_control, "rectangle", default=None))
+        if self._current_report_id in REPORTS_REQUIRING_ENABLED_EXPORT and (
+            export_control is None or not self._is_enabled(export_control)
+        ):
+            if export_control is not None:
+                self._log_r01_rejected_export_candidate(export_control, "open_menu_enabled_required")
+            raise ReportAutomationError(
+                "EXPORT_BUTTON_NOT_READY",
+                f"{self._current_report_id} 的匯出控制項在實際點擊前已停用；不能改走未確認的格式或鍵盤 fallback。",
+            )
+        if not self._r01_export_control_is_clickable(export_control):
+            self._log_r01_rejected_export_candidate(export_control, "open_menu")
+            return False
         if not self._export_control_is_inside_active_report_area(export_control):
             self.actions.append("skip:匯出:outside_active_report_form")
             return False
@@ -2182,6 +2684,8 @@ class ReportWindowAutomator:
             self._is_exact_export_control(export_control)
             and not self._is_enabled(export_control)
         )
+        if self._should_use_geometry_only_export_menu() and not disabled_exact_toolbar_export:
+            return self._open_export_menu_by_geometry_only(export_control)
         if disabled_exact_toolbar_export:
             self.actions.append("skip:匯出:disabled_uia_click_use_geometry")
         else:
@@ -2203,6 +2707,13 @@ class ReportWindowAutomator:
                 self._export_format_menu_confirmed = True
                 return False
 
+        state = self._activate_export_menu_by_toolbar_wrapper(export_control)
+        if state == "save_as":
+            return True
+        if state == "format_menu":
+            self._export_format_menu_confirmed = True
+            return False
+
         if self._click_export_dropdown_by_geometry(export_control, "匯出:dropdown"):
             state = self._safe_export_menu_or_save_dialog_state("dropdown_geometry", timeout_seconds=0.8)
             if state == "save_as":
@@ -2210,8 +2721,16 @@ class ReportWindowAutomator:
             if state == "format_menu":
                 self._export_format_menu_confirmed = True
                 return False
-            if self._select_default_export_format_from_possible_menu("匯出:dropdown"):
-                return True
+            if require_confirmed_menu_for_format_fallback:
+                self.actions.append("skip:匯出格式:匯出:dropdown:R13未確認選單不送出格式選擇鍵")
+            else:
+                selected, hidden_enter_attempted = self._click_default_export_format_from_possible_menu(
+                    export_control,
+                    "匯出:dropdown",
+                    hidden_enter_attempted=hidden_enter_attempted,
+                )
+                if selected:
+                    return True
 
         if self._click_control_center_by_geometry(export_control, "匯出:retry"):
             state = self._safe_export_menu_or_save_dialog_state("retry_geometry", timeout_seconds=0.8)
@@ -2220,17 +2739,55 @@ class ReportWindowAutomator:
             if state == "format_menu":
                 self._export_format_menu_confirmed = True
                 return False
-            if self._select_default_export_format_from_possible_menu("匯出:retry"):
+            if require_confirmed_menu_for_format_fallback:
+                self.actions.append("skip:匯出格式:匯出:retry:R13未確認選單不送出格式選擇鍵")
+            else:
+                selected, hidden_enter_attempted = self._click_default_export_format_from_possible_menu(
+                    export_control,
+                    "匯出:retry",
+                    hidden_enter_attempted=hidden_enter_attempted,
+                )
+                if selected:
+                    return True
+
+        if not require_confirmed_menu_for_format_fallback and self._click_export_left_by_geometry(
+            export_control,
+            "匯出:left",
+        ):
+            state = self._safe_export_menu_or_save_dialog_state("left_geometry", timeout_seconds=0.8)
+            if state == "save_as":
                 return True
+            if state == "format_menu":
+                self._export_format_menu_confirmed = True
+                return False
+            selected, hidden_enter_attempted = self._click_default_export_format_from_possible_menu(
+                export_control,
+                "匯出:left",
+                hidden_enter_attempted=hidden_enter_attempted,
+            )
+            if selected:
+                return True
+        elif require_confirmed_menu_for_format_fallback:
+            self.actions.append("skip:匯出:left:R13避免未確認工具列左側誤觸")
 
         if disabled_exact_toolbar_export:
             self.actions.append("continue:匯出:disabled_geometry_no_menu_use_keyboard")
 
-        if disabled_exact_toolbar_export:
+        if require_confirmed_menu_for_format_fallback:
+            if not self._focus_control_without_click(export_control):
+                self.actions.append("stop:匯出:R13未確認匯出控制項焦點不送出鍵盤")
+                return False
+        elif disabled_exact_toolbar_export:
             self._focus_control_without_click(export_control)
         else:
             self._focus_control(export_control)
-        for keys in ("%{DOWN}", "{ENTER}", "{SPACE}", "{DOWN}"):
+        keyboard_keys = ("%{DOWN}",) if require_confirmed_menu_for_format_fallback else (
+            "%{DOWN}",
+            "{ENTER}",
+            "{SPACE}",
+            "{DOWN}",
+        )
+        for keys in keyboard_keys:
             if not self._send_keyboard(keys, f"open_export_menu_by_keyboard:{keys}"):
                 continue
             state = self._safe_export_menu_or_save_dialog_state(f"keyboard:{keys}", timeout_seconds=0.8)
@@ -2240,9 +2797,223 @@ class ReportWindowAutomator:
                 self._export_format_menu_confirmed = True
                 return False
 
+        if require_confirmed_menu_for_format_fallback:
+            self.actions.append("skip:匯出:R13未確認格式選單不送出格式選擇鍵")
+
         if click_error is not None:
             self.actions.append("continue:匯出:改用格式選擇fallback")
         return False
+
+    def _open_export_menu_by_geometry_only(
+        self,
+        export_control: Any,
+    ) -> bool:
+        report_id = self._current_report_id or "REPORT"
+        self.actions.append(f"strategy:匯出:{report_id}使用幾何點擊避免UIA pattern卡住")
+        for action_name, clicker in (
+            ("匯出:dropdown", self._click_export_dropdown_by_geometry),
+            ("匯出:geometry_center", self._click_control_center_by_geometry),
+            ("匯出:left", self._click_export_left_by_geometry),
+        ):
+            if not clicker(export_control, action_name):
+                continue
+            state = self._safe_export_menu_or_save_dialog_state(action_name, timeout_seconds=1.5)
+            if state == "save_as":
+                return True
+            if state == "format_menu":
+                self._export_format_menu_confirmed = True
+                return False
+            if self._select_r01_export_format_from_confirmed_popup(export_control, action_name):
+                return True
+            self.actions.append(f"skip:匯出格式:{report_id}未確認格式選單不猜測Excel座標:{action_name}")
+        self._write_export_menu_failure_probe(
+            report_id,
+            export_control,
+            context="geometry_only_no_confirmed_menu",
+        )
+        self.actions.append(f"continue:匯出:{report_id}幾何點擊未確認選單快速失敗")
+        return False
+
+    def _select_r01_export_format_from_confirmed_popup(self, export_control: Any, context: str) -> bool:
+        if not self._should_use_geometry_only_export_menu():
+            return False
+        popup_rects: list[dict[str, int]] = []
+        deadline = monotonic() + GEOMETRY_ONLY_EXPORT_POPUP_WAIT_SECONDS
+        while monotonic() < deadline:
+            popup_rects = self._r01_export_popup_rects_near_control(export_control)
+            if popup_rects:
+                break
+            sleep(0.1)
+        if not popup_rects:
+            popup_rects = self._r01_export_popup_rects_near_control(export_control)
+        if not popup_rects:
+            return False
+        report_id = self._current_report_id or "REPORT"
+        for popup_rect in popup_rects:
+            self.actions.append(
+                f"confirm:匯出格式:{report_id}已確認popup:"
+                f"context={context}:"
+                f"rect={popup_rect['left']},{popup_rect['top']},{popup_rect['right']},{popup_rect['bottom']}"
+            )
+            if report_id == "R13":
+                # R13 must bind the format lookup to the popup just confirmed.
+                # A stale Excel item in the cached ReportViewer toolbar is not
+                # evidence that this popup contains an export format.
+                control = self._find_export_format_control_in_confirmed_popup(popup_rect)
+            else:
+                control = self._find_export_format_control(menu_only=True)
+            if control is not None:
+                label = self._control_name(control) or "Excel"
+                if self._activate_export_format_control(control, label):
+                    return True
+                continue
+            if report_id == "R13":
+                self.actions.append(
+                    "probe:匯出格式:R13已確認popup未暴露Excel控制項，改用popup第一列幾何選取"
+                )
+                # POS 1.5.19.x can render this WinForms menu owner-drawn:
+                # the screenshot/geometry probe confirms the POS-owned menu,
+                # but UIA/Win32 exposes no child item.  The first row is the
+                # stable Excel option in this confirmed two-row POS menu.
+                if self._click_r01_default_export_format_in_popup(popup_rect, context):
+                    return True
+                self.actions.append(
+                    "skip:匯出格式:R13已確認popup但第一列幾何選取未啟動匯出"
+                )
+                continue
+            if self._click_r01_default_export_format_in_popup(popup_rect, context):
+                return True
+        return False
+
+    def _click_r01_default_export_format_in_popup(self, popup_rect: dict[str, int], context: str) -> bool:
+        width = popup_rect["right"] - popup_rect["left"]
+        height = popup_rect["bottom"] - popup_rect["top"]
+        if width <= 0 or height <= 0:
+            return False
+        row_height = min(max(height, 18), 32)
+        x = popup_rect["left"] + min(max(width // 2, 24), max(width - 6, 1))
+        y = popup_rect["top"] + min(max(row_height // 2, 10), max(height - 4, 1))
+        action_name = f"匯出格式:Excel:{context}:confirmed_popup_geometry"
+        if not self._click_screen_point(x, y, action_name):
+            return False
+        state = self._export_format_activation_state(
+            "Excel",
+            f"{context}:confirmed_popup_geometry",
+            require_observed_response=False,
+            timeout_seconds=12.0,
+        )
+        if state == "continue":
+            self.actions.append(
+                f"continue:匯出格式:Excel:{context}:confirmed_popup_geometry_wait_for_save_as"
+            )
+            return True
+        return False
+
+    def _r01_export_popup_rects_near_control(self, export_control: Any) -> list[dict[str, int]]:
+        if not self._should_use_geometry_only_export_menu():
+            return []
+        export_rect = _rect_to_dict(_safe_call(export_control, "rectangle", default=None))
+        if not _rect_has_area(export_rect):
+            return []
+        return [
+            record["rectangle"]
+            for record in self._export_popup_window_records_near_rect(export_rect)
+            if _rect_has_area(record.get("rectangle", {}))
+        ]
+
+    def _export_popup_window_records_near_rect(
+        self,
+        export_rect: dict[str, int],
+        *,
+        top_level_handles: list[int] | None = None,
+        foreground_handle: int | None = None,
+        restrict_to_supplied_handles: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not sys.platform.startswith("win") or not _rect_has_area(export_rect):
+            return []
+        if foreground_handle is None:
+            foreground_handle = self._fast_foreground_window_handle()
+        candidate_handles = list(dict.fromkeys(top_level_handles or self._fast_top_level_window_handles()))
+        if not restrict_to_supplied_handles:
+            for handle in self._fast_top_level_window_handles(class_name="#32768"):
+                if handle not in candidate_handles:
+                    candidate_handles.insert(0, handle)
+        parent_handles = candidate_handles[:20]
+        if foreground_handle is not None and foreground_handle not in parent_handles:
+            parent_handles.insert(0, foreground_handle)
+        for parent_handle in [handle for handle in parent_handles if handle is not None]:
+            for child_handle in self._fast_child_window_handles(parent_handle, class_name="#32768"):
+                if child_handle not in candidate_handles:
+                    candidate_handles.insert(0, child_handle)
+        records: list[dict[str, Any]] = []
+        for handle in candidate_handles:
+            record = self._window_handle_record(
+                handle,
+                export_rect=export_rect,
+                foreground_handle=foreground_handle,
+            )
+            if record is not None and record.get("popup_is_pos_related") is False:
+                continue
+            if record is None or not self._looks_like_export_popup_window_record(record):
+                continue
+            records.append(record)
+        return records
+
+    def _export_popup_window_handles_near_rect(
+        self,
+        export_rect: dict[str, int],
+        *,
+        top_level_handles: list[int],
+        foreground_handle: int | None,
+        restrict_to_supplied_handles: bool = False,
+    ) -> list[int]:
+        return [
+            int(record["handle"])
+            for record in self._export_popup_window_records_near_rect(
+                export_rect,
+                top_level_handles=top_level_handles,
+                foreground_handle=foreground_handle,
+                restrict_to_supplied_handles=restrict_to_supplied_handles,
+            )
+        ]
+
+    def _looks_like_export_popup_window_record(self, record: dict[str, Any]) -> bool:
+        if not record.get("visible") or not record.get("enabled") or not record.get("near_export_control"):
+            return False
+        rect = record.get("rectangle", {})
+        if not _rect_has_area(rect):
+            return False
+        width = rect["right"] - rect["left"]
+        height = rect["bottom"] - rect["top"]
+        if width < 40 or height < 18 or width > 600 or height > 500:
+            return False
+        class_name = str(record.get("class_name") or "")
+        title = str(record.get("title") or "")
+        if class_name == "SysShadow":
+            return False
+        if class_name == "#32768":
+            return True
+        return not title and class_name.startswith("WindowsForms10.Window.20808.")
+
+    @staticmethod
+    def _r01_popup_rect_near_export_rect(
+        popup_rect: dict[str, int],
+        export_rect: dict[str, int],
+    ) -> bool:
+        if not _rect_has_area(popup_rect):
+            return False
+        popup_width = popup_rect["right"] - popup_rect["left"]
+        popup_height = popup_rect["bottom"] - popup_rect["top"]
+        if popup_width > 600 or popup_height > 500:
+            return False
+        vertical_gap = popup_rect["top"] - export_rect["bottom"]
+        if vertical_gap < -8 or vertical_gap > 180:
+            return False
+        horizontally_near = (
+            popup_rect["right"] >= export_rect["left"] - 120
+            and popup_rect["left"] <= export_rect["right"] + 220
+        )
+        return horizontally_near
 
     def _activate_export_menu_by_pattern(self, export_control: Any) -> str | None:
         for label, callback in self._export_menu_activation_callbacks(export_control):
@@ -2256,6 +3027,108 @@ class ReportWindowAutomator:
             if state is not None:
                 return state
         return None
+
+    def _activate_export_menu_by_toolbar_wrapper(self, export_control: Any) -> str | None:
+        for toolbar in self._export_toolbar_candidates_for_control(export_control):
+            for label, callback in self._toolbar_export_activation_callbacks(toolbar, export_control):
+                try:
+                    callback()
+                except Exception as exc:
+                    self.actions.append(f"skip:匯出:{label}:{_action_text(_exception_detail(exc))}")
+                    continue
+                self.actions.append(f"activate:匯出:{label}")
+                state = self._safe_export_menu_or_save_dialog_state(label, timeout_seconds=1.5)
+                if state is not None:
+                    return state
+        return None
+
+    def _export_toolbar_candidates_for_control(self, export_control: Any) -> list[Any]:
+        candidates: list[Any] = []
+        seen: set[tuple[Any, ...]] = set()
+        for _scope_name, scope in self._export_search_scopes():
+            queue: list[tuple[Any, int]] = [(scope, 0)]
+            while queue:
+                control, depth = queue.pop(0)
+                identity = _control_identity(control)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if self._looks_like_report_toolbar(control) and self._toolbar_contains_export_control(
+                    control,
+                    export_control,
+                ):
+                    candidates.append(control)
+                if depth >= EXPORT_BUTTON_FAST_SEARCH_DEPTH or self._looks_like_report_content_subtree(control):
+                    continue
+                queue.extend((child, depth + 1) for child in self._export_priority_children(control)[:40])
+        return candidates
+
+    def _toolbar_contains_export_control(self, toolbar: Any, export_control: Any) -> bool:
+        export_identity = _control_identity(export_control)
+        for control, _depth in [(toolbar, 0), *self._collect_children_with_depth(toolbar, max_depth=3, depth=1)]:
+            if _control_identity(control) == export_identity:
+                return True
+            if self._is_visible(control) and self._looks_like_export_button(control):
+                return True
+        return False
+
+    def _toolbar_export_activation_callbacks(self, toolbar: Any, export_control: Any) -> list[tuple[str, Any]]:
+        callbacks: list[tuple[str, Any]] = []
+
+        press_button = getattr(toolbar, "PressButton", None)
+        if callable(press_button):
+            callbacks.append(("toolbar.PressButton:匯出", lambda press_button=press_button: press_button("匯出")))
+
+        button_method = getattr(toolbar, "Button", None)
+        if callable(button_method):
+            callbacks.extend(
+                self._toolbar_button_activation_callbacks(
+                    button_method,
+                    "toolbar.Button",
+                    export_control,
+                )
+            )
+
+        get_button = getattr(toolbar, "GetButton", None)
+        if callable(get_button):
+            callbacks.extend(
+                self._toolbar_button_activation_callbacks(
+                    get_button,
+                    "toolbar.GetButton",
+                    export_control,
+                )
+            )
+
+        return callbacks
+
+    def _toolbar_button_activation_callbacks(
+        self,
+        button_method: Any,
+        method_label: str,
+        export_control: Any,
+    ) -> list[tuple[str, Any]]:
+        callbacks: list[tuple[str, Any]] = []
+        for key in self._toolbar_export_button_keys(export_control):
+            try:
+                button = button_method(key)
+            except Exception:
+                continue
+            for click_method_name in ("click_input", "Click", "click"):
+                click_method = getattr(button, click_method_name, None)
+                if callable(click_method):
+                    callbacks.append((f"{method_label}:{key}:{click_method_name}", click_method))
+                    break
+        return callbacks
+
+    def _toolbar_export_button_keys(self, export_control: Any) -> list[Any]:
+        keys: list[Any] = ["匯出"]
+        try:
+            name = self._control_name(export_control)
+        except Exception:
+            name = ""
+        if name and name not in keys:
+            keys.append(name)
+        return keys
 
     def _safe_export_menu_or_save_dialog_state(self, context: str, *, timeout_seconds: float) -> str | None:
         try:
@@ -2299,6 +3172,19 @@ class ReportWindowAutomator:
         return callbacks
 
     def _refresh_export_control_before_click(self, export_control: Any) -> Any:
+        if self._should_avoid_r01_report_viewer_scope():
+            if self._r01_export_control_is_clickable(export_control):
+                report_id = self._current_report_id or "REPORT"
+                self.actions.append(f"skip:匯出控制項刷新:{report_id}已是可用匯出避免重掃預覽範圍")
+                return export_control
+        if (
+            self._is_exact_export_control(export_control)
+            and self._is_enabled(export_control)
+            and self._is_visible(export_control)
+            and self._export_control_is_inside_active_report_area(export_control)
+        ):
+            self.actions.append("skip:匯出控制項刷新:已是可用作用中匯出")
+            return export_control
         fresh_record = self._find_visible_report_toolbar_export_record_fast(max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH)
         if fresh_record is None:
             return export_control
@@ -2328,26 +3214,73 @@ class ReportWindowAutomator:
             return True
         return _rect_has_area(_rect_intersection(rect, form_rect))
 
-    def _select_default_export_format_from_possible_menu(self, context: str) -> bool:
+    def _click_default_export_format_from_possible_menu(
+        self,
+        export_control: Any,
+        context: str,
+        *,
+        hidden_enter_attempted: bool,
+    ) -> tuple[bool, bool]:
+        rect = _rect_to_dict(_safe_call(export_control, "rectangle", default=None))
+        if not _rect_has_area(rect):
+            return False, hidden_enter_attempted
+        click_rect = self._visible_control_rect(export_control, rect)
+        if click_rect is None:
+            self.actions.append(f"skip:匯出格式:Excel:{context}:menu_geometry_offscreen")
+            return False, hidden_enter_attempted
+        width = click_rect["right"] - click_rect["left"]
+        height = click_rect["bottom"] - click_rect["top"]
+        if width <= 0 or height <= 0:
+            return False, hidden_enter_attempted
+        x = click_rect["left"] + min(max(width // 2, 8), 32)
+        y = click_rect["bottom"] + min(max(height // 2, 10), 18)
+        if not self._click_screen_point(x, y, f"匯出格式:Excel:{context}:menu_geometry"):
+            return False, hidden_enter_attempted
+        state = self._export_format_activation_state(
+            "Excel",
+            f"{context}:menu_geometry",
+            require_observed_response=True,
+            timeout_seconds=12.0,
+        )
+        if state == "continue":
+            self.actions.append(f"continue:匯出格式:Excel:{context}:menu_geometry_wait_for_save_as")
+            return True, hidden_enter_attempted
+        if hidden_enter_attempted:
+            return False, hidden_enter_attempted
+        hidden_enter_attempted = True
         if not self._send_keyboard("{ENTER}", f"select_export_format_by_keyboard:{context}:hidden_enter"):
-            return False
-        dialog_state = self._wait_for_save_as_dialog_visible(timeout_seconds=1.5)
-        if dialog_state is True:
-            self.actions.append(f"continue:{context}:hidden_menu_enter_opened_save_as")
-            return True
-        return False
+            return False, hidden_enter_attempted
+        state = self._export_format_activation_state(
+            "Excel",
+            f"{context}:hidden_enter",
+            require_observed_response=True,
+            timeout_seconds=12.0,
+        )
+        if state == "continue":
+            self.actions.append(f"continue:匯出格式:Excel:{context}:hidden_enter_wait_for_save_as")
+            return True, hidden_enter_attempted
+        return False, hidden_enter_attempted
 
     def _export_menu_or_save_dialog_state(self, *, timeout_seconds: float) -> str | None:
         deadline = monotonic() + timeout_seconds
+        menu_only = sys.platform.startswith("win")
+        if menu_only:
+            self.actions.append("probe:匯出格式:fast_menu_only")
         while monotonic() < deadline:
             if self._wait_for_save_as_dialog_visible(timeout_seconds=0.1) is True:
                 return "save_as"
-            if self._find_export_format_control() is not None:
+            if self._export_progress_visible_for_activation():
+                self.actions.append("confirm:匯出狀態:POS匯出進度視窗")
+                return "save_as"
+            if self._find_export_format_control(menu_only=menu_only) is not None:
                 return "format_menu"
             sleep(0.1)
         if self._wait_for_save_as_dialog_visible(timeout_seconds=0.1) is True:
             return "save_as"
-        if self._find_export_format_control() is not None:
+        if self._export_progress_visible_for_activation():
+            self.actions.append("confirm:匯出狀態:POS匯出進度視窗")
+            return "save_as"
+        if self._find_export_format_control(menu_only=menu_only) is not None:
             return "format_menu"
         return None
 
@@ -2405,33 +3338,51 @@ class ReportWindowAutomator:
         checked_disabled_toolbar_export = False
         logged_disabled_toolbar_wait = False
         retried_view_report_no_response = False
+        report_toolbar_export_seen = False
+        deferred_pos_busy_count = 0
+        r01_safe_scan_until = started_at + self._r01_export_safe_scan_seconds(timeout_seconds)
+        r01_safe_scan_skipped = False
         self._export_fast_scan_hit_limit = False
-        if self._dismiss_no_data_warning():
-            self.actions.append("dismiss_warning:目前並無符合的療程殘值資料")
-            raise ReportAutomationError(
-                "NO_REPORT_DATA",
-                "POS 顯示目前並無符合的療程殘值資料；已按下確定並跳過此輸出。",
-            )
+        self._export_wait_had_fast_scan_limit = False
+        self._export_wait_had_active_scope_scan_limit = False
+        if self._must_check_pos_health_before_export_search():
+            self._raise_if_pos_not_responding(force=True)
+        self._raise_no_report_data_if_warning_visible()
         if export_control is not None and self._is_enabled(export_control):
-            self._log_export_target((export_control, -1, "initial"), "匯出")
-            return export_control
+            if not self._r01_export_control_is_clickable(export_control):
+                self._log_r01_rejected_export_candidate(export_control, "initial")
+            else:
+                self._log_export_target((export_control, -1, "initial"), "匯出")
+                return export_control
         while monotonic() < deadline:
             now = monotonic()
             if now >= next_wait_log:
                 self.actions.append(f"wait:匯出啟用:elapsed={int(now - started_at)}s:timeout={int(timeout_seconds)}s")
                 next_wait_log = now + max(0.5, self.export_wait_log_interval_seconds)
             if now >= first_health_check_after:
-                self._raise_if_pos_not_responding()
-            if self._dismiss_no_data_warning():
-                self.actions.append("dismiss_warning:目前並無符合的療程殘值資料")
-                raise ReportAutomationError(
-                    "NO_REPORT_DATA",
-                    "POS 顯示目前並無符合的療程殘值資料；已按下確定並跳過此輸出。",
-                )
+                try:
+                    self._raise_if_pos_not_responding()
+                except ReportAutomationError as exc:
+                    if self._should_defer_pos_not_responding_during_r01_export_wait(
+                        started_at=started_at,
+                        timeout_seconds=timeout_seconds,
+                        report_toolbar_export_seen=report_toolbar_export_seen,
+                    ):
+                        deferred_pos_busy_count += 1
+                        report_id = self._current_report_id or "REPORT"
+                        self.actions.append(
+                            f"defer:POS無回應:{report_id}報表產生中暫緩判定:"
+                            f"elapsed={int(now - started_at)}s:"
+                            f"count={deferred_pos_busy_count}"
+                        )
+                    else:
+                        raise exc
+            self._raise_no_report_data_if_warning_visible()
             if (
                 self._report_view_requested
                 and not retried_view_report_no_response
                 and now >= no_response_retry_after
+                and not self._should_avoid_r01_report_viewer_scope()
                 and not self._report_viewer_is_present()
             ):
                 retried_view_report_no_response = True
@@ -2439,12 +3390,35 @@ class ReportWindowAutomator:
             control = export_control
             if control is not None:
                 if self._is_enabled(control):
-                    self._log_export_target((control, -1, "initial"), "匯出")
-                    return control
+                    if not self._r01_export_control_is_clickable(control):
+                        self._log_r01_rejected_export_candidate(control, "initial")
+                    else:
+                        self._log_export_target((control, -1, "initial"), "匯出")
+                        return control
+            if self._should_avoid_r01_report_viewer_scope() and now >= r01_safe_scan_until:
+                if not r01_safe_scan_skipped:
+                    r01_safe_scan_skipped = True
+                    report_id = self._current_report_id or "REPORT"
+                    self.actions.append(
+                        f"stop:匯出搜尋:{report_id}超過安全掃描時間避免ReportViewer枚舉卡住"
+                    )
+                return None
             toolbar_record = self._find_visible_report_toolbar_export_record_with_fallback(max_depth=6)
+            if monotonic() >= deadline:
+                self.actions.append("timeout:匯出搜尋:單次UI枚舉超過等待預算")
+                return None
+            if toolbar_record is not None and not self._r01_export_record_is_valid_candidate(toolbar_record):
+                self._log_r01_rejected_export_candidate(toolbar_record[0], toolbar_record[2])
+                toolbar_record = None
+            if toolbar_record is not None and toolbar_record[2] == "report_toolbar":
+                report_toolbar_export_seen = True
+                self._remember_report_toolbar_scope_for_record(toolbar_record)
             if toolbar_record is not None and self._is_enabled(toolbar_record[0]):
                 self._log_export_target(toolbar_record, "匯出")
                 return toolbar_record[0]
+            if self._export_wait_had_active_scope_scan_limit:
+                self.actions.append("stop:匯出搜尋:多報表作用中範圍有界搜尋達上限")
+                break
             if (
                 toolbar_record is not None
                 and toolbar_record[2] == "report_toolbar"
@@ -2462,9 +3436,16 @@ class ReportWindowAutomator:
                 disabled_toolbar_record = toolbar_record or self._find_visible_report_toolbar_export_record_with_fallback(
                     max_depth=6
                 )
+                if disabled_toolbar_record is not None and not self._r01_export_record_is_valid_candidate(disabled_toolbar_record):
+                    self._log_r01_rejected_export_candidate(disabled_toolbar_record[0], disabled_toolbar_record[2])
+                    disabled_toolbar_record = None
                 if disabled_toolbar_record is not None and disabled_toolbar_record[2] == "report_toolbar":
-                    if self._export_fast_scan_hit_limit:
+                    if self._export_fast_scan_hit_limit or self._export_wait_had_fast_scan_limit:
                         self.actions.append("skip:匯出控制項:快速搜尋達上限不可直接接受停用匯出")
+                    elif not self._disabled_export_geometry_fallback_allowed():
+                        self.actions.append(
+                            f"skip:匯出控制項:{self._current_report_id or ''}需等待UIA啟用不接受停用匯出"
+                        )
                     elif self._report_viewer_looks_empty(
                         export_control=disabled_toolbar_record[0],
                         max_depth=6,
@@ -2476,18 +3457,36 @@ class ReportWindowAutomator:
                         return disabled_toolbar_record[0]
             sleep(0.5)
         if export_control is not None and self._is_enabled(export_control):
-            self._log_export_target((export_control, -1, "initial"), "匯出")
-            return export_control
+            if not self._r01_export_control_is_clickable(export_control):
+                self._log_r01_rejected_export_candidate(export_control, "initial")
+            else:
+                self._log_export_target((export_control, -1, "initial"), "匯出")
+                return export_control
+        if self._export_wait_had_active_scope_scan_limit:
+            return None
+        if self._should_avoid_r01_report_viewer_scope():
+            report_id = self._current_report_id or "REPORT"
+            self.actions.append(f"skip:匯出搜尋:{report_id}等待結束不做最後預覽範圍掃描")
+            return None
         final_record = self._find_visible_report_toolbar_export_record_with_fallback(
             max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH
         )
+        if final_record is not None and not self._r01_export_record_is_valid_candidate(final_record):
+            self._log_r01_rejected_export_candidate(final_record[0], final_record[2])
+            final_record = None
         if final_record is not None:
             if self._is_enabled(final_record[0]):
+                if final_record[2] == "report_toolbar":
+                    self._remember_report_toolbar_scope_for_record(final_record)
                 self._log_export_target(final_record, "匯出")
                 return final_record[0]
             if final_record[2] == "report_toolbar":
-                if self._export_fast_scan_hit_limit:
+                if self._export_fast_scan_hit_limit or self._export_wait_had_fast_scan_limit:
                     self.actions.append("skip:匯出控制項:快速搜尋達上限不可直接接受停用匯出")
+                elif not self._disabled_export_geometry_fallback_allowed():
+                    self.actions.append(
+                        f"skip:匯出控制項:{self._current_report_id or ''}需等待UIA啟用不接受停用匯出"
+                    )
                 elif not self._report_viewer_looks_empty(
                     export_control=final_record[0],
                     max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH,
@@ -2501,10 +3500,15 @@ class ReportWindowAutomator:
             disabled_toolbar_record = self._find_visible_report_toolbar_export_record_with_fallback(
                 max_depth=EXPORT_BUTTON_FAST_SEARCH_DEPTH,
             )
+            if disabled_toolbar_record is not None and not self._r01_export_record_is_valid_candidate(disabled_toolbar_record):
+                self._log_r01_rejected_export_candidate(disabled_toolbar_record[0], disabled_toolbar_record[2])
+                disabled_toolbar_record = None
             if (
                 disabled_toolbar_record is not None
                 and disabled_toolbar_record[2] == "report_toolbar"
                 and not self._export_fast_scan_hit_limit
+                and not self._export_wait_had_fast_scan_limit
+                and self._disabled_export_geometry_fallback_allowed()
                 and (
                     not self._report_viewer_looks_empty(
                         export_control=disabled_toolbar_record[0],
@@ -2517,6 +3521,119 @@ class ReportWindowAutomator:
                 return disabled_toolbar_record[0]
         return None
 
+    def _disabled_export_geometry_fallback_allowed(self) -> bool:
+        return self._current_report_id not in REPORTS_REQUIRING_ENABLED_EXPORT
+
+    def _r01_export_record_is_clickable(self, record: tuple[Any, int, str]) -> bool:
+        if not self._should_avoid_r01_report_viewer_scope():
+            return True
+        control, _depth, scope_name = record
+        return scope_name == "report_toolbar" and self._r01_export_control_is_clickable(control)
+
+    def _r01_export_record_is_valid_candidate(self, record: tuple[Any, int, str]) -> bool:
+        if not self._should_avoid_r01_report_viewer_scope():
+            return True
+        control, _depth, scope_name = record
+        return scope_name == "report_toolbar" and self._r01_export_control_has_stable_geometry(control)
+
+    def _r01_export_control_is_clickable(self, control: Any) -> bool:
+        if not self._should_avoid_r01_report_viewer_scope():
+            return True
+        return self._is_enabled(control) and self._r01_export_control_has_stable_geometry(control)
+
+    def _r01_export_control_has_stable_geometry(self, control: Any) -> bool:
+        if not self._should_avoid_r01_report_viewer_scope():
+            return True
+        if not self._is_exact_export_control(control):
+            return False
+        if not self._is_visible(control):
+            return False
+        raw_rect = _safe_call(control, "rectangle", default=None)
+        if raw_rect is None:
+            return False
+        rect = _rect_to_dict(raw_rect)
+        if not _rect_has_area(rect):
+            return False
+        return self._visible_control_rect(control, rect) is not None
+
+    def _log_r01_rejected_export_candidate(self, control: Any, source: str) -> None:
+        if not self._should_avoid_r01_report_viewer_scope():
+            return
+        report_id = self._current_report_id or "REPORT"
+        rect = _rect_to_dict(_safe_call(control, "rectangle", default=None))
+        self.actions.append(
+            f"skip:匯出控制項:{report_id}拒絕不可點擊候選:"
+            f"source={source}:"
+            f"name={_action_text(self._control_name(control))}:"
+            f"id={_action_text(self._control_automation_id(control))}:"
+            f"type={_action_text(self._control_type(control))}:"
+            f"enabled={self._is_enabled(control)}:"
+            f"visible={self._is_visible(control)}:"
+            f"rect={rect['left']},{rect['top']},{rect['right']},{rect['bottom']}"
+        )
+
+    def _remember_report_toolbar_scope_for_record(self, record: tuple[Any, int, str]) -> None:
+        control, _depth, scope_name = record
+        if scope_name != "report_toolbar":
+            return
+        if self._should_avoid_geometry_report_viewer_scope():
+            if self._last_report_toolbar_scope is None:
+                report_id = self._current_report_id or "REPORT"
+                self.actions.append(f"skip:匯出控制項刷新:{report_id}無快取工具列避免重掃")
+            return
+        toolbar = self._nearest_report_toolbar_ancestor(control)
+        if toolbar is None:
+            return
+        self._last_report_toolbar_scope = toolbar
+
+    def _nearest_report_toolbar_ancestor(self, target: Any) -> Any | None:
+        target_identity = _control_identity(target)
+        for scope_name, scope in self._export_search_scopes(include_desktop_report_viewers=False):
+            queue: list[tuple[Any, bool]] = [(scope, self._looks_like_report_toolbar(scope))]
+            seen: set[tuple[Any, ...]] = set()
+            while queue:
+                control, inside_toolbar = queue.pop(0)
+                identity = _control_identity(control)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                is_toolbar = inside_toolbar or self._looks_like_report_toolbar(control)
+                if is_toolbar and _control_identity(control) == target_identity:
+                    return control if self._looks_like_report_toolbar(control) else scope
+                children = self._export_priority_children(control)[:40]
+                for child in children:
+                    child_is_toolbar = self._looks_like_report_toolbar(child)
+                    if _control_identity(child) == target_identity:
+                        return control if is_toolbar else (child if child_is_toolbar else None)
+                    if self._looks_like_report_content_subtree(child):
+                        continue
+                    queue.append((child, is_toolbar or child_is_toolbar))
+        return None
+
+    def _r01_export_safe_scan_seconds(self, timeout_seconds: float) -> float:
+        if self._should_avoid_r01_report_viewer_scope():
+            return min(
+                max(0.0, timeout_seconds),
+                max(R01_EXPORT_SAFE_SCAN_MIN_SECONDS, R01_EXPORT_SAFE_SCAN_MAX_SECONDS),
+            )
+        return min(
+            R01_EXPORT_SAFE_SCAN_MIN_SECONDS,
+            max(timeout_seconds * 0.25, 15.0),
+        )
+
+    def _should_defer_pos_not_responding_during_r01_export_wait(
+        self,
+        *,
+        started_at: float,
+        timeout_seconds: float,
+        report_toolbar_export_seen: bool,
+    ) -> bool:
+        if not report_toolbar_export_seen:
+            return False
+        if not self._should_avoid_r01_report_viewer_scope():
+            return False
+        return monotonic() < started_at + timeout_seconds
+
     def _find_visible_report_toolbar_export_record_with_fallback(
         self,
         *,
@@ -2526,6 +3643,31 @@ class ReportWindowAutomator:
         record = self._find_visible_report_toolbar_export_record_fast(max_depth=max_depth)
         if not self._export_fast_scan_hit_limit:
             return record
+        self._export_wait_had_fast_scan_limit = True
+        if self._should_avoid_r01_report_viewer_scope():
+            report_id = self._current_report_id or "REPORT"
+            self.actions.append(f"skip:匯出控制項:{report_id}快速搜尋達上限避免加深預覽範圍掃描")
+            return record
+        if self._export_should_stay_with_active_report_form():
+            bounded_record_limit = max(self.export_fast_scan_record_limit * 4, 480)
+            bounded_depth = max(
+                max_depth if max_depth is not None else EXPORT_BUTTON_FAST_SEARCH_DEPTH,
+                EXPORT_BUTTON_FAST_SEARCH_DEPTH,
+            )
+            self.actions.append(
+                "fallback:匯出控制項:多報表作用中範圍快速搜尋達上限改用加深有界搜尋:"
+                f"depth={bounded_depth}:records={bounded_record_limit}"
+            )
+            self._export_fast_scan_hit_limit = False
+            bounded_record = self._find_visible_report_toolbar_export_record_fast(
+                max_depth=bounded_depth,
+                record_limit=bounded_record_limit,
+            )
+            if not self._export_fast_scan_hit_limit:
+                return bounded_record if bounded_record is not None else record
+            self._export_wait_had_active_scope_scan_limit = True
+            self.actions.append("skip:匯出控制項:多報表作用中範圍有界搜尋達上限避免完整掃描")
+            return bounded_record if bounded_record is not None else record
         full_record = self._find_visible_report_toolbar_export_record(max_depth=max_depth)
         if full_record is None:
             return record
@@ -2539,16 +3681,32 @@ class ReportWindowAutomator:
         export_control: Any | None = None,
         max_depth: int | None = None,
     ) -> bool:
-        if not self._report_viewer_is_present():
-            return False
-        if export_control is None:
-            export_control = self._find_export_button_control(
-                require_enabled=False,
-                max_depth=max_depth,
+        if self._should_avoid_geometry_report_viewer_scope():
+            controls = self._geometry_only_report_toolbar_controls(export_control)
+            if not controls:
+                return False
+            if export_control is None:
+                export_control = next(
+                    (control for control in controls if self._is_exact_export_control(control)),
+                    None,
+                )
+            if export_control is None or self._is_enabled(export_control):
+                return False
+        else:
+            if not self._report_viewer_is_present():
+                return False
+            if export_control is None:
+                export_control = self._find_export_button_control(
+                    require_enabled=False,
+                    max_depth=max_depth,
+                )
+            if export_control is None or self._is_enabled(export_control):
+                return False
+            controls = (
+                self._post_report_view_controls(max_depth=max_depth)
+                if self._report_view_requested
+                else self._search_controls()
             )
-        if export_control is None or self._is_enabled(export_control):
-            return False
-        controls = self._post_report_view_controls(max_depth=max_depth) if self._report_view_requested else self._search_controls()
         if self._report_viewer_has_content_evidence(controls):
             return False
         disabled_toolbar_names = {"列印", "預覽列印", "版面設定", "下一頁", "最後一頁"}
@@ -2560,6 +3718,33 @@ class ReportWindowAutomator:
         if disabled_count >= 3:
             self.actions.append(f"evidence:ReportViewer空白候選:disabled_toolbar_count={disabled_count}")
         return disabled_count >= 3
+
+    def _geometry_only_report_toolbar_controls(self, export_control: Any | None) -> list[Any]:
+        roots: list[Any] = []
+        if self._last_report_toolbar_scope is not None and self._control_has_visible_area(
+            self._last_report_toolbar_scope
+        ):
+            roots.append(self._last_report_toolbar_scope)
+        if export_control is not None and all(export_control is not root for root in roots):
+            roots.append(export_control)
+        if not roots:
+            return []
+
+        controls: list[Any] = []
+        queue: list[tuple[Any, int]] = [(root, 0) for root in roots]
+        seen: set[tuple[Any, ...]] = set()
+        while queue and len(controls) < 80:
+            control, depth = queue.pop(0)
+            identity = _control_identity(control)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            controls.append(control)
+            if depth >= 2 or self._looks_like_report_content_subtree(control):
+                continue
+            for child in self._export_priority_children(control)[:40]:
+                queue.append((child, depth + 1))
+        return controls
 
     def _report_viewer_has_content_evidence(self, controls: list[Any]) -> bool:
         normalized_names = [_normalized_text(self._control_name(control)) for control in controls]
@@ -2645,32 +3830,44 @@ class ReportWindowAutomator:
         self,
         *,
         max_depth: int | None = None,
+        record_limit: int | None = None,
     ) -> tuple[Any, int, str] | None:
         search_depth = max_depth if max_depth is not None else EXPORT_BUTTON_FAST_SEARCH_DEPTH
+        search_record_limit = record_limit if record_limit is not None else self.export_fast_scan_record_limit
         scopes = self._export_search_scopes()
 
         best_record: tuple[Any, int, str] | None = None
         visited = 0
         for scope_name, scope in scopes:
-            queue: list[tuple[Any, int, bool]] = [(scope, 0, self._looks_like_report_toolbar(scope))]
+            scope_is_toolbar = self._looks_like_report_toolbar(scope)
+            queue: list[tuple[Any, int, bool, Any | None]] = [
+                (scope, 0, scope_is_toolbar, scope if scope_is_toolbar else None)
+            ]
             seen: set[tuple[Any, ...]] = set()
             while queue:
-                control, depth, inside_toolbar = queue.pop(0)
+                control, depth, inside_toolbar, toolbar_scope = queue.pop(0)
                 identity = _control_identity(control)
                 if identity in seen:
                     continue
                 seen.add(identity)
                 visited += 1
-                if visited > self.export_fast_scan_record_limit:
+                if visited > search_record_limit:
                     self._export_fast_scan_hit_limit = True
                     self.actions.append(f"limit:匯出快速搜尋:records={visited}")
                     return best_record
 
-                is_toolbar = inside_toolbar or self._looks_like_report_toolbar(control)
+                control_is_toolbar = self._looks_like_report_toolbar(control)
+                is_toolbar = inside_toolbar or control_is_toolbar
+                current_toolbar_scope = control if control_is_toolbar else toolbar_scope
                 if self._is_visible(control) and self._looks_like_export_button(control):
                     if not self._export_control_is_inside_active_report_area(control):
                         continue
+                    if is_toolbar and current_toolbar_scope is not None:
+                        self._last_report_toolbar_scope = current_toolbar_scope
                     record = (control, depth, "report_toolbar" if is_toolbar else scope_name)
+                    if not self._r01_export_record_is_valid_candidate(record):
+                        self._log_r01_rejected_export_candidate(control, record[2])
+                        continue
                     if best_record is None or self._export_button_record_priority(record) > self._export_button_record_priority(
                         best_record
                     ):
@@ -2681,9 +3878,17 @@ class ReportWindowAutomator:
                 if depth >= search_depth or self._looks_like_report_content_subtree(control):
                     continue
                 children = self._export_priority_children(control)
-                child_records = [
-                    (child, depth + 1, is_toolbar or self._looks_like_report_toolbar(child)) for child in children[:40]
-                ]
+                child_records: list[tuple[Any, int, bool, Any | None]] = []
+                for child in children[:40]:
+                    child_is_toolbar = self._looks_like_report_toolbar(child)
+                    child_records.append(
+                        (
+                            child,
+                            depth + 1,
+                            is_toolbar or child_is_toolbar,
+                            child if child_is_toolbar else current_toolbar_scope,
+                        )
+                    )
                 if is_toolbar:
                     queue = child_records + queue
                 else:
@@ -2806,21 +4011,42 @@ class ReportWindowAutomator:
             )
         )
 
-    def _export_search_scopes(self) -> list[tuple[str, Any]]:
+    def _export_search_scopes(self, *, include_desktop_report_viewers: bool = True) -> list[tuple[str, Any]]:
         if self._report_view_requested:
+            if self._should_avoid_geometry_report_viewer_scope() and self._last_report_toolbar_scope is not None:
+                if self._control_has_visible_area(self._last_report_toolbar_scope):
+                    report_id = self._current_report_id or "REPORT"
+                    action = f"reuse:匯出搜尋:{report_id}已快取ReportViewer工具列"
+                    if action not in self.actions[-5:]:
+                        self.actions.append(action)
+                    return [("last_report_toolbar", self._last_report_toolbar_scope)]
             scopes: list[tuple[str, Any]] = []
+            self._refresh_active_report_form_for_export_scope()
             if self._active_report_form is not None and self._control_has_visible_area(self._active_report_form):
                 scopes.append(("active_form", self._active_report_form))
-            if self._active_report_title:
+            if (
+                include_desktop_report_viewers
+                and self._active_report_title
+                and not self._should_avoid_r01_report_viewer_scope()
+            ):
                 scopes.extend(
                     ("desktop_report_viewer", report_viewer)
                     for report_viewer in self._desktop_report_viewer_windows(self._active_report_title)
                 )
+            elif include_desktop_report_viewers and self._active_report_title and self._should_avoid_r01_report_viewer_scope():
+                report_id = self._current_report_id or "REPORT"
+                self.actions.append(f"skip:匯出搜尋:{report_id}避免桌面報表視窗枚舉")
             if self._window_title_looks_stale_for_active_report():
                 self.actions.append(
                     "skip:匯出搜尋:stale_window_title:"
                     f"expected={_action_text(self._active_report_title or '')}:"
                     f"actual={_action_text(self._control_name(self.window))}"
+                )
+                return scopes
+            if self._export_should_stay_with_active_report_form():
+                self.actions.append(
+                    "skip:匯出搜尋:multiple_report_forms_restrict_to_active_form:"
+                    f"{_action_text(self._active_report_title or '')}"
                 )
                 return scopes
             if all(self.window is not scope for _, scope in scopes):
@@ -2868,7 +4094,7 @@ class ReportWindowAutomator:
                 return True
         return False
 
-    def _export_button_record_priority(self, record: tuple[Any, int, str]) -> tuple[int, int, int, int, int]:
+    def _export_button_record_priority(self, record: tuple[Any, int, str]) -> tuple[int, int, int, int, int, int]:
         control, depth, scope_name = record
         scope_score = {
             "report_toolbar": 5,
@@ -2879,10 +4105,54 @@ class ReportWindowAutomator:
             "initial": 0,
         }.get(scope_name, 0)
         exact_score = 4 if self._is_exact_export_control(control) else 0
+        active_form_score = 3 if self._export_control_is_inside_active_report_area(control) else 0
         enabled_score = 2 if self._is_enabled(control) else 0
         control_type = self._control_type(control).lower()
         button_score = 1 if any(token in control_type for token in ("button", "menuitem", "split")) else 0
-        return (exact_score, scope_score, enabled_score, button_score, depth)
+        return (exact_score, active_form_score, scope_score, enabled_score, button_score, depth)
+
+    def _export_should_stay_with_active_report_form(self) -> bool:
+        if self._should_avoid_r01_report_viewer_scope():
+            return self._active_report_form is not None
+        if self._export_scope_locked_to_active_form:
+            return (
+                self._report_view_requested
+                and self._active_report_title is not None
+                and self._active_report_form is not None
+            )
+        return (
+            self._report_view_requested
+            and self._active_report_title is not None
+            and self._open_report_form_count(exclude=None) > 1
+        )
+
+    def _focus_active_report_form_for_export(self) -> None:
+        self._refresh_active_report_form_for_export_scope()
+        if self._active_report_form is None:
+            return
+        if not self._control_has_visible_area(self._active_report_form):
+            return
+        self._focus_control_without_click(self._active_report_form)
+        self.actions.append(
+            f"focus:匯出前作用中報表視窗:{_action_text(self._control_name(self._active_report_form))}"
+        )
+
+    def _refresh_active_report_form_for_export_scope(self) -> None:
+        if not self._active_report_title:
+            return
+        if self._active_report_form is not None and self._control_has_visible_area(self._active_report_form):
+            return
+        if self._should_avoid_r01_report_viewer_scope():
+            report_id = self._current_report_id or "REPORT"
+            action = f"skip:refresh_active_report_form:{report_id}避免全視窗掃描"
+            if action not in self.actions[-5:]:
+                self.actions.append(action)
+            return
+        refreshed = self._find_report_form(self._active_report_title)
+        if refreshed is None or refreshed is self._active_report_form:
+            return
+        self._active_report_form = refreshed
+        self.actions.append(f"refresh_active_report_form:before_export:{self._control_name(refreshed)}")
 
     def _looks_like_report_toolbar(self, control: Any) -> bool:
         haystack = " ".join(
@@ -2946,9 +4216,28 @@ class ReportWindowAutomator:
         return self._find_enabled_control(name)
 
     def _select_export_format(self, *, require_confirmed_menu: bool = True) -> None:
-        if self._activate_visible_export_format(timeout_seconds=self.export_format_wait_seconds):
+        self._export_format_seen_but_not_activated = False
+        initial_wait_seconds = self.export_format_wait_seconds
+        menu_only = False
+        if not require_confirmed_menu:
+            initial_wait_seconds = min(initial_wait_seconds, 1.0)
+            menu_only = sys.platform.startswith("win")
+        if self._activate_visible_export_format(
+            timeout_seconds=initial_wait_seconds,
+            menu_only=menu_only,
+        ):
             return
         if not require_confirmed_menu:
+            self._raise_no_report_data_if_warning_visible(include_child_scan=True)
+            if (
+                self.last_export_menu_probe_path is None
+                and self._current_report_id in REPORTS_WITH_EXPORT_MENU_FAILURE_PROBE
+            ):
+                self._write_export_menu_failure_probe(
+                    self._current_report_id or "REPORT",
+                    self._last_report_toolbar_scope or self._active_report_form or self.window,
+                    context="before_export_menu_not_opened_cleanup",
+                )
             self._send_keyboard("{ESC}", "cleanup:export_menu_not_opened:ESC")
             raise ReportAutomationError(
                 "EXPORT_MENU_NOT_OPENED",
@@ -2977,23 +4266,42 @@ class ReportWindowAutomator:
             if dialog_state is True:
                 return
         self._send_keyboard("{ESC}", "cleanup:export_format_menu:ESC")
+        self._raise_no_report_data_if_warning_visible(include_child_scan=True)
+        if self._export_format_seen_but_not_activated or self._find_export_format_control() is not None:
+            raise ReportAutomationError(
+                "EXPORT_FORMAT_NOT_ACTIVATED",
+                "已看到 Excel 匯出選項，但點擊或按 Enter 後未出現另存新檔視窗或 POS 匯出進度；"
+                "已停止並交由重試/復原流程處理。",
+            )
         raise ReportAutomationError(
             "EXPORT_FORMAT_NOT_FOUND",
             "已點擊報表工具列的匯出按鈕，但找不到 Excel 匯出選項。",
         )
 
-    def _activate_visible_export_format(self, *, timeout_seconds: float) -> bool:
+    def _raise_no_report_data_if_warning_visible(self, *, include_child_scan: bool = False) -> None:
+        if not self._dismiss_no_data_warning(include_child_scan=include_child_scan):
+            return
+        self.actions.append("dismiss_warning:目前並無符合的相關資料")
+        raise ReportAutomationError(
+            "NO_REPORT_DATA",
+            "POS 顯示目前並無符合條件的相關資料；已按下確定並跳過此輸出。",
+        )
+
+    def _activate_visible_export_format(self, *, timeout_seconds: float, menu_only: bool = False) -> bool:
         deadline = monotonic() + timeout_seconds
         while monotonic() < deadline:
-            control = self._find_export_format_control()
+            control = self._find_export_format_control(menu_only=menu_only)
             if control is not None:
                 break
             sleep(0.25)
-        control = self._find_export_format_control()
+        control = self._find_export_format_control(menu_only=menu_only)
         if control is None:
             return False
         label = self._control_name(control) or "Excel"
-        return self._activate_export_format_control(control, label)
+        activated = self._activate_export_format_control(control, label)
+        if not activated:
+            self._export_format_seen_but_not_activated = True
+        return activated
 
     def _select_visible_export_format_by_keyboard(self, *, timeout_seconds: float) -> bool:
         deadline = monotonic() + timeout_seconds
@@ -3027,6 +4335,42 @@ class ReportWindowAutomator:
             return int(value)
         except (TypeError, ValueError):
             return 60
+
+    def _extend_save_as_timeout_for_report(self, report: ReportConfig) -> Callable[[], None]:
+        if report.id != "R13":
+            return lambda: None
+        if not hasattr(self.save_as_handler, "wait_timeout_seconds"):
+            return lambda: None
+        original_timeout = getattr(self.save_as_handler, "wait_timeout_seconds")
+        original_blind_delay = getattr(self.save_as_handler, "blind_keyboard_fallback_delay_seconds", None)
+        try:
+            current_timeout = int(original_timeout)
+        except (TypeError, ValueError):
+            current_timeout = 0
+        effective_timeout = max(current_timeout, int(report.max_wait_seconds), R13_LONG_EXPORT_TIMEOUT_SECONDS)
+        if effective_timeout <= current_timeout:
+            return lambda: None
+        setattr(self.save_as_handler, "wait_timeout_seconds", effective_timeout)
+        if original_blind_delay is not None:
+            try:
+                setattr(
+                    self.save_as_handler,
+                    "blind_keyboard_fallback_delay_seconds",
+                    max(float(original_blind_delay), float(effective_timeout)),
+                )
+            except (TypeError, ValueError):
+                setattr(self.save_as_handler, "blind_keyboard_fallback_delay_seconds", float(effective_timeout))
+        self.actions.append(f"config:另存新檔處理:R13延長timeout={effective_timeout}s")
+
+        def restore() -> None:
+            try:
+                setattr(self.save_as_handler, "wait_timeout_seconds", original_timeout)
+                if original_blind_delay is not None:
+                    setattr(self.save_as_handler, "blind_keyboard_fallback_delay_seconds", original_blind_delay)
+            except Exception:
+                pass
+
+        return restore
 
     def _wait_for_export_progress_to_finish(self, *, timeout_seconds: float) -> None:
         if not self._export_progress_visible():
@@ -3065,12 +4409,32 @@ class ReportWindowAutomator:
             "POS 已進入「正在匯出」但進度視窗逾時未消失；已停止等待，避免卡住後續報表。",
         )
 
-    def _raise_if_pos_not_responding(self) -> None:
+    def _must_check_pos_health_before_export_search(self) -> bool:
+        return self._report_view_requested and self._current_report_id in REPORTS_REQUIRING_ENABLED_EXPORT
+
+    def _should_avoid_r01_report_viewer_scope(self) -> bool:
+        return self._should_avoid_geometry_report_viewer_scope()
+
+    def _should_avoid_geometry_report_viewer_scope(self) -> bool:
+        return (
+            sys.platform.startswith("win")
+            and self._current_report_id in REPORTS_REQUIRING_GEOMETRY_ONLY_EXPORT_MENU
+            and self._report_view_requested
+        )
+
+    def _should_use_geometry_only_export_menu(self) -> bool:
+        return (
+            sys.platform.startswith("win")
+            and self._current_report_id in REPORTS_WITH_GEOMETRY_EXPORT_MENU
+            and self._report_view_requested
+        )
+
+    def _raise_if_pos_not_responding(self, *, force: bool = False) -> None:
         interval = self.pos_health_check_interval_seconds
         if interval <= 0:
             return
         now = monotonic()
-        if now < self._next_pos_health_check_at:
+        if not force and now < self._next_pos_health_check_at:
             return
         self._next_pos_health_check_at = now + interval
         if self._pos_window_is_responsive():
@@ -3352,7 +4716,7 @@ class ReportWindowAutomator:
             if dialog_state is None and not require_observed_response:
                 self.actions.append(f"continue:匯出格式:{label}:交由SaveAsHandler等待另存新檔")
                 return "continue"
-            if self._export_progress_visible():
+            if self._export_progress_visible_for_activation():
                 self.actions.append(f"confirm:匯出格式:{label}:{attempt_name}:export_progress_visible")
                 self.actions.append(f"continue:匯出格式:{label}:交由SaveAsHandler等待另存新檔")
                 return "continue"
@@ -3368,7 +4732,7 @@ class ReportWindowAutomator:
         if dialog_state is None and not require_observed_response:
             self.actions.append(f"continue:匯出格式:{label}:交由SaveAsHandler等待另存新檔")
             return "continue"
-        if self._export_progress_visible():
+        if self._export_progress_visible_for_activation():
             self.actions.append(f"confirm:匯出格式:{label}:{attempt_name}:export_progress_visible")
             self.actions.append(f"continue:匯出格式:{label}:交由SaveAsHandler等待另存新檔")
             return "continue"
@@ -3382,9 +4746,55 @@ class ReportWindowAutomator:
         self.actions.append(f"continue:匯出格式:{label}:交由SaveAsHandler等待另存新檔")
         return "continue"
 
-    def _find_export_format_control(self) -> Any | None:
+    def _export_progress_visible_for_activation(self) -> bool:
+        r13_geometry_only = (
+            self._current_report_id == "R13"
+            and self._should_use_geometry_only_export_menu()
+        )
+        if not self._should_avoid_geometry_report_viewer_scope() and not r13_geometry_only:
+            return self._export_progress_visible()
+        hook = self._direct_window_method("is_export_progress_visible")
+        if hook is not None:
+            try:
+                return bool(hook())
+            except Exception:
+                return False
+        current_probe = getattr(self, "_export_progress_visible")
+        current_func = getattr(current_probe, "__func__", None)
+        if current_func is not ReportWindowAutomator._export_progress_visible:
+            try:
+                return bool(current_probe())
+            except Exception:
+                return False
+        report_id = self._current_report_id or "REPORT"
+        self.actions.append(f"skip:POS匯出進度偵測:{report_id}避免pywinauto Desktop掃描")
+        return False
+
+    def _find_export_format_control(self, *, menu_only: bool = False) -> Any | None:
+        if self._current_report_id == "R13" and self._should_use_geometry_only_export_menu():
+            self.actions.append("skip:匯出格式:R13不以未確認toolbar Excel作為格式證據")
+            return None
         controls = self._desktop_export_controls()
-        controls.extend(self._lightweight_controls(max_depth=EXPORT_FORMAT_SEARCH_DEPTH))
+        skip_report_scope_probe = self._should_skip_report_scope_export_format_probe()
+        if skip_report_scope_probe:
+            self._log_skip_report_scope_export_format_probe()
+            controls.extend(self._fast_report_toolbar_export_format_controls())
+        elif menu_only:
+            controls.extend(self._fast_report_export_format_controls())
+        if (
+            not skip_report_scope_probe
+            and not menu_only
+            and self._export_scope_locked_to_active_form
+            and self._active_report_form is not None
+        ):
+            controls.extend(
+                [
+                    self._active_report_form,
+                    *self._collect_children(self._active_report_form, max_depth=EXPORT_FORMAT_SEARCH_DEPTH),
+                ]
+            )
+        elif not skip_report_scope_probe and not menu_only:
+            controls.extend(self._lightweight_controls(max_depth=EXPORT_FORMAT_SEARCH_DEPTH))
         for control in controls:
             if not self._is_enabled(control):
                 continue
@@ -3396,21 +4806,255 @@ class ReportWindowAutomator:
                 return control
         return None
 
+    def _find_export_format_control_in_confirmed_popup(
+        self,
+        popup_rect: dict[str, int],
+    ) -> Any | None:
+        for control in self._desktop_export_controls_for_popup(popup_rect):
+            if not self._looks_like_export_format_option(control):
+                continue
+            return control
+        self.actions.append("probe:匯出格式:R13已確認popup限定來源未找到Excel控制項")
+        return None
+
+    def _should_skip_report_scope_export_format_probe(self) -> bool:
+        return (
+            sys.platform.startswith("win")
+            and self._current_report_id in REPORTS_WITH_GEOMETRY_EXPORT_MENU
+            and self._report_view_requested
+        )
+
+    def _log_skip_report_scope_export_format_probe(self) -> None:
+        report_id = self._current_report_id or "REPORT"
+        action = f"skip:匯出格式:{report_id}避免掃描報表預覽範圍"
+        if action not in self.actions[-5:]:
+            self.actions.append(action)
+
+    def _fast_report_export_format_controls(self) -> list[Any]:
+        if not self._report_view_requested:
+            return []
+        controls: list[Any] = []
+        scopes: list[tuple[str, Any]] = []
+        if self._active_report_form is not None and self._control_has_visible_area(self._active_report_form):
+            scopes.append(("active_form", self._active_report_form))
+        if self._active_report_title:
+            scopes.extend(
+                ("desktop_report_viewer", report_viewer)
+                for report_viewer in self._desktop_report_viewer_windows(self._active_report_title)
+            )
+        if not scopes:
+            return []
+
+        visited = 0
+        logged_probe = False
+        seen: set[tuple[Any, ...]] = set()
+        for scope_name, scope in scopes:
+            queue: list[tuple[Any, int, bool]] = [(scope, 0, self._looks_like_report_toolbar(scope))]
+            while queue:
+                control, depth, inside_toolbar = queue.pop(0)
+                identity = _control_identity(control)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                visited += 1
+                if visited > EXPORT_FORMAT_FAST_RECORD_LIMIT:
+                    self.actions.append(f"limit:匯出格式快速搜尋:records={visited}")
+                    return controls
+                if not logged_probe:
+                    self.actions.append("probe:匯出格式:bounded_report_scope")
+                    logged_probe = True
+
+                if self._is_visible(control) and self._is_enabled(control):
+                    name = self._control_name(control)
+                    normalized = _normalized_text(name).lower()
+                    if any(token in normalized for token in EXPORT_FORMAT_TOKENS):
+                        controls.append(control)
+
+                if depth >= EXPORT_FORMAT_FAST_SEARCH_DEPTH or self._looks_like_report_content_subtree(control):
+                    continue
+                is_toolbar = inside_toolbar or self._looks_like_report_toolbar(control)
+                child_records = [
+                    (child, depth + 1, is_toolbar or self._looks_like_report_toolbar(child))
+                    for child in self._export_priority_children(control)[:40]
+                ]
+                if is_toolbar or scope_name == "desktop_report_viewer":
+                    queue = child_records + queue
+                else:
+                    queue.extend(child_records)
+        return controls
+
+    def _fast_report_toolbar_export_format_controls(self) -> list[Any]:
+        if not self._report_view_requested:
+            return []
+        controls: list[Any] = []
+        scopes: list[tuple[str, Any]] = []
+        if self._last_report_toolbar_scope is not None and self._control_has_visible_area(self._last_report_toolbar_scope):
+            scopes.append(("last_report_toolbar", self._last_report_toolbar_scope))
+        if self._active_report_form is not None and self._control_has_visible_area(self._active_report_form):
+            scopes.append(("active_form", self._active_report_form))
+        if self._active_report_title and not self._should_use_geometry_only_export_menu():
+            scopes.extend(
+                ("desktop_report_viewer", report_viewer)
+                for report_viewer in self._desktop_report_viewer_windows(self._active_report_title)
+            )
+        elif self._active_report_title and self._should_use_geometry_only_export_menu():
+            report_id = self._current_report_id or "REPORT"
+            self.actions.append(f"skip:匯出格式:{report_id}避免桌面報表視窗枚舉")
+        if not scopes:
+            return []
+
+        visited = 0
+        logged_probe = False
+        seen: set[tuple[Any, ...]] = set()
+        for _scope_name, scope in scopes:
+            queue: list[tuple[Any, int, bool]] = [(scope, 0, self._looks_like_report_toolbar(scope))]
+            while queue:
+                control, depth, inside_toolbar = queue.pop(0)
+                identity = _control_identity(control)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                visited += 1
+                if visited > EXPORT_FORMAT_FAST_RECORD_LIMIT:
+                    self.actions.append(f"limit:匯出格式工具列快速搜尋:records={visited}")
+                    return controls
+                if not logged_probe:
+                    self.actions.append("probe:匯出格式:bounded_toolbar_scope")
+                    logged_probe = True
+
+                is_toolbar = inside_toolbar or self._looks_like_report_toolbar(control)
+                if is_toolbar and self._looks_like_export_format_option(control):
+                    controls.append(control)
+
+                if depth >= EXPORT_FORMAT_FAST_SEARCH_DEPTH or self._looks_like_report_content_subtree(control):
+                    continue
+                child_records = [
+                    (child, depth + 1, is_toolbar or self._looks_like_report_toolbar(child))
+                    for child in self._export_priority_children(control)[:40]
+                ]
+                if is_toolbar:
+                    queue = child_records + queue
+                else:
+                    queue.extend(child_records)
+        return controls
+
+    def _looks_like_export_format_option(self, control: Any) -> bool:
+        if not self._is_visible(control) or not self._is_enabled(control):
+            return False
+        name = self._control_name(control)
+        normalized = _normalized_text(name).lower()
+        if not any(token in normalized for token in EXPORT_FORMAT_TOKENS):
+            return False
+        control_type = self._control_type(control).lower()
+        class_name = self._control_class_name(control).lower()
+        return any(token in control_type or token in class_name for token in ("menu", "item", "button", "split"))
+
+    def _export_menu_popup_handles(self) -> list[int]:
+        anchor_rect = self._export_menu_anchor_rect
+        if not sys.platform.startswith("win") or not _rect_has_area(anchor_rect):
+            return []
+        try:
+            import win32gui
+        except Exception:
+            return []
+        get_window = getattr(win32gui, "GetWindow", None)
+        get_parent = getattr(win32gui, "GetParent", None)
+        get_foreground_window = getattr(win32gui, "GetForegroundWindow", None)
+        get_window_rect = getattr(win32gui, "GetWindowRect", None)
+        if not all(callable(func) for func in (get_window, get_parent, get_foreground_window, get_window_rect)):
+            return []
+        pos_handle = _control_handle(self.window)
+        try:
+            foreground_handle = int(get_foreground_window()) or None
+        except Exception:
+            foreground_handle = None
+        handles: list[int] = []
+        for handle in self._fast_top_level_window_handles(class_name="#32768"):
+            if pos_handle is not None and int(handle) == pos_handle:
+                continue
+            try:
+                raw_rect = get_window_rect(int(handle))
+                popup_rect = {
+                    "left": int(raw_rect[0]),
+                    "top": int(raw_rect[1]),
+                    "right": int(raw_rect[2]),
+                    "bottom": int(raw_rect[3]),
+                }
+            except Exception:
+                continue
+            if not _rect_is_near_any_scope(popup_rect, [anchor_rect], margin=240):
+                continue
+            if not self._popup_window_handle_is_pos_related(
+                int(handle),
+                pos_handle=pos_handle,
+                get_window=get_window,
+                get_parent=get_parent,
+            ):
+                continue
+            handles.append(int(handle))
+        parent_handles: list[int] = []
+        if pos_handle is not None:
+            parent_handles.append(pos_handle)
+        if foreground_handle is not None and (foreground_handle == pos_handle or foreground_handle in handles):
+            parent_handles.append(foreground_handle)
+        for parent_handle in parent_handles:
+            for handle in self._fast_child_window_handles(parent_handle, class_name="#32768"):
+                if handle not in handles:
+                    handles.append(handle)
+        return list(dict.fromkeys(handles[:12]))
+
     def _desktop_export_controls(self) -> list[Any]:
         if not sys.platform.startswith("win"):
             return []
 
         controls: list[Any] = []
-        for handle in self._fast_top_level_window_handles(class_name="#32768"):
+        for handle in self._export_menu_popup_handles():
             menu = self._wrap_win32_window_handle(handle)
             if menu is None or not self._is_visible(menu):
                 continue
+            self.actions.append(f"probe:匯出格式:desktop_popup:handle={handle}")
             controls.append(menu)
             children = list(_safe_call(menu, "children", default=[]))[:20]
             controls.extend(children)
             for child in children:
                 controls.extend(list(_safe_call(child, "children", default=[]))[:10])
+            descendants = list(_safe_call(menu, "descendants", default=[]))[:40]
+            controls.extend(descendants)
         return controls
+
+    def _desktop_export_controls_for_popup(self, popup_rect: dict[str, int]) -> list[Any]:
+        """Read format controls only from the popup whose geometry was confirmed."""
+        if not sys.platform.startswith("win") or not _rect_has_area(popup_rect):
+            return []
+        anchor_rect = self._export_menu_anchor_rect
+        if not anchor_rect or not _rect_has_area(anchor_rect):
+            return []
+        foreground_handle = self._fast_foreground_window_handle()
+        records = self._export_popup_window_records_near_rect(
+            anchor_rect,
+            foreground_handle=foreground_handle,
+        )
+        controls: list[Any] = []
+        seen_handles: set[int] = set()
+        for record in records:
+            record_rect = record.get("rectangle", {})
+            if not _rect_has_area(_rect_intersection(record_rect, popup_rect)):
+                continue
+            handle = int(record["handle"])
+            if handle in seen_handles:
+                continue
+            seen_handles.add(handle)
+            menu = self._wrap_win32_window_handle(handle)
+            if menu is None or not self._is_visible(menu):
+                continue
+            self.actions.append(f"probe:匯出格式:confirmed_popup:handle={handle}")
+            controls.append(menu)
+            children = list(_safe_call(menu, "children", default=[]))[:20]
+            controls.extend(children)
+            for child in children:
+                controls.extend(list(_safe_call(child, "children", default=[]))[:10])
+            controls.extend(list(_safe_call(menu, "descendants", default=[]))[:40])
+        return _dedupe_controls(controls)
 
     def _fast_top_level_window_handles(
         self,
@@ -3467,6 +5111,252 @@ class ReportWindowAutomator:
         except Exception:
             return None
 
+    def _write_export_menu_failure_probe(
+        self,
+        report_id: str,
+        export_control: Any,
+        *,
+        context: str,
+    ) -> Path | None:
+        target_dir = self.log_dir or self.diagnostic_dir or (self.output_dir / "diagnostics")
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+            filename = f"automation_export_menu_probe_{timestamp}_{_safe_filename_token(report_id)}.json"
+            path = target_dir / filename
+            screenshot_path = path.with_suffix(".png")
+
+            export_rect = _rect_to_dict(_safe_call(export_control, "rectangle", default=None))
+            foreground_handle = self._fast_foreground_window_handle()
+            pos_handle = _control_handle(self.window)
+            scoped_top_level_handles = list(
+                dict.fromkeys(
+                    handle
+                    for handle in (foreground_handle, pos_handle)
+                    if handle is not None
+                )
+            )
+            popup_handles = self._export_popup_window_handles_near_rect(
+                export_rect,
+                top_level_handles=scoped_top_level_handles,
+                foreground_handle=foreground_handle,
+                restrict_to_supplied_handles=True,
+            )
+            child_popup_handles: list[int] = []
+            for parent_handle in scoped_top_level_handles[:4]:
+                child_popup_handles.extend(self._fast_child_window_handles(parent_handle, class_name="#32768"))
+            popup_handles = list(dict.fromkeys([*popup_handles, *child_popup_handles]))
+            candidate_handles = list(
+                dict.fromkeys(
+                    [
+                        handle for handle in [foreground_handle, pos_handle, *popup_handles] if handle is not None
+                    ]
+                )
+            )
+
+            saved_screenshot, screenshot_error, screenshot_source = self._capture_export_menu_probe_screenshot(
+                screenshot_path,
+                candidate_handles,
+            )
+            window_records = [
+                record
+                for record in (
+                    self._window_handle_record(
+                        handle,
+                        export_rect=export_rect,
+                        foreground_handle=foreground_handle,
+                    )
+                    for handle in candidate_handles
+                )
+                if record is not None
+            ]
+            payload = {
+                "schema_version": 1,
+                "probe_type": "export_menu_failure_instant",
+                "created_at": datetime.now(tz=UTC).isoformat(),
+                "report_id": report_id,
+                "context": context,
+                "reason": "export_clicked_but_no_confirmed_format_menu_save_dialog_or_progress",
+                "screenshot_path": str(saved_screenshot) if saved_screenshot else None,
+                "screenshot_source": screenshot_source,
+                "screenshot_error": screenshot_error,
+                "export_control": self._diagnostic_control_record(export_control),
+                    "export_control_rectangle": export_rect,
+                    "foreground_handle": foreground_handle,
+                    "pos_window_handle": pos_handle,
+                    "popup_handles": popup_handles,
+                    "candidate_handles": candidate_handles,
+                "windows": window_records,
+                "popup_controls": self._popup_probe_control_records(popup_handles),
+                "actions_tail": list(self.actions[-80:]),
+                "runtime_metadata": self.runtime_metadata,
+                "notes": [
+                    "此檔案在送出 ESC 清理匯出選單前建立，用來保留失敗瞬間狀態。",
+                    "本 probe 只記錄證據，不根據 popup 猜測點擊 Excel。",
+                    "R01/R09/R10/R13 不掃描整個報表預覽內容，避免月底大量資料造成 UIA 卡住。",
+                    "candidate_handles 只限 POS 主視窗、前景視窗與匯出控制項附近的 popup，不記錄其他 top-level 視窗。",
+                ],
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            self.last_export_menu_probe_path = path
+            self.last_export_menu_screenshot_path = saved_screenshot
+            self.actions.append(f"probe:匯出選單失敗瞬間:{path}")
+            self._write_action_log_event(
+                "export_menu_failure_probe_written",
+                path=str(path),
+                screenshot_path=str(saved_screenshot) if saved_screenshot else None,
+                screenshot_error=screenshot_error,
+            )
+            return path
+        except Exception as exc:
+            self.actions.append(f"probe_failed:匯出選單失敗瞬間:{_exception_detail(exc)}")
+            return None
+
+    def _capture_export_menu_probe_screenshot(
+        self,
+        screenshot_path: Path,
+        candidate_handles: list[int],
+    ) -> tuple[Path | None, str | None, str | None]:
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        sources: list[tuple[str, Any]] = []
+        for handle in candidate_handles[:8]:
+            window = self._wrap_win32_window_handle(handle)
+            if window is not None:
+                sources.append((f"handle:{handle}", window))
+        sources.append(("main_window", self.window))
+
+        last_error: str | None = None
+        for source_name, source in sources:
+            image = _safe_call(source, "capture_as_image", default=None)
+            if image is None:
+                continue
+            save = getattr(image, "save", None)
+            if not callable(save):
+                continue
+            try:
+                save(screenshot_path)
+                return screenshot_path, None, source_name
+            except Exception as exc:
+                last_error = _exception_detail(exc)
+        main_rect = _rect_to_dict(_safe_call(self.window, "rectangle", default=None))
+        if not _rect_has_area(main_rect):
+            return None, last_error or "main_window_rectangle_unavailable", None
+        try:
+            from PIL import ImageGrab  # type: ignore[import-not-found]
+
+            image = ImageGrab.grab(
+                bbox=(main_rect["left"], main_rect["top"], main_rect["right"], main_rect["bottom"])
+            )
+            image.save(screenshot_path)
+            return screenshot_path, None, "PIL.ImageGrab.grab(bbox=POS_main_window)"
+        except Exception as exc:
+            last_error = last_error or _exception_detail(exc)
+        return None, last_error or "capture_as_image_unavailable", None
+
+    def _window_handle_record(
+        self,
+        handle: int,
+        *,
+        export_rect: dict[str, int],
+        foreground_handle: int | None,
+    ) -> dict[str, Any] | None:
+        if not sys.platform.startswith("win"):
+            return None
+        try:
+            import win32gui
+        except Exception:
+            return None
+        try:
+            window_rect = win32gui.GetWindowRect(int(handle))
+            title = str(win32gui.GetWindowText(int(handle)) or "")
+            class_name = str(win32gui.GetClassName(int(handle)) or "")
+            visible = bool(win32gui.IsWindowVisible(int(handle)))
+            enabled = bool(win32gui.IsWindowEnabled(int(handle)))
+        except Exception:
+            return None
+        get_window = getattr(win32gui, "GetWindow", None)
+        get_parent = getattr(win32gui, "GetParent", None)
+        pos_handle = _control_handle(self.window)
+        popup_is_pos_related = bool(
+            callable(get_window)
+            and callable(get_parent)
+            and self._popup_window_handle_is_pos_related(
+                int(handle),
+                pos_handle=pos_handle,
+                get_window=get_window,
+                get_parent=get_parent,
+            )
+        )
+        rect = {
+            "left": int(window_rect[0]),
+            "top": int(window_rect[1]),
+            "right": int(window_rect[2]),
+            "bottom": int(window_rect[3]),
+        }
+        return {
+            "handle": int(handle),
+            "title": title,
+            "class_name": class_name,
+            "rectangle": rect,
+            "visible": visible,
+            "enabled": enabled,
+            "is_foreground": int(handle) == foreground_handle,
+            "is_popup_class": class_name == "#32768",
+            "popup_is_pos_related": popup_is_pos_related,
+            "near_export_control": self._r01_popup_rect_near_export_rect(rect, export_rect),
+        }
+
+    @staticmethod
+    def _popup_window_handle_is_pos_related(
+        handle: int,
+        *,
+        pos_handle: int | None,
+        get_window: Any,
+        get_parent: Any,
+    ) -> bool:
+        if pos_handle is None:
+            return False
+        pending = [int(handle)]
+        seen: set[int] = set()
+        while pending and len(seen) < 16:
+            current = pending.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            if current == int(pos_handle):
+                return True
+            for getter in (get_window, get_parent):
+                try:
+                    ancestor = int(getter(current, 4) if getter is get_window else getter(current)) or 0
+                except Exception:
+                    ancestor = 0
+                if ancestor and ancestor not in seen:
+                    pending.append(ancestor)
+        return False
+
+    def _popup_probe_control_records(self, popup_handles: list[int]) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for handle in popup_handles[:10]:
+            menu = self._wrap_win32_window_handle(handle)
+            if menu is None:
+                continue
+            controls = [menu]
+            children = list(_safe_call(menu, "children", default=[]))[:20]
+            controls.extend(children)
+            for child in children:
+                controls.extend(list(_safe_call(child, "children", default=[]))[:10])
+            controls.extend(list(_safe_call(menu, "descendants", default=[]))[:40])
+            for control in controls:
+                identity = _control_identity(control)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                records.append(self._diagnostic_control_record(control))
+                if len(records) >= 120:
+                    return records
+        return records
+
     def _send_keyboard(self, keys: str, action_name: str) -> bool:
         sender = self._keyboard_sender
         if sender is None:
@@ -3501,6 +5391,28 @@ class ReportWindowAutomator:
 
     def _post_report_view_controls(self, *, max_depth: int | None = None) -> list[Any]:
         depth = max_depth if max_depth is not None else POST_REPORT_SEARCH_DEPTH
+        if self._export_scope_locked_to_active_form and self._active_report_form is not None:
+            controls = [self._active_report_form]
+            controls.extend(
+                control
+                for control, _control_depth in self._collect_export_candidate_controls_with_depth(
+                    self._active_report_form,
+                    max_depth=depth,
+                    depth=1,
+                )
+            )
+            if self._active_report_title:
+                for report_viewer in self._desktop_report_viewer_windows(self._active_report_title):
+                    controls.append(report_viewer)
+                    controls.extend(
+                        control
+                        for control, _control_depth in self._collect_export_candidate_controls_with_depth(
+                            report_viewer,
+                            max_depth=depth,
+                            depth=1,
+                        )
+                    )
+            return _dedupe_controls(controls)
         controls = [
             self.window,
             *[
@@ -3543,6 +5455,18 @@ class ReportWindowAutomator:
 
     def _remember_active_report_form(self, report_menu_text: str) -> None:
         self._active_report_form = self._find_report_form(report_menu_text)
+
+    def _lock_export_scope_if_previous_report_form_open(
+        self,
+        previous_form: Any | None,
+        report_menu_text: str,
+    ) -> None:
+        if previous_form is None or self._active_report_form is None:
+            return
+        if self._control_name_matches_report_title(previous_form, report_menu_text):
+            return
+        self._export_scope_locked_to_active_form = True
+        self.actions.append(f"lock:匯出搜尋:active_report_form:{_action_text(report_menu_text)}")
 
     def _find_report_form(self, report_menu_text: str) -> Any | None:
         title_candidates = [_normalized_text(candidate) for candidate in _report_title_candidates(report_menu_text)]
@@ -3590,6 +5514,10 @@ class ReportWindowAutomator:
         return records
 
     def _any_open_report_form(self, *, exclude: Any | None = None) -> bool:
+        return self._open_report_form_count(exclude=exclude) > 0
+
+    def _open_report_form_count(self, *, exclude: Any | None = None) -> int:
+        count = 0
         for control in self._all_controls():
             if control is self.window:
                 continue
@@ -3598,8 +5526,8 @@ class ReportWindowAutomator:
             if self._looks_like_report_form(control) and self._date_input_controls(
                 self._control_scope(control)
             ):
-                return True
-        return False
+                count += 1
+        return count
 
     def _looks_like_report_form(self, control: Any) -> bool:
         control_type = self._control_type(control).lower()
@@ -3635,6 +5563,29 @@ class ReportWindowAutomator:
         for child in children:
             controls.append((child, depth))
             controls.extend(self._collect_children_with_depth(child, max_depth=max_depth, depth=depth + 1))
+        return controls
+
+    def _bounded_control_tree(
+        self,
+        roots: list[Any],
+        *,
+        max_depth: int,
+        record_limit: int,
+    ) -> list[Any]:
+        controls: list[Any] = []
+        queue: list[tuple[Any, int]] = [(root, 0) for root in roots if root is not None]
+        seen: set[tuple[Any, ...]] = set()
+        while queue and len(controls) < record_limit:
+            control, depth = queue.pop(0)
+            identity = _control_identity(control)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            controls.append(control)
+            if depth >= max_depth:
+                continue
+            children = list(_safe_call(control, "children", default=[]))
+            queue.extend((child, depth + 1) for child in children[:40])
         return controls
 
     def _click(self, control: Any, action_name: str, *, prefer_click_input: bool = False) -> None:
@@ -3849,14 +5800,48 @@ class ReportWindowAutomator:
             except Exception:
                 continue
 
-    def _focus_control_without_click(self, control: Any) -> None:
+    def _read_control_focus_state(self, control: Any) -> bool | None:
+        for method_name in ("has_focus", "is_focused", "has_keyboard_focus"):
+            value = _safe_call(control, method_name, default=None)
+            if value is not None:
+                return bool(value)
+        for attr_name in ("focused", "has_keyboard_focus"):
+            try:
+                value = getattr(control, attr_name, None)
+            except Exception:
+                value = None
+            if isinstance(value, bool):
+                return value
+        handle = _control_handle(control)
+        if handle is None or not sys.platform.startswith("win"):
+            return None
+        try:
+            import win32gui
+
+            get_focus = getattr(win32gui, "GetFocus", None)
+            if not callable(get_focus):
+                return None
+            focused_handle = int(get_focus()) or None
+        except Exception:
+            return None
+        return focused_handle == handle
+
+    def _focus_control_without_click(self, control: Any) -> bool:
         method = getattr(control, "set_focus", None)
-        if method is None:
-            return
+        if not callable(method):
+            return False
         try:
             method()
         except Exception:
-            return
+            return False
+        deadline = monotonic() + 0.8
+        while monotonic() < deadline:
+            if self._read_control_focus_state(control) is True:
+                return True
+            if self._read_control_focus_state(control) is None:
+                return False
+            sleep(0.05)
+        return self._read_control_focus_state(control) is True
 
     def _close_attempt_succeeded(self, control: Any) -> bool:
         if bool(getattr(control, "closed", False)):
@@ -3963,6 +5948,10 @@ class ReportWindowAutomator:
     def _start_action_log(self, output: PlannedOutput, report: ReportConfig) -> list[str]:
         self.last_action_log_path = None
         self.last_probe_log_path = None
+        self.last_export_menu_probe_path = None
+        self.last_export_menu_screenshot_path = None
+        self._export_menu_anchor_rect = None
+        self._last_export_progress_wait_error = None
         if self.log_dir is None:
             return []
         try:
@@ -4022,13 +6011,7 @@ class ReportWindowAutomator:
         status: str,
         error_code: str | None,
     ) -> dict[str, Any]:
-        all_controls = self._safe_controls(
-            lambda: self._post_report_view_controls(max_depth=DIAGNOSTIC_SEARCH_DEPTH)
-        ) if self._report_view_requested else self._safe_controls(
-            lambda: self._lightweight_controls(max_depth=DIAGNOSTIC_SEARCH_DEPTH)
-        )
-        search_controls = self._safe_controls(self._search_controls)
-        report_controls = self._safe_controls(lambda: self._report_form_controls(report.report_menu_text))
+        all_controls, search_controls, report_controls = self._diagnostic_control_sets(report)
         active_form = self._active_report_form
         if active_form is None and not self._report_view_requested:
             active_form = self._find_report_form(report.report_menu_text)
@@ -4056,6 +6039,12 @@ class ReportWindowAutomator:
                 "metadata": self.runtime_metadata,
                 "actions": list(self.actions),
                 "action_log_path": str(self.last_action_log_path) if self.last_action_log_path else None,
+                "export_menu_probe_path": (
+                    str(self.last_export_menu_probe_path) if self.last_export_menu_probe_path else None
+                ),
+                "export_menu_screenshot_path": (
+                    str(self.last_export_menu_screenshot_path) if self.last_export_menu_screenshot_path else None
+                ),
             },
             "scope": {
                 "active_form": self._diagnostic_control_record(active_form) if active_form is not None else None,
@@ -4146,6 +6135,10 @@ class ReportWindowAutomator:
             "actions": list(self.actions),
             "action_log_path": str(self.last_action_log_path) if self.last_action_log_path else None,
             "probe_log_path": str(self.last_probe_log_path) if self.last_probe_log_path else None,
+            "export_menu_probe_path": str(self.last_export_menu_probe_path) if self.last_export_menu_probe_path else None,
+            "export_menu_screenshot_path": (
+                str(self.last_export_menu_screenshot_path) if self.last_export_menu_screenshot_path else None
+            ),
         }
 
     def _failure_diagnostic_payload(
@@ -4154,13 +6147,7 @@ class ReportWindowAutomator:
         report: ReportConfig,
         error: ReportAutomationError,
     ) -> dict[str, Any]:
-        all_controls = self._safe_controls(
-            lambda: self._post_report_view_controls(max_depth=DIAGNOSTIC_SEARCH_DEPTH)
-        ) if self._report_view_requested else self._safe_controls(
-            lambda: self._lightweight_controls(max_depth=DIAGNOSTIC_SEARCH_DEPTH)
-        )
-        search_controls = self._safe_controls(self._search_controls)
-        report_controls = self._safe_controls(lambda: self._report_form_controls(report.report_menu_text))
+        all_controls, search_controls, report_controls = self._diagnostic_control_sets(report)
         active_form = self._active_report_form
         if active_form is None and not self._report_view_requested:
             active_form = self._find_report_form(report.report_menu_text)
@@ -4189,6 +6176,14 @@ class ReportWindowAutomator:
                 "window_title": self._control_name(self.window),
                 "metadata": self.runtime_metadata,
                 "actions": list(self.actions),
+                "action_log_path": str(self.last_action_log_path) if self.last_action_log_path else None,
+                "probe_log_path": str(self.last_probe_log_path) if self.last_probe_log_path else None,
+                "export_menu_probe_path": (
+                    str(self.last_export_menu_probe_path) if self.last_export_menu_probe_path else None
+                ),
+                "export_menu_screenshot_path": (
+                    str(self.last_export_menu_screenshot_path) if self.last_export_menu_screenshot_path else None
+                ),
             },
             "lookup": {
                 "option_aliases": OPTION_ALIASES,
@@ -4222,6 +6217,22 @@ class ReportWindowAutomator:
                 ),
             },
         }
+
+    def _diagnostic_control_sets(self, report: ReportConfig) -> tuple[list[Any], list[Any], list[Any]]:
+        if self._should_skip_report_scope_export_format_probe():
+            all_controls = [self.window]
+            if self._active_report_form is not None:
+                all_controls.append(self._active_report_form)
+            all_controls.extend(self._safe_controls(self._desktop_export_controls))
+            return _dedupe_controls(all_controls), [], []
+        all_controls = self._safe_controls(
+            lambda: self._post_report_view_controls(max_depth=DIAGNOSTIC_SEARCH_DEPTH)
+        ) if self._report_view_requested else self._safe_controls(
+            lambda: self._lightweight_controls(max_depth=DIAGNOSTIC_SEARCH_DEPTH)
+        )
+        search_controls = self._safe_controls(self._search_controls)
+        report_controls = self._safe_controls(lambda: self._report_form_controls(report.report_menu_text))
+        return all_controls, search_controls, report_controls
 
     def _safe_controls(self, getter: Any) -> list[Any]:
         try:
@@ -4607,6 +6618,28 @@ def _rect_intersection(first: dict[str, int], second: dict[str, int]) -> dict[st
     }
 
 
+def _rect_is_near_any_scope(
+    rect: dict[str, int],
+    scope_rects: list[dict[str, int]],
+    *,
+    margin: int,
+) -> bool:
+    if not _rect_has_area(rect):
+        return False
+    for scope in scope_rects:
+        if not _rect_has_area(scope):
+            continue
+        expanded = {
+            "left": scope["left"] - margin,
+            "top": scope["top"] - margin,
+            "right": scope["right"] + margin,
+            "bottom": scope["bottom"] + margin,
+        }
+        if _rect_has_area(_rect_intersection(rect, expanded)):
+            return True
+    return False
+
+
 def _control_text_matches(expected: str, actual: str) -> bool:
     if not expected or not actual:
         return False
@@ -4623,4 +6656,6 @@ def _is_known_transient_pos_warning(value: str) -> bool:
 
 def _is_no_report_data_warning(value: str) -> bool:
     normalized = _normalized_text(value)
-    return "目前並無符合" in normalized and ("療程殘值資料" in normalized or "殘值資料" in normalized)
+    if "目前並無符合" not in normalized:
+        return False
+    return any(token in normalized for token in ("相關資料", "條件", "資料", "殘值資料", "療程殘值資料"))

@@ -5,11 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from time import monotonic, sleep
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QCheckBox,
+    QComboBox,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -57,10 +60,10 @@ def test_pyside_settings_window_can_be_created() -> None:
     assert window.windowTitle() == "POSReportBot 設定中心"
     tabs = window.findChild(QTabWidget)
     assert tabs is not None
-    assert tabs.count() == 11
+    assert tabs.count() == 13
     table = window.findChild(QTableWidget, "drive_target_table")
     assert table is not None
-    assert table.rowCount() == 18
+    assert table.rowCount() == 19
     window.close()
 
 
@@ -74,24 +77,29 @@ def test_settings_window_defaults_enable_reports_drive_and_email() -> None:
     email_enabled = window.findChild(QCheckBox, "setting_email_enabled")
     r01_enabled = window.findChild(QCheckBox, "report_R01_enabled")
     r14_enabled = window.findChild(QCheckBox, "report_R14_enabled")
+    w01_enabled = window.findChild(QCheckBox, "report_W01_enabled")
+    w01_frequency = window.findChild(QComboBox, "report_W01_frequency")
     r04_enabled = window.findChild(QCheckBox, "report_R04_enabled")
     drive_table = window.findChild(QTableWidget, "drive_target_table")
 
     assert report_title is not None
-    assert report_title.text() == "報表任務設定 - 已啟用 13 項"
+    assert report_title.text() == "報表任務設定 - 已啟用 16 項"
     assert drive_enabled is not None and drive_enabled.isChecked()
     assert email_enabled is not None and email_enabled.isChecked()
     assert r01_enabled is not None and r01_enabled.isChecked()
     assert r14_enabled is not None and r14_enabled.isChecked()
-    assert r04_enabled is not None and not r04_enabled.isChecked()
+    assert w01_enabled is not None and w01_enabled.isChecked()
+    assert w01_frequency is not None and w01_frequency.currentText() == "weekly"
+    assert r04_enabled is not None and r04_enabled.isChecked()
     assert drive_table is not None
-    assert drive_table.rowCount() == 18
+    assert drive_table.rowCount() == 19
     task_ids = {
         drive_table.item(row, 1).text()
         for row in range(drive_table.rowCount())
         if drive_table.item(row, 1) is not None
     }
     assert {"R01", "R13", "R14"} <= task_ids
+    assert "W01" not in task_ids
     window.close()
 
 
@@ -233,6 +241,28 @@ def test_pos_settings_page_uses_editable_fields_before_button_action() -> None:
     assert window.config.pos.executable_path == r"C:\SPA-POS\SPA-POS.exe"
     assert window.last_action_result is not None
     assert window.last_action_result.error_code == "POS_EXECUTABLE_NOT_FOUND"
+    window.close()
+
+
+def test_pos_ini_page_persists_selected_profile(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    settings_path = tmp_path / "app.yaml"
+    window = SettingsMainWindow(config, settings_path=settings_path)
+
+    profile_combo = window.findChild(QComboBox, "pos_ini_profile_choice")
+    assert profile_combo is not None
+    profile_combo.setCurrentIndex(1)
+    button = window.findChild(QPushButton, "pos_ini_儲存 POS 環境設定")
+    assert button is not None
+    button.click()
+
+    reloaded = load_project_config(settings_path)
+
+    assert window.last_action_result is not None
+    assert window.last_action_result.ok is True
+    assert reloaded.pos.startup_ini_selection_enabled is True
+    assert reloaded.pos.startup_ini_profile == r"c:\tkhspa\tkhspa-正式區.ini"
     window.close()
 
 
@@ -471,9 +501,9 @@ def test_settings_window_can_fill_all_drive_targets_and_dry_run_has_no_missing()
     window.fill_all_drive_targets_for_testing(prefix="folder")
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 19
     assert payload["counts"]["missing_drive_targets"] == 0
-    assert "R04" not in {output["task_id"] for output in payload["outputs"]}
+    assert any(output["task_id"] == "R04" for output in payload["outputs"])
     window.close()
 
 
@@ -485,16 +515,23 @@ def test_settings_window_can_trigger_dry_run_without_pos() -> None:
     payload = window.trigger_dry_run(today=date(2026, 5, 13))
 
     assert payload["mode"] == "dry_run"
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 19
     assert payload["counts"]["missing_drive_targets"] == 0
-    assert "R04" not in {output["task_id"] for output in payload["outputs"]}
+    assert any(output["task_id"] == "R04" for output in payload["outputs"])
     window.close()
 
 
-def test_dry_run_button_updates_status_and_result() -> None:
+def test_dry_run_button_updates_status_and_result(monkeypatch: pytest.MonkeyPatch) -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     window = SettingsMainWindow(config)
+
+    original_build_dry_run_plan = main_window.build_dry_run_plan
+    monkeypatch.setattr(
+        main_window,
+        "build_dry_run_plan",
+        lambda config, today=None: original_build_dry_run_plan(config, today=date(2026, 5, 13)),
+    )
 
     button = window.findChild(QPushButton, "dashboard_立即 Dry-run")
     assert button is not None
@@ -503,8 +540,8 @@ def test_dry_run_button_updates_status_and_result() -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert window.last_dry_run_payload is not None
-    assert window.last_dry_run_payload["counts"]["outputs"] == 18
-    assert "R04" not in {output["task_id"] for output in window.last_dry_run_payload["outputs"]}
+    assert window.last_dry_run_payload["counts"]["outputs"] == 19
+    assert any(output["task_id"] == "R04" for output in window.last_dry_run_payload["outputs"])
     assert "Dry-run 完成" in window.statusBar().currentMessage()
     window.close()
 
@@ -621,7 +658,15 @@ def test_export_ui_probe_button_writes_report_from_open_pos_window(
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     config.app.screenshots_dir = str(tmp_path)
     window = SettingsMainWindow(config)
-    fake_window = FakeControl("SPA-POS 主畫面", [FakeControl("統計報表")])
+
+    class EmptyTextControl(FakeControl):
+        def window_text(self) -> str:
+            return ""
+
+        def texts(self) -> list[str]:
+            return []
+
+    fake_window = FakeControl("SPA-POS 主畫面", [EmptyTextControl("")])
 
     monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: fake_window)
     button = window.findChild(QPushButton, "pos_匯出 UI 探測報告")
@@ -633,6 +678,8 @@ def test_export_ui_probe_button_writes_report_from_open_pos_window(
     dated_screenshots_dir = tmp_path / date.today().strftime("%Y%m%d")
     reports = list(dated_screenshots_dir.glob("ui_probe_*.json"))
     assert len(reports) == 1
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["controls"][1]["name"] == ""
     assert "UI 探測報告已匯出" in window.statusBar().currentMessage()
     window.close()
 
@@ -832,6 +879,26 @@ def test_report_page_can_enable_only_r01_for_single_report_dry_run() -> None:
     window.close()
 
 
+def test_manual_report_selection_defaults_w02_off_before_next_run_date(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.w02_order.next_run_date = "2026/07/17"
+    for report in config.reports:
+        report.enabled = report.id in {"R13", "W02"}
+    window = SettingsMainWindow(config)
+
+    r13_selected = window.findChild(QCheckBox, "report_R13_run_selected")
+    w02_selected = window.findChild(QCheckBox, "report_W02_run_selected")
+
+    assert r13_selected is not None and r13_selected.isChecked()
+    assert w02_selected is not None and not w02_selected.isChecked()
+    assert window._selected_manual_task_ids() == {"R13"}
+
+    w02_selected.setChecked(True)
+    assert window._selected_manual_task_ids() == {"R13", "W02"}
+    window.close()
+
+
 def test_report_page_enable_all_refreshes_drive_targets_and_persists(tmp_path: Path) -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
@@ -851,10 +918,11 @@ def test_report_page_enable_all_refreshes_drive_targets_and_persists(tmp_path: P
     enable_all.click()
     reloaded = load_project_config(tmp_path / "app.yaml")
 
-    assert title.text() == "報表任務設定 - 已啟用 13 項"
-    assert drive_table.rowCount() == 18
-    assert sum(1 for report in reloaded.reports if report.enabled) == 13
+    assert title.text() == "報表任務設定 - 已啟用 16 項"
+    assert drive_table.rowCount() == 19
+    assert sum(1 for report in reloaded.reports if report.enabled) == 16
     assert next(report for report in reloaded.reports if report.id == "R14").enabled is True
+    assert next(report for report in reloaded.reports if report.id == "W01").enabled is True
     window.close()
 
 

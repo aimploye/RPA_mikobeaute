@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pos-report-bot"
-version = "2.1.0"
+version = "2.1.2"
 description = "Windows desktop RPA tool for SPA-POS report export and Google Drive upload"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
   "google-auth-oauthlib>=1.2",
   "keyring>=25.0",
   "openpyxl>=3.1",
+  "Pillow>=10.0",
   "pywinauto>=0.6.8",
   "pywin32>=306; sys_platform == 'win32'",
   "xlrd>=2.0",

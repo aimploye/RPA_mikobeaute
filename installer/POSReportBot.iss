@@ -1,5 +1,5 @@
 #define MyAppName "POSReportBot"
-#define MyAppVersion "2.1.0"
+#define MyAppVersion "2.1.2"
 #define MyAppPublisher "Pei Fang International"
 #define MyAppExeName "POSReportBot.exe"
 #define MyAppURL GetEnv("POSREPORTBOT_APP_URL")

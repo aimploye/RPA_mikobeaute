@@ -29,6 +29,8 @@ class PosSettings(StrictBaseModel):
     window_title_regex: str = ""
     backend: Literal["auto", "uia", "win32"] = "auto"
     startup_wait_seconds: int = 20
+    startup_ini_selection_enabled: bool = True
+    startup_ini_profile: str = "c:\\tkhspa\\tkhspa-測試區.ini"
     run_as_admin: bool = False
     close_after_run: bool = False
 
@@ -95,6 +97,17 @@ class R14EmailSettings(StrictBaseModel):
     body: str = R14_EMAIL_DEFAULT_BODY
 
 
+class W02OrderSettings(StrictBaseModel):
+    enabled: bool = True
+    next_run_date: str = "2026/07/03"
+    recipients: list[str] = Field(default_factory=lambda: list(R14_EMAIL_DEFAULT_RECIPIENTS))
+    cc: list[str] = Field(default_factory=list)
+    subject_template: str = "W02 下單異常通知 {date}"
+    body: str = "Hi,\n\nW02 自動下單流程有需要人工確認的品項，請查看下方明細。\n\nRPA程式\n"
+    pos_submission_enabled: bool = False
+    diagnostic_mode: bool = False
+
+
 class SchedulerSettings(StrictBaseModel):
     enabled: bool = False
     daily_time: str = "01:00"
@@ -112,7 +125,7 @@ class PosUpdateSettings(StrictBaseModel):
     action: str = "click_yes_and_restart"
     expected_update_weekday: str = "Thursday"
     restart_wait_seconds: int = 180
-    max_restart_wait_seconds: int = 600
+    max_restart_wait_seconds: int = 300
     resume_unfinished_tasks: bool = True
 
 
@@ -133,6 +146,51 @@ class R14TransformSettings(StrictBaseModel):
     raw_search_dir: str = ""
     raw_filename_glob: str = "診所stock status - * demand planning-*-rawdata.xls"
     output_extension: str = ".xlsx"
+
+
+class R14InventorySourceSettings(StrictBaseModel):
+    enabled: bool = True
+    spreadsheet_url: str = (
+        "https://docs.google.com/spreadsheets/d/"
+        "1LfKl6LevlSuk8-OVQZNp8VFaTHyAB1NTR7Y1bpgEWUE/edit?gid=651674627#gid=651674627"
+    )
+    spreadsheet_id: str = ""
+    sheet_name: str = "Summary"
+    item_code_column: str = "B"
+    branch_inventory_columns: dict[str, str] = Field(
+        default_factory=lambda: {
+            "站前4樓": "G",
+            "站前11樓": "H",
+            "忠孝7樓": "I",
+            "忠孝國際醫學3樓": "J",
+            "忠孝健康7樓": "K",
+        }
+    )
+    apply_weekday: Literal[
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "星期一",
+        "星期二",
+        "星期三",
+        "星期四",
+        "星期五",
+        "星期六",
+        "星期日",
+        "星期天",
+        "週一",
+        "週二",
+        "週三",
+        "週四",
+        "週五",
+        "週六",
+        "週日",
+        "週天",
+    ] = "Friday"
 
 
 class BranchConfig(StrictBaseModel):
@@ -159,7 +217,7 @@ class ReportOptions(StrictBaseModel):
 class ReportConfig(StrictBaseModel):
     id: str
     enabled: bool = True
-    frequency: Literal["daily", "weekly"] = "daily"
+    frequency: Literal["daily", "weekly", "biweekly"] = "daily"
     name: str
     handler: str
     report_menu_text: str
@@ -197,7 +255,9 @@ class ProjectConfig(StrictBaseModel):
     pos_update: PosUpdateSettings
     pos_recovery: PosRecoverySettings = Field(default_factory=PosRecoverySettings)
     r14_transform: R14TransformSettings = Field(default_factory=R14TransformSettings)
+    r14_inventory_source: R14InventorySourceSettings = Field(default_factory=R14InventorySourceSettings)
     r14_email: R14EmailSettings = Field(default_factory=R14EmailSettings)
+    w02_order: W02OrderSettings = Field(default_factory=W02OrderSettings)
     reports: list[ReportConfig]
     branches: list[BranchConfig]
     drive_targets: DriveTargetsConfig

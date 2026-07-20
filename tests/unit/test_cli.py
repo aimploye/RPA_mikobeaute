@@ -25,7 +25,7 @@ def test_version_cli_outputs_current_version(capsys) -> None:  # type: ignore[no
         cli.main(["--version"])
 
     assert exc_info.value.code == 0
-    assert capsys.readouterr().out.strip() == "pos_report_bot 2.1.0"
+    assert capsys.readouterr().out.strip() == "pos_report_bot 2.1.2"
 
 
 def test_install_scheduler_cli_retries_elevated_and_requests_diagnostic_dir(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -75,9 +75,9 @@ def test_dry_run_cli_outputs_json_plan() -> None:
 
     assert payload["mode"] == "dry_run"
     assert payload["status"] == "success"
-    assert payload["counts"]["outputs"] == 18
+    assert payload["counts"]["outputs"] == 19
     assert payload["counts"]["missing_drive_targets"] == 0
-    assert "R04" not in {output["task_id"] for output in payload["outputs"]}
+    assert any(output["task_id"] == "R04" for output in payload["outputs"])
     assert any(
         output["task_id"] == "R06" and output["branch_code"] == "N006"
         for output in payload["outputs"]
@@ -111,8 +111,8 @@ def test_dry_run_cli_can_write_summary(tmp_path: Path) -> None:
 
     assert summary_path.parent == tmp_path
     assert summary["status"] == "success"
-    assert len(summary["outputs"]) == 18
-    assert "R04" not in {output["task_id"] for output in summary["outputs"]}
+    assert len(summary["outputs"]) == 19
+    assert any(output["task_id"] == "R04" for output in summary["outputs"])
     assert summary["outputs"][0]["status"] == "skipped"
     assert summary["outputs"][0]["drive_folder_id"] == "1DibytnRl9054M65TMUVfHNSTIAeQ-ghF"
 
@@ -291,6 +291,45 @@ def test_run_task_cli_executes_r14_without_connecting_pos(
     assert payload["ok"] is True
     assert payload["completed"] == 1
     assert (tmp_path / "downloads" / "R14" / "20260609" / "診所stock status - 2026 demand planning-0608.xlsx").exists()
+
+
+def test_run_task_cli_forces_w01_on_non_configured_weekday(monkeypatch, capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    captured = {}
+
+    class FakeSummary:
+        ok = True
+        completed = 1
+        skipped = 0
+        total = 1
+        message = "w01 done"
+        error_code = None
+        details = None
+        failures = ()
+
+    class FakeRunner:
+        def __init__(self, config, *, settings_path: Path, app_version: str, run_source: str, run_date: date) -> None:  # type: ignore[no-untyped-def]
+            captured["enabled_report_ids"] = [report.id for report in config.reports if report.enabled]
+            captured["settings_path"] = settings_path
+            captured["run_source"] = run_source
+            captured["run_date"] = run_date
+
+        def run(self) -> FakeSummary:
+            captured["ran"] = True
+            return FakeSummary()
+
+    monkeypatch.setattr(cli, "AutomationRunner", FakeRunner)
+
+    config_path = ROOT / "config_templates" / "app.template.yaml"
+    exit_code = cli.main(["--run-task", "W01", "--config", str(config_path), "--today", "2026-06-09"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert captured["ran"] is True
+    assert captured["enabled_report_ids"] == ["W01"]
+    assert captured["run_source"] == "manual_single_task"
+    assert captured["run_date"] == date(2026, 6, 9)
+    assert payload["ok"] is True
+    assert payload["completed"] == 1
 
 
 def test_run_enabled_cli_uses_automation_runner(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]

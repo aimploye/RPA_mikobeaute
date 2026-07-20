@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from pos_report_bot import __version__
-from pos_report_bot.app.automation_runner import LOCAL_REPORT_HANDLERS, AutomationRunner
+from pos_report_bot.app.automation_runner import (
+    LOCAL_REPORT_HANDLERS,
+    AutomationRunner,
+    forced_weekly_report_ids_for_run_source,
+)
 from pos_report_bot.config.loader import load_project_config
 from pos_report_bot.config.writer import user_config_path
 from pos_report_bot.core.summary import build_dry_run_summary, write_run_summary
@@ -144,7 +148,13 @@ def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None =
     if report is not None:
         for item in config.reports:
             item.enabled = item.id == task_id
-    plan = build_dry_run_plan(config, today=run_date)
+    run_source = "manual_single_task"
+    plan = build_dry_run_plan(
+        config,
+        today=run_date,
+        force_weekly_report_ids=forced_weekly_report_ids_for_run_source(run_source),
+        selected_task_ids={task_id},
+    )
     runtime_paths = RuntimePaths.from_config(config, run_date=run_date)
     output = next((item for item in plan.outputs if item.task_id == task_id), None)
     if output is None or report is None:
@@ -169,7 +179,7 @@ def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None =
             config,
             settings_path=config_path,
             app_version=__version__,
-            run_source="manual_single_task",
+            run_source=run_source,
             run_date=run_date,
         ).run()
         payload = {

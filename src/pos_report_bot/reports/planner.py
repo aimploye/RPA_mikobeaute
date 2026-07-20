@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from pos_report_bot.config.models import BranchConfig, ProjectConfig, ReportConfig
 from pos_report_bot.core.dates import (
@@ -21,13 +21,24 @@ BRANCH_FILENAME_NAMES = {
     "N006": "忠孝預防醫學3F",
 }
 
+MAINTENANCE_REPORT_HANDLERS = {"r14_template_inventory_sync", "w02_pos_order_creation"}
 
-def build_dry_run_plan(config: ProjectConfig, *, today: date | None = None) -> DryRunPlan:
+
+def build_dry_run_plan(
+    config: ProjectConfig,
+    *,
+    today: date | None = None,
+    force_weekly_report_ids: set[str] | None = None,
+    selected_task_ids: set[str] | None = None,
+) -> DryRunPlan:
     base_date = today or date.today()
+    forced_weekly = force_weekly_report_ids or set()
     outputs: list[PlannedOutput] = []
 
     for report in config.reports:
-        if not report.enabled or not _is_executable_report(report):
+        if selected_task_ids is not None and report.id not in selected_task_ids:
+            continue
+        if not _should_include_report(config, report, base_date, force_weekly_report_ids=forced_weekly):
             continue
         if report.branch_mode == "each_branch":
             for branch in config.branches:
@@ -39,13 +50,37 @@ def build_dry_run_plan(config: ProjectConfig, *, today: date | None = None) -> D
     return DryRunPlan(outputs=outputs)
 
 
+def _should_include_report(
+    config: ProjectConfig,
+    report: ReportConfig,
+    base_date: date,
+    *,
+    force_weekly_report_ids: set[str],
+) -> bool:
+    if not report.enabled or not _is_executable_report(report):
+        return False
+    if report.id == "W02":
+        if not config.w02_order.enabled:
+            return False
+        if report.id in force_weekly_report_ids:
+            return True
+        return _w02_run_date_matches(config.w02_order.next_run_date, base_date)
+    if report.id in force_weekly_report_ids:
+        return True
+    if report.frequency == "weekly":
+        return _weekday_matches(base_date, config.r14_inventory_source.apply_weekday)
+    return True
+
+
 def _is_executable_report(report: ReportConfig) -> bool:
-    return bool(
+    has_core_settings = bool(
         report.handler.strip()
         and report.handler != "placeholder"
         and report.report_menu_text.strip()
-        and report.output_filename.strip()
     )
+    if report.handler in MAINTENANCE_REPORT_HANDLERS:
+        return has_core_settings
+    return bool(has_core_settings and report.output_filename.strip())
 
 
 def _build_output(
@@ -97,6 +132,45 @@ def _resolve_drive_folder_id(
         raw_value = raw_value or report.drive_folder_id
 
     return parse_drive_folder_id(raw_value)
+
+
+def _weekday_matches(run_date: date, expected_weekday: str) -> bool:
+    normalized = expected_weekday.strip().lower()
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+        "星期一": 0,
+        "週一": 0,
+        "星期二": 1,
+        "週二": 1,
+        "星期三": 2,
+        "週三": 2,
+        "星期四": 3,
+        "週四": 3,
+        "星期五": 4,
+        "週五": 4,
+        "星期六": 5,
+        "週六": 5,
+        "星期日": 6,
+        "星期天": 6,
+        "週日": 6,
+        "週天": 6,
+    }
+    return run_date.weekday() == weekdays.get(normalized, -1)
+
+
+def _w02_run_date_matches(configured_date: str, base_date: date) -> bool:
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(configured_date.strip(), fmt).date() == base_date
+        except ValueError:
+            continue
+    return False
 
 
 def _format_output_filename(

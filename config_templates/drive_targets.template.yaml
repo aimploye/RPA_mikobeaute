@@ -10,7 +10,7 @@ drive_targets:
   R03:
     folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1iIwcWtj4Vs5yFf4YN_iU2pnkbMNWj9sl"
   R04:
-    folder_id_or_url: ""
+    folder_id_or_url: "https://drive.google.com/drive/u/6/folders/1B3_KGkQ3nMNA0MMJxWVqLi1EvzKKZhGV"
   R05:
     folder_id_or_url: "https://drive.google.com/drive/u/6/folders/11W0BAM7l4XbI4iaIEWLbfuFJbgbln4BH"
   R06:

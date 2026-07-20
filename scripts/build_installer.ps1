@@ -21,7 +21,7 @@ $InnoArgs += $InnoScript
 
 & $InnoCompiler @InnoArgs
 
-$InstallerOutput = Join-Path $ProjectRoot "dist\installer\POSReportBotSetup-2.1.0.exe"
+$InstallerOutput = Join-Path $ProjectRoot "dist\installer\POSReportBotSetup-2.1.2.exe"
 if (-not (Test-Path $InstallerOutput)) {
   throw "Expected installer output not found: $InstallerOutput"
 }

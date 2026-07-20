@@ -7,7 +7,11 @@ from openpyxl.utils import get_column_letter
 
 from pos_report_bot.reports.r14_transformer import (
     R14TransformError,
+    _days_in_month_label,
+    load_r14_workbook_snapshot,
     parse_r13_usage_summary,
+    sync_r14_template_actual_month_state,
+    sync_r14_template_inventory,
     transform_r13_to_r14,
 )
 
@@ -33,6 +37,13 @@ def test_parse_r13_usage_summary_reads_bottom_summary_block() -> None:
     assert all(row.branch != "合計:" for row in usage.rows)
 
 
+def test_r14_previous_month_day_count_handles_month_boundaries() -> None:
+    assert _days_in_month_label("2026/01") == 31
+    assert _days_in_month_label("2026/02") == 28
+    assert _days_in_month_label("2028/02") == 29
+    assert _days_in_month_label("2026/12") == 31
+
+
 def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: Path) -> None:
     output_path = tmp_path / "診所stock status - 2026 demand planning-0608.xlsx"
 
@@ -45,7 +56,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
 
     assert result.output_path == output_path
     assert result.report_month == "2026/06"
-    assert result.report_date.date() == date(2026, 6, 8)
+    assert result.report_date.date() == date(2026, 5, 31)
     assert result.imported_rows == 208
     assert result.added_summary_items == 2
     assert result.added_branch_items == 3
@@ -83,7 +94,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
     ]
 
     summary = workbook["Summary"]
-    assert summary["F2"].value.date() == date(2026, 6, 8)
+    assert summary["F2"].value.date() == date(2026, 5, 31)
     assert [(summary.cell(2, col).value, summary.cell(3, col).value) for col in range(121, 127)] == [
         ("2026/06", "Actual"),
         ("站前4樓", "Actual"),
@@ -195,9 +206,13 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
         f"=CEILING({_col_letter(previous_actual_col)}{branch_row}*1.2,1)"
     )
     assert branch_sheet.cell(branch_row, order_col).value == (
-        f"=MAX(0,IFERROR(CEILING((BN{branch_row}/DAY($F$2))*14+BY{branch_row}-F{branch_row},1),0))"
+        f"=MAX(0,IFERROR(IF(D{branch_row}>0,"
+        f"CEILING((({_col_letter(previous_actual_col)}{branch_row}/31)*21+BY{branch_row}-F{branch_row}),D{branch_row}),"
+        f"CEILING((({_col_letter(previous_actual_col)}{branch_row}/31)*21+BY{branch_row}-F{branch_row}),1)),0))"
     )
-    assert branch_sheet.cell(branch_row, safety_col).value == f"=CEILING((BN{branch_row}/DAY($F$2))*14,1)"
+    assert branch_sheet.cell(branch_row, safety_col).value == (
+        f"=CEILING(({_col_letter(previous_actual_col)}{branch_row}/31)*14,1)"
+    )
 
     expected_visibility = {
         "站前4樓": ("BM", "BN", "BO", 67, 72),
@@ -221,7 +236,6 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
     for sheet_name in ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓"):
         branch_sheet = workbook[sheet_name]
         item_row = _first_item_row(branch_sheet)
-        actual_col = _find_month_column(branch_sheet, "2026/06")
         previous_actual_col = _find_month_column(branch_sheet, "2026/05")
         forecast_col = _find_forecast_month_column(branch_sheet)
         order_col = forecast_col + 1
@@ -233,11 +247,14 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
             f"=CEILING({_col_letter(previous_actual_col)}{item_row}*1.2,1)"
         )
         assert branch_sheet.cell(item_row, order_col).value == (
-            f"=MAX(0,IFERROR(CEILING(({_col_letter(actual_col)}{item_row}/DAY($F$2))*14+"
-            f"{_col_letter(safety_col)}{item_row}-{_col_letter(stock_col)}{item_row},1),0))"
+            f"=MAX(0,IFERROR(IF(D{item_row}>0,"
+            f"CEILING((({_col_letter(previous_actual_col)}{item_row}/31)*21+"
+            f"{_col_letter(safety_col)}{item_row}-{_col_letter(stock_col)}{item_row}),D{item_row}),"
+            f"CEILING((({_col_letter(previous_actual_col)}{item_row}/31)*21+"
+            f"{_col_letter(safety_col)}{item_row}-{_col_letter(stock_col)}{item_row}),1)),0))"
         )
         assert branch_sheet.cell(item_row, safety_col).value == (
-            f"=CEILING(({_col_letter(actual_col)}{item_row}/DAY($F$2))*14,1)"
+            f"=CEILING(({_col_letter(previous_actual_col)}{item_row}/31)*14,1)"
         )
 
     assert workbook["站前4樓"].column_dimensions["H"].hidden is True
@@ -250,6 +267,252 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
     assert workbook["站前11樓"].column_dimensions["H"].max == 44
     for hidden_col in ("H", "I", "J", "K"):
         assert workbook["忠孝健康7樓"].column_dimensions[hidden_col].hidden is True
+
+
+def test_transform_r13_to_r14_writes_weekly_google_sheet_inventory(tmp_path: Path) -> None:
+    output_path = tmp_path / "with-inventory.xlsx"
+
+    result = transform_r13_to_r14(
+        RAW_PATH,
+        TEMPLATE_PATH,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+        branch_inventory={
+            "站前4樓": {"6050010": 123},
+            "站前11樓": {"6120001": 45},
+            "忠孝7樓": {"6110181": 67},
+            "忠孝國際醫學3樓": {"6120001": 89},
+            "忠孝健康7樓": {"6120004": 10},
+        },
+        inventory_date=date(2026, 6, 9),
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    assert workbook["Summary"]["F2"].value.date() == date(2026, 6, 9)
+    expected = {
+        "站前4樓": ("6050010", 123),
+        "站前11樓": ("6120001", 45),
+        "忠孝7樓": ("6110181", 67),
+        "忠孝國際醫學3樓": ("6120001", 89),
+        "忠孝健康7樓": ("6120004", 10),
+    }
+    for sheet_name, (item_code, inventory_value) in expected.items():
+        branch_sheet = workbook[sheet_name]
+        branch_row = _find_item_row(branch_sheet, item_code)
+        stock_col = _find_branch_stock_column(branch_sheet, sheet_name)
+        forecast_col = _find_forecast_month_column(branch_sheet)
+        order_col = forecast_col + 1
+        stock_letter = _col_letter(stock_col)
+
+        assert branch_sheet.cell(branch_row, stock_col).value == inventory_value
+        assert branch_sheet.cell(branch_row, order_col).value.endswith(
+            f"-{stock_letter}{branch_row}),1)),0))"
+        )
+
+    assert _find_branch_stock_column(workbook["忠孝7樓"], "忠孝7樓") != 6
+    assert result.inventory_updated == 5
+    assert result.inventory_unmatched > 0
+
+
+def test_transform_r13_to_r14_appends_google_sheet_only_inventory_items(tmp_path: Path) -> None:
+    output_path = tmp_path / "with-new-inventory-item.xlsx"
+
+    result = transform_r13_to_r14(
+        RAW_PATH,
+        TEMPLATE_PATH,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+        branch_inventory={
+            "站前4樓": {"NEWGOOGLE001": 12},
+            "站前11樓": {},
+            "忠孝7樓": {"NEWGOOGLE001": 0},
+            "忠孝國際醫學3樓": {},
+            "忠孝健康7樓": {},
+        },
+        branch_inventory_item_names={"NEWGOOGLE001": "Google Sheet 新增品項"},
+        inventory_date=date(2026, 6, 9),
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    summary_row = _find_item_row(workbook["Summary"], "NEWGOOGLE001")
+    assert workbook["Summary"].cell(summary_row, 3).value == "Google Sheet 新增品項"
+    assert workbook["Summary"]["F2"].value.date() == date(2026, 6, 9)
+
+    for sheet_name, expected_value in {"站前4樓": 12, "忠孝7樓": 0}.items():
+        sheet = workbook[sheet_name]
+        row = _find_item_row(sheet, "NEWGOOGLE001")
+        stock_col = _find_branch_stock_column(sheet, sheet_name)
+        forecast_col = _find_forecast_month_column(sheet)
+        assert sheet.cell(row, 3).value == "Google Sheet 新增品項"
+        assert sheet.cell(row, stock_col).value == expected_value
+        assert str(sheet.cell(row, forecast_col).value).startswith("=CEILING(")
+
+    for sheet_name in ("站前11樓", "忠孝國際醫學3樓", "忠孝健康7樓"):
+        with pytest.raises(AssertionError):
+            _find_item_row(workbook[sheet_name], "NEWGOOGLE001")
+
+    assert result.added_summary_items >= 1
+    assert result.added_branch_items >= 2
+    assert result.inventory_updated == 2
+
+
+def test_sync_r14_template_inventory_updates_existing_template_file(tmp_path: Path) -> None:
+    template_path = tmp_path / "r14-template.xlsx"
+    template_path.write_bytes(TEMPLATE_PATH.read_bytes())
+
+    result = sync_r14_template_inventory(
+        template_path,
+        {
+            "站前4樓": {"6050010": 321},
+            "站前11樓": {"6120001": 654},
+        },
+    )
+
+    workbook = load_workbook(template_path, data_only=False)
+    expected = {
+        "站前4樓": ("6050010", 321),
+        "站前11樓": ("6120001", 654),
+    }
+    for sheet_name, (item_code, expected_value) in expected.items():
+        sheet = workbook[sheet_name]
+        row = _find_item_row(sheet, item_code)
+        stock_col = _find_branch_stock_column(sheet, sheet_name)
+        assert sheet.cell(row, stock_col).value == expected_value
+    assert result.template_path == template_path
+    assert result.inventory_updated == 2
+
+
+def test_sync_r14_template_inventory_writes_date_and_appends_google_sheet_only_items(tmp_path: Path) -> None:
+    template_path = tmp_path / "r14-template.xlsx"
+    template_path.write_bytes(TEMPLATE_PATH.read_bytes())
+
+    result = sync_r14_template_inventory(
+        template_path,
+        {
+            "站前4樓": {"NEWGOOGLE002": 5},
+            "站前11樓": {},
+            "忠孝7樓": {},
+            "忠孝國際醫學3樓": {},
+            "忠孝健康7樓": {"NEWGOOGLE002": 0},
+        },
+        item_names={"NEWGOOGLE002": "庫存表新增品項"},
+        inventory_date=date(2026, 6, 25),
+    )
+
+    workbook = load_workbook(template_path, data_only=False)
+    summary_row = _find_item_row(workbook["Summary"], "NEWGOOGLE002")
+    assert workbook["Summary"]["F2"].value.date() == date(2026, 6, 25)
+    assert workbook["Summary"].cell(summary_row, 3).value == "庫存表新增品項"
+    for sheet_name, expected_value in {"站前4樓": 5, "忠孝健康7樓": 0}.items():
+        sheet = workbook[sheet_name]
+        row = _find_item_row(sheet, "NEWGOOGLE002")
+        stock_col = _find_branch_stock_column(sheet, sheet_name)
+        assert sheet.cell(row, 3).value == "庫存表新增品項"
+        assert sheet.cell(row, stock_col).value == expected_value
+    assert result.added_summary_items == 1
+    assert result.added_branch_items == 2
+    assert result.inventory_updated == 2
+
+
+def test_transform_preserves_template_inventory_date_when_w01_is_not_running(tmp_path: Path) -> None:
+    refreshed_template = tmp_path / "refreshed-template.xlsx"
+    refreshed_template.write_bytes(TEMPLATE_PATH.read_bytes())
+    workbook = load_workbook(refreshed_template)
+    workbook["Summary"]["F2"] = date(2026, 6, 25)
+    workbook.save(refreshed_template)
+    output_path = tmp_path / "daily-r14-after-w01.xlsx"
+
+    result = transform_r13_to_r14(
+        RAW_PATH,
+        refreshed_template,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    assert result.report_date.date() == date(2026, 6, 25)
+    assert workbook["Summary"]["F2"].value.date() == date(2026, 6, 25)
+
+
+def test_transform_can_persist_month_state_to_runtime_template(tmp_path: Path) -> None:
+    runtime_template = tmp_path / "runtime-template.xlsx"
+    runtime_template.write_bytes(TEMPLATE_PATH.read_bytes())
+    output_path = tmp_path / "daily-r14.xlsx"
+
+    transform_r13_to_r14(
+        RAW_PATH,
+        runtime_template,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+        update_template_path=runtime_template,
+    )
+
+    output_workbook = load_workbook(output_path, data_only=False)
+    runtime_workbook = load_workbook(runtime_template, data_only=False)
+    output_summary = output_workbook["Summary"]
+    runtime_summary = runtime_workbook["Summary"]
+    output_group = _find_summary_metric_group(output_summary, total_label="2026/06", metric_label="Actual")
+    runtime_group = _find_summary_metric_group(runtime_summary, total_label="2026/06", metric_label="Actual")
+    item_row = _find_item_row(runtime_summary, "6050010")
+
+    assert runtime_group == output_group
+    assert runtime_summary.cell(item_row, runtime_group[0]).value == output_summary.cell(item_row, output_group[0]).value
+
+
+def test_sync_r14_template_actual_month_state_overwrites_existing_previous_month_values(tmp_path: Path) -> None:
+    runtime_template = tmp_path / "runtime-template.xlsx"
+    runtime_template.write_bytes(TEMPLATE_PATH.read_bytes())
+    source_report = tmp_path / "source-report.xlsx"
+    transform_r13_to_r14(
+        RAW_PATH,
+        runtime_template,
+        source_report,
+        expected_end_date=date(2026, 6, 8),
+        update_template_path=runtime_template,
+    )
+    workbook = load_workbook(runtime_template)
+    summary_group = _find_summary_metric_group(workbook["Summary"], total_label="2026/06", metric_label="Actual")
+    summary_row = _find_item_row(workbook["Summary"], "6050010")
+    workbook["Summary"].cell(summary_row, summary_group[0]).value = 999
+    branch = workbook["站前4樓"]
+    branch_col = _find_month_column(branch, "2026/06")
+    branch_row = _find_item_row(branch, "6050010")
+    branch.cell(branch_row, branch_col).value = 999
+    workbook.save(runtime_template)
+
+    result = sync_r14_template_actual_month_state(
+        runtime_template,
+        source_report,
+        "2026/06",
+        overwrite_values=True,
+    )
+
+    workbook = load_workbook(runtime_template, data_only=False)
+    summary = workbook["Summary"]
+    summary_group = _find_summary_metric_group(summary, total_label="2026/06", metric_label="Actual")
+    branch = workbook["站前4樓"]
+    branch_col = _find_month_column(branch, "2026/06")
+    assert result.updated_columns == 11
+    assert summary.cell(summary_row, summary_group[0]).value == 1
+    assert branch.cell(branch_row, branch_col).value == 1
+
+
+def test_transform_requires_template_inventory_date_when_w01_is_not_running(tmp_path: Path) -> None:
+    bad_template = tmp_path / "bad-template-date.xlsx"
+    bad_template.write_bytes(TEMPLATE_PATH.read_bytes())
+    workbook = load_workbook(bad_template)
+    workbook["Summary"]["F2"] = None
+    workbook.save(bad_template)
+
+    with pytest.raises(R14TransformError) as error:
+        transform_r13_to_r14(
+            RAW_PATH,
+            bad_template,
+            tmp_path / "bad-template-date-output.xlsx",
+            expected_end_date=date(2026, 6, 8),
+        )
+
+    assert error.value.error_code == "R14_TEMPLATE_INVENTORY_DATE_MISSING"
 
 
 def test_transform_replaces_existing_usage_month_instead_of_appending(tmp_path: Path) -> None:
@@ -292,6 +555,41 @@ def test_transform_rejects_raw_file_with_unexpected_end_date(tmp_path: Path) -> 
         )
 
     assert error.value.error_code == "R14_SOURCE_DATE_MISMATCH"
+
+
+def test_transform_allows_inventory_date_from_different_month(tmp_path: Path) -> None:
+    output_path = tmp_path / "cross-month-inventory-date.xlsx"
+
+    result = transform_r13_to_r14(
+        RAW_PATH,
+        TEMPLATE_PATH,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+        inventory_date=date(2026, 5, 31),
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    assert result.report_month == "2026/06"
+    assert result.report_date.date() == date(2026, 5, 31)
+    assert workbook["Summary"]["F2"].value.date() == date(2026, 5, 31)
+
+
+def test_r14_snapshot_uses_filename_report_date_when_inventory_date_is_different_month(tmp_path: Path) -> None:
+    output_path = tmp_path / "診所stock status - 2026 demand planning-0608.xlsx"
+    transform_r13_to_r14(
+        RAW_PATH,
+        TEMPLATE_PATH,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+        inventory_date=date(2026, 5, 31),
+    )
+
+    snapshot = load_r14_workbook_snapshot(output_path)
+    station_front_item = next(item for item in snapshot.items if item.branch == "站前4樓" and item.item_code == "6050010")
+
+    assert snapshot.report_date.date() == date(2026, 6, 8)
+    assert snapshot.report_month == "2026/06"
+    assert station_front_item.actual == 1
 
 
 def _find_item_row(sheet, item_code: str) -> int:  # type: ignore[no-untyped-def]

@@ -158,6 +158,7 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
         if report.id not in existing_report_ids:
             config.reports.append(report.model_copy(deep=True))
             existing_report_ids.add(report.id)
+    _order_reports_like_template(config, template_defaults)
 
     default_reports_by_id = {report.id: report for report in template_defaults.reports}
     for report in config.reports:
@@ -167,6 +168,9 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
         if stale_r14_only_defaults and report.handler != "placeholder":
             report.enabled = default_report.enabled
             report.upload_enabled = default_report.upload_enabled
+        if _should_replace_legacy_r04_placeholder(report, default_report):
+            _copy_report_defaults(report, default_report)
+            continue
         if _should_update_report_output_filename(report, default_report):
             report.output_filename = default_report.output_filename
 
@@ -196,15 +200,26 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
 
 def _looks_like_r14_only_stale_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> bool:
     report_ids = {report.id for report in config.reports}
+    template_report_ids = {report.id for report in template_defaults.reports}
     if report_ids != {"R14"}:
-        template_report_ids = {report.id for report in template_defaults.reports}
         enabled_ids = {report.id for report in config.reports if report.enabled}
-        if report_ids != template_report_ids or enabled_ids != {"R14"}:
+        if not report_ids.issubset(template_report_ids) or enabled_ids != {"R14"}:
             return False
         if config.google_drive.upload_enabled or config.email.enabled:
             return False
         return _drive_targets_look_like_template_or_empty(config, template_defaults)
     return set(config.drive_targets.targets) <= {"R14"}
+
+
+def _order_reports_like_template(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    template_order = {report.id: index for index, report in enumerate(template_defaults.reports)}
+    original_order = {id(report): index for index, report in enumerate(config.reports)}
+    config.reports.sort(
+        key=lambda report: (
+            template_order.get(report.id, len(template_order)),
+            original_order[id(report)],
+        )
+    )
 
 
 def _drive_targets_look_like_template_or_empty(config: ProjectConfig, template_defaults: ProjectConfig) -> bool:
@@ -247,6 +262,21 @@ def _should_update_report_output_filename(report: ReportConfig, default_report: 
     return current in LEGACY_REPORT_OUTPUT_FILENAMES.get(report.id, set()) and current != default_report.output_filename
 
 
+def _should_replace_legacy_r04_placeholder(report: ReportConfig, default_report: ReportConfig) -> bool:
+    if report.id != "R04":
+        return False
+    if default_report.handler != "appointment_record":
+        return False
+    current_filename = report.output_filename.strip()
+    return report.handler == "placeholder" or current_filename in LEGACY_REPORT_OUTPUT_FILENAMES.get("R04", set())
+
+
+def _copy_report_defaults(report: ReportConfig, default_report: ReportConfig) -> None:
+    replacement = default_report.model_copy(deep=True)
+    for field_name in ReportConfig.model_fields:
+        setattr(report, field_name, getattr(replacement, field_name))
+
+
 def _merge_app_defaults(config: ProjectConfig, template_defaults: ProjectConfig, *, stale_r14_only_defaults: bool = False) -> None:
     if _should_use_default_pos_executable_path(config.pos.executable_path):
         config.pos.executable_path = template_defaults.pos.executable_path
@@ -261,7 +291,9 @@ def _merge_app_defaults(config: ProjectConfig, template_defaults: ProjectConfig,
         config.email.recipients = list(template_defaults.email.recipients)
     _merge_pos_recovery_defaults(config, template_defaults)
     _merge_r14_transform_defaults(config, template_defaults)
+    _merge_r14_inventory_source_defaults(config, template_defaults)
     _merge_r14_email_defaults(config, template_defaults)
+    _merge_w02_order_defaults(config, template_defaults)
 
 
 def _merge_pos_recovery_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
@@ -285,6 +317,20 @@ def _merge_r14_transform_defaults(config: ProjectConfig, template_defaults: Proj
         config.r14_transform.output_extension = template_defaults.r14_transform.output_extension
 
 
+def _merge_r14_inventory_source_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    if not config.r14_inventory_source.spreadsheet_url.strip():
+        config.r14_inventory_source.spreadsheet_url = template_defaults.r14_inventory_source.spreadsheet_url
+    if not config.r14_inventory_source.sheet_name.strip():
+        config.r14_inventory_source.sheet_name = template_defaults.r14_inventory_source.sheet_name
+    if not config.r14_inventory_source.item_code_column.strip():
+        config.r14_inventory_source.item_code_column = template_defaults.r14_inventory_source.item_code_column
+    if not config.r14_inventory_source.apply_weekday.strip():
+        config.r14_inventory_source.apply_weekday = template_defaults.r14_inventory_source.apply_weekday
+    for branch, column in template_defaults.r14_inventory_source.branch_inventory_columns.items():
+        if not config.r14_inventory_source.branch_inventory_columns.get(branch, "").strip():
+            config.r14_inventory_source.branch_inventory_columns[branch] = column
+
+
 def _merge_r14_email_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
     if not config.r14_email.recipients:
         config.r14_email.recipients = list(template_defaults.r14_email.recipients)
@@ -292,6 +338,17 @@ def _merge_r14_email_defaults(config: ProjectConfig, template_defaults: ProjectC
         config.r14_email.subject_template = template_defaults.r14_email.subject_template
     if not config.r14_email.body.strip():
         config.r14_email.body = template_defaults.r14_email.body
+
+
+def _merge_w02_order_defaults(config: ProjectConfig, template_defaults: ProjectConfig) -> None:
+    if not config.w02_order.next_run_date.strip():
+        config.w02_order.next_run_date = template_defaults.w02_order.next_run_date
+    if not config.w02_order.recipients:
+        config.w02_order.recipients = list(template_defaults.w02_order.recipients)
+    if not config.w02_order.subject_template.strip():
+        config.w02_order.subject_template = template_defaults.w02_order.subject_template
+    if not config.w02_order.body.strip():
+        config.w02_order.body = template_defaults.w02_order.body
 
 
 def _should_use_default_pos_executable_path(value: str) -> bool:
@@ -366,12 +423,6 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
         uncheck = _append_missing_options(uncheck, ["不列明細"])
         other_conditions = _append_missing_options(other_conditions, ["二次篩選"])
     if report.id == "R04":
-        report.enabled = False
-        report.name = "R04 保留空號（停用）"
-        report.handler = "placeholder"
-        report.report_menu_text = ""
-        report.output_filename = ""
-        report.upload_enabled = False
         check = []
         uncheck = []
         other_conditions = []

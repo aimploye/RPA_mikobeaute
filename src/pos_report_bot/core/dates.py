@@ -7,6 +7,8 @@ def resolve_date_token(value: str, *, today: date | None = None) -> date:
 
     if normalized == "{today}":
         return base_date
+    if normalized == "{today_plus_30}":
+        return base_date + timedelta(days=30)
     if normalized == "{yesterday}":
         return base_date - timedelta(days=1)
     if normalized == "{month_start}":

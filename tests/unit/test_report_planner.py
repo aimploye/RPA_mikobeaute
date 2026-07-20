@@ -18,6 +18,7 @@ def test_dry_run_expands_default_reports_with_r06_branch_outputs() -> None:
         "R01",
         "R02",
         "R03",
+        "R04",
         "R05",
         "R06",
         "R07",
@@ -25,22 +26,145 @@ def test_dry_run_expands_default_reports_with_r06_branch_outputs() -> None:
         "R09",
         "R10",
         "R11",
-            "R12",
-            "R13",
-            "R14",
-        } == task_ids
+        "R12",
+        "R13",
+        "R14",
+    } == task_ids
+    assert "W01" not in task_ids
     assert len([output for output in plan.outputs if output.task_id == "R06"]) == 6
-    assert len(plan.outputs) == 18
+    assert len(plan.outputs) == 19
 
 
-def test_dry_run_skips_r04_placeholder_even_if_legacy_config_enables_it() -> None:
+def test_dry_run_includes_w01_between_r13_and_r14_on_configured_weekday() -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
-    r04 = next(report for report in config.reports if report.id == "R04")
-    r04.enabled = True
 
-    plan = build_dry_run_plan(config, today=date(2026, 5, 13))
+    plan = build_dry_run_plan(config, today=date(2026, 6, 12))
+    task_ids = [output.task_id for output in plan.outputs]
+    w01 = next(output for output in plan.outputs if output.task_id == "W01")
 
-    assert "R04" not in {output.task_id for output in plan.outputs}
+    assert task_ids.index("R13") < task_ids.index("W01") < task_ids.index("R14")
+    assert len(plan.outputs) == 20
+    assert w01.frequency == "weekly"
+    assert w01.handler == "r14_template_inventory_sync"
+    assert w01.output_filename == ""
+    assert w01.upload_enabled is False
+    assert w01.real_pos_validation_status == "local_transform"
+    assert plan.to_payload()["counts"]["missing_drive_targets"] == 0
+
+
+def test_dry_run_includes_w02_after_r14_on_configured_next_run_date() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+
+    plan = build_dry_run_plan(config, today=date(2026, 7, 3))
+    task_ids = [output.task_id for output in plan.outputs]
+    w02 = next(output for output in plan.outputs if output.task_id == "W02")
+
+    assert task_ids.index("R13") < task_ids.index("W01") < task_ids.index("R14") < task_ids.index("W02")
+    assert len(plan.outputs) == 21
+    assert w02.frequency == "biweekly"
+    assert w02.handler == "w02_pos_order_creation"
+    assert w02.output_filename == ""
+    assert w02.upload_enabled is False
+    assert w02.real_pos_validation_status == "pending_real_pos_validation"
+
+
+def test_dry_run_can_force_w01_on_non_configured_weekday_for_manual_runs() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+
+    plan = build_dry_run_plan(config, today=date(2026, 6, 9), force_weekly_report_ids={"W01"})
+    task_ids = [output.task_id for output in plan.outputs]
+    w01 = next(output for output in plan.outputs if output.task_id == "W01")
+
+    assert task_ids.index("R13") < task_ids.index("W01") < task_ids.index("R14")
+    assert len(plan.outputs) == 20
+    assert w01.output_filename == ""
+    assert w01.upload_enabled is False
+
+
+def test_dry_run_can_force_w02_on_non_configured_date_for_manual_runs() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+
+    plan = build_dry_run_plan(config, today=date(2026, 7, 10), force_weekly_report_ids={"W02"})
+    task_ids = [output.task_id for output in plan.outputs]
+    w02 = next(output for output in plan.outputs if output.task_id == "W02")
+
+    assert task_ids.index("R14") < task_ids.index("W02")
+    assert w02.output_filename == ""
+    assert w02.upload_enabled is False
+
+
+def test_dry_run_excludes_w02_before_next_run_date_without_manual_force() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.w02_order.next_run_date = "2026/07/17"
+    for report in config.reports:
+        report.enabled = report.id == "W02"
+
+    scheduled_plan = build_dry_run_plan(config, today=date(2026, 7, 15))
+    assert scheduled_plan.outputs == []
+
+    manual_plan = build_dry_run_plan(
+        config,
+        today=date(2026, 7, 15),
+        force_weekly_report_ids={"W02"},
+    )
+    assert [output.task_id for output in manual_plan.outputs] == ["W02"]
+
+
+def test_dry_run_selected_tasks_do_not_pull_in_enabled_w02_before_next_run_date() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.w02_order.next_run_date = "2026/07/17"
+
+    plan = build_dry_run_plan(
+        config,
+        today=date(2026, 7, 16),
+        force_weekly_report_ids={"W01", "W02"},
+        selected_task_ids={"R13"},
+    )
+
+    assert [output.task_id for output in plan.outputs] == ["R13"]
+
+
+def test_dry_run_selected_w02_can_be_explicitly_forced_before_next_run_date() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.w02_order.next_run_date = "2026/07/17"
+
+    plan = build_dry_run_plan(
+        config,
+        today=date(2026, 7, 16),
+        force_weekly_report_ids={"W02"},
+        selected_task_ids={"W02"},
+    )
+
+    assert [output.task_id for output in plan.outputs] == ["W02"]
+
+
+def test_dry_run_force_does_not_override_w02_disabled_setting() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.w02_order.enabled = False
+    for report in config.reports:
+        report.enabled = report.id == "W02"
+
+    plan = build_dry_run_plan(
+        config,
+        today=date(2026, 7, 15),
+        force_weekly_report_ids={"W02"},
+    )
+
+    assert plan.outputs == []
+
+
+def test_dry_run_includes_r04_future_30_day_appointment_report() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+
+    plan = build_dry_run_plan(config, today=date(2026, 7, 9))
+    r04 = next(output for output in plan.outputs if output.task_id == "R04")
+
+    assert r04.handler == "appointment_record"
+    assert r04.start_date == "2026/07/09"
+    assert r04.end_date == "2026/08/08"
+    assert r04.output_filename == "預約資料統計報表-20260709-20260808.xls"
+    assert r04.drive_folder_id == "1B3_KGkQ3nMNA0MMJxWVqLi1EvzKKZhGV"
+    assert r04.drive_target_status == "configured"
 
 
 def test_dry_run_output_contains_dates_filename_drive_target_and_status() -> None:
@@ -60,6 +184,13 @@ def test_dry_run_output_contains_dates_filename_drive_target_and_status() -> Non
     assert r01.drive_folder_id == "1DibytnRl9054M65TMUVfHNSTIAeQ-ghF"
     assert r01.drive_target_status == "configured"
     assert r01.real_pos_validation_status == "pending_real_pos_validation"
+
+    r04 = next(output for output in plan.outputs if output.task_id == "R04")
+    assert r04.start_date == "2026/05/13"
+    assert r04.end_date == "2026/06/12"
+    assert r04.output_filename == "預約資料統計報表-20260513-20260612.xls"
+    assert r04.drive_folder_id == "1B3_KGkQ3nMNA0MMJxWVqLi1EvzKKZhGV"
+    assert r04.drive_target_status == "configured"
 
     assert r06_n003.start_date == "2024/01/01"
     assert r06_n003.end_date == "2026/05/12"
@@ -93,6 +224,7 @@ def test_default_output_filenames_match_requested_report_naming_rules() -> None:
         "R01": "課程服務明細表-20260501-20260512-全部.xls",
         "R02": "商品銷售明細表-20260501-20260512-全部.xls",
         "R03": "商品銷售明細表-20260501-20260512-全部.xls",
+        "R04": "預約資料統計報表-20260513-20260612.xls",
         "R05": "商品課程服務明細表-20260501-20260512-僅新客.xls",
         "R06_N001": "會員剩餘點數殘值統計表-清單檢視20260513-站前4F.xls",
         "R06_N002": "會員剩餘點數殘值統計表-清單檢視20260513-站前11F.xls",

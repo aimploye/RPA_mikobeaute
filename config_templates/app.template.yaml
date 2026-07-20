@@ -16,6 +16,8 @@ pos:
   window_title_regex: ""
   backend: "auto"   # auto | uia | win32
   startup_wait_seconds: 20
+  startup_ini_selection_enabled: true
+  startup_ini_profile: "c:\\tkhspa\\tkhspa-測試區.ini"
   run_as_admin: false
   close_after_run: false
 
@@ -78,6 +80,26 @@ r14_email:
 
     RPA程式
 
+w02_order:
+  enabled: true
+  next_run_date: "2026/07/03"
+  recipients:
+    - "joe.little7208@gmail.com"
+    - "mickey.chen@mikobeaute.com"
+    - "rae.hsu@mikobeaute.com"
+    - "miko_03@mikobeaute.com"
+    - "bbone_pu@bebetterone.com"
+  cc: []
+  subject_template: "W02 下單異常通知 {date}"
+  body: |
+    Hi,
+
+    W02 自動下單流程有需要人工確認的品項，請查看下方明細。
+
+    RPA程式
+  pos_submission_enabled: false
+  diagnostic_mode: false
+
 scheduler:
   enabled: false
   daily_time: "01:00"
@@ -94,7 +116,7 @@ pos_update:
   action: "click_yes_and_restart"
   expected_update_weekday: "Thursday"
   restart_wait_seconds: 180
-  max_restart_wait_seconds: 600
+  max_restart_wait_seconds: 300
   resume_unfinished_tasks: true
 
 pos_recovery:
@@ -113,3 +135,17 @@ r14_transform:
   raw_search_dir: ""
   raw_filename_glob: "診所stock status - * demand planning-*-rawdata.xls"
   output_extension: ".xlsx"
+
+r14_inventory_source:
+  enabled: true
+  spreadsheet_url: "https://docs.google.com/spreadsheets/d/1LfKl6LevlSuk8-OVQZNp8VFaTHyAB1NTR7Y1bpgEWUE/edit?gid=651674627#gid=651674627"
+  spreadsheet_id: ""
+  sheet_name: "Summary"
+  item_code_column: "B"
+  branch_inventory_columns:
+    站前4樓: "G"
+    站前11樓: "H"
+    忠孝7樓: "I"
+    忠孝國際醫學3樓: "J"
+    忠孝健康7樓: "K"
+  apply_weekday: "Friday"

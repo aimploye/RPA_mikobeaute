@@ -17,9 +17,9 @@ pos:
   backend: "auto"   # auto | uia | win32
   startup_wait_seconds: 20
   startup_ini_selection_enabled: true
-  startup_ini_profile: "c:\\tkhspa\\tkhspa-測試區.ini"
+  startup_ini_profile: "c:\\tkhspa\\tkhspa -測試.ini"
   run_as_admin: false
-  close_after_run: false
+  close_after_run: true
 
 login:
   required: true
@@ -132,6 +132,9 @@ pos_recovery:
 r14_transform:
   template_path: ""
   template_search_dir: "C:\\ProgramData\\POSReportBot\\templates"
+  template_drive_folder_id_or_url: ""
+  template_drive_filename_glob: "診所stock status - * demand planning-*.xlsx"
+  template_drive_fallback_to_local: false
   raw_search_dir: ""
   raw_filename_glob: "診所stock status - * demand planning-*-rawdata.xls"
   output_extension: ".xlsx"
@@ -148,4 +151,5 @@ r14_inventory_source:
     忠孝7樓: "I"
     忠孝國際醫學3樓: "J"
     忠孝健康7樓: "K"
+    忠孝預防醫學3樓: "L"
   apply_weekday: "Friday"

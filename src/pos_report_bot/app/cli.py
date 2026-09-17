@@ -9,14 +9,12 @@ from typing import Any, Sequence
 
 from pos_report_bot import __version__
 from pos_report_bot.app.automation_runner import (
-    LOCAL_REPORT_HANDLERS,
     AutomationRunner,
-    forced_weekly_report_ids_for_run_source,
 )
 from pos_report_bot.config.loader import load_project_config
 from pos_report_bot.config.writer import user_config_path
 from pos_report_bot.core.summary import build_dry_run_summary, write_run_summary
-from pos_report_bot.pos.report_automation import ReportAutomationError, ReportWindowAutomator
+from pos_report_bot.pos.report_automation import ReportWindowAutomator
 from pos_report_bot.pos.save_as_handler import (
     OverwritePolicy,
     SaveAsDialogTimeoutError,
@@ -30,7 +28,10 @@ from pos_report_bot.scheduler.windows_task_scheduler import (
     install_task,
     remove_task,
 )
-from pos_report_bot.startup_diagnostics import write_scheduler_startup_event
+from pos_report_bot.startup_diagnostics import (
+    write_manual_task_startup_event,
+    write_scheduler_startup_event,
+)
 from pos_report_bot.storage.runtime_paths import RuntimePaths
 
 
@@ -67,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-source", default="manual_cli", help=argparse.SUPPRESS)
     parser.add_argument("--run-task", help="在已開啟的 SPA-POS 上執行單一報表任務，例如 R01")
     parser.add_argument("--gui", action="store_true", help="啟動 PySide6 設定中心")
+    parser.add_argument(
+        "--self-test-gui-runtime",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--today", help="測試用日期，格式 YYYY-MM-DD")
     parser.add_argument("--write-summary", action="store_true", help="將 dry-run 結果寫成 run_summary JSON")
     parser.add_argument("--summary-dir", type=Path, help="run_summary JSON 輸出資料夾")
@@ -87,10 +93,33 @@ def launch_settings_gui(config: Any, *, settings_path: Path) -> int:
     return _launch_settings_gui(config, settings_path=settings_path)
 
 
+def _self_test_gui_runtime() -> int:
+    """Import every native Qt layer needed by the settings GUI.
+
+    This intentionally runs before configuration loading so a packaged executable
+    can distinguish a broken frozen Qt runtime from a user configuration problem.
+    """
+    import shiboken6
+    from PySide6.QtCore import QCoreApplication, qVersion
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
+
+    required_runtime_objects = (
+        shiboken6.Shiboken,
+        QCoreApplication,
+        QGuiApplication,
+        QApplication,
+    )
+    return 0 if qVersion() and all(required_runtime_objects) else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(raw_args)
+
+    if args.self_test_gui_runtime:
+        return _self_test_gui_runtime()
 
     if args.gui or not raw_args:
         config = load_project_config(args.config)
@@ -142,113 +171,156 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _run_single_pos_task(config_path: Path, task_id: str, *, today: str | None = None) -> int:
-    run_date = date.fromisoformat(today) if today else date.today()
-    config = load_project_config(config_path)
-    report = next((item for item in config.reports if item.id == task_id), None)
-    if report is not None:
-        for item in config.reports:
-            item.enabled = item.id == task_id
-    run_source = "manual_single_task"
-    plan = build_dry_run_plan(
-        config,
-        today=run_date,
-        force_weekly_report_ids=forced_weekly_report_ids_for_run_source(run_source),
-        selected_task_ids={task_id},
+    startup_path = write_manual_task_startup_event(
+        config_path=config_path,
+        task_id=task_id,
+        run_date=today,
+        phase="cli_entry",
     )
-    runtime_paths = RuntimePaths.from_config(config, run_date=run_date)
-    output = next((item for item in plan.outputs if item.task_id == task_id), None)
-    if output is None or report is None:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error_code": "TASK_NOT_FOUND",
-                    "message": f"找不到任務：{task_id}",
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+    try:
+        run_date = date.fromisoformat(today) if today else date.today()
+    except ValueError as exc:
+        failure_path = write_manual_task_startup_event(
+            config_path=config_path,
+            task_id=task_id,
+            run_date=today,
+            phase="invalid_run_date",
+            error_code="INVALID_RUN_DATE",
+            message=str(exc),
+            exc=exc,
+        )
+        _write_single_task_payload(
+            {
+                "ok": False,
+                "task_id": task_id,
+                "error_code": "INVALID_RUN_DATE",
+                "message": f"無效的執行日期：{today}",
+                "startup_diagnostic_path": _diagnostic_path_text(failure_path or startup_path),
+            }
         )
         return 1
 
-    if report.handler in LOCAL_REPORT_HANDLERS:
-        for item in config.reports:
-            item.enabled = item.id == task_id
+    try:
+        config = load_project_config(config_path)
+    except Exception as exc:
+        failure_path = write_manual_task_startup_event(
+            config_path=config_path,
+            task_id=task_id,
+            run_date=run_date.isoformat(),
+            phase="config_load_failed",
+            error_code="CONFIG_LOAD_FAILED",
+            message=str(exc),
+            exc=exc,
+        )
+        _write_single_task_payload(
+            {
+                "ok": False,
+                "task_id": task_id,
+                "error_code": "CONFIG_LOAD_FAILED",
+                "message": f"讀取設定檔失敗：{exc}",
+                "startup_diagnostic_path": _diagnostic_path_text(failure_path or startup_path),
+            }
+        )
+        return 1
+
+    startup_path = write_manual_task_startup_event(
+        config_path=config_path,
+        task_id=task_id,
+        run_date=run_date.isoformat(),
+        phase="config_loaded",
+        config=config,
+    ) or startup_path
+    report = next((item for item in config.reports if item.id == task_id), None)
+    if report is None:
+        finish_path = write_manual_task_startup_event(
+            config_path=config_path,
+            task_id=task_id,
+            run_date=run_date.isoformat(),
+            phase="task_not_found",
+            config=config,
+            error_code="TASK_NOT_FOUND",
+            message=f"找不到任務：{task_id}",
+        )
+        _write_single_task_payload(
+            {
+                "ok": False,
+                "task_id": task_id,
+                "error_code": "TASK_NOT_FOUND",
+                "message": f"找不到任務：{task_id}",
+                "startup_diagnostic_path": _diagnostic_path_text(finish_path or startup_path),
+            }
+        )
+        return 1
+
+    for item in config.reports:
+        item.enabled = item.id == task_id
+    try:
         summary = AutomationRunner(
             config,
             settings_path=config_path,
             app_version=__version__,
-            run_source=run_source,
+            run_source="manual_single_task",
             run_date=run_date,
+            selected_task_ids={task_id},
         ).run()
-        payload = {
-            "ok": summary.ok,
-            "completed": summary.completed,
-            "skipped": summary.skipped,
-            "total": summary.total,
-            "message": summary.message,
-            "error_code": summary.error_code,
-            "details": summary.details,
-            "failures": [asdict(failure) for failure in summary.failures],
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0 if summary.ok else 1
-
-    try:
-        window = connect_pos_window(
-            window_title_contains=config.pos.window_title_contains,
-            backend=config.pos.backend,
+    except Exception as exc:
+        failure_path = write_manual_task_startup_event(
+            config_path=config_path,
+            task_id=task_id,
+            run_date=run_date.isoformat(),
+            phase="runner_failed",
+            config=config,
+            error_code="RUNNER_FAILED",
+            message=str(exc),
+            exc=exc,
         )
-        handler = WindowsSaveAsHandler(
-            dialog_title_contains=config.save_as.dialog_title_contains,
-            filename_label=config.save_as.filename_label,
-            save_button_text=config.save_as.save_button_text,
-            default_extension=config.save_as.default_extension,
-            overwrite_policy=OverwritePolicy(config.save_as.overwrite_policy),
-            wait_timeout_seconds=config.save_as.wait_timeout_seconds,
-            stable_seconds=config.save_as.stable_seconds,
+        _write_single_task_payload(
+            {
+                "ok": False,
+                "task_id": task_id,
+                "completed": 0,
+                "skipped": 0,
+                "total": 0,
+                "message": f"單一報表執行發生未處理錯誤：{exc}",
+                "error_code": "RUNNER_FAILED",
+                "details": str(config_path),
+                "startup_diagnostic_path": _diagnostic_path_text(failure_path or startup_path),
+                "failures": [],
+            }
         )
-        result = ReportWindowAutomator(
-            window,
-            save_as_handler=handler,
-            output_dir=runtime_paths.downloads_dir,
-            diagnostic_dir=runtime_paths.screenshots_dir,
-            log_dir=runtime_paths.logs_dir,
-            runtime_metadata={
-                "app_version": __version__,
-                "config_path": str(config_path),
-                "configured_backend": config.pos.backend,
-                "run_date": run_date.isoformat(),
-                "downloads_dir": str(runtime_paths.downloads_dir),
-                "logs_dir": str(runtime_paths.logs_dir),
-                "screenshots_dir": str(runtime_paths.screenshots_dir),
-                "state_dir": str(runtime_paths.state_dir),
-            },
-        ).download_report(output, report)
-    except UiProbeError as exc:
-        payload = {
-            "ok": False,
-            "task_id": task_id,
-            "error_code": "POS_CONNECTION_FAILED",
-            "message": str(exc),
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 1
-    except ReportAutomationError as exc:
-        payload = {
-            "ok": False,
-            "task_id": task_id,
-            "error_code": exc.error_code,
-            "message": exc.message,
-            "actions": exc.actions,
-            "diagnostic_path": str(exc.diagnostic_path) if exc.diagnostic_path else None,
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 1
 
-    print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
-    return 0 if result.ok else 1
+    finish_path = write_manual_task_startup_event(
+        config_path=config_path,
+        task_id=task_id,
+        run_date=run_date.isoformat(),
+        phase="runner_finished",
+        config=config,
+        error_code=summary.error_code,
+        message=summary.message,
+    )
+    payload = {
+        "ok": summary.ok,
+        "task_id": task_id,
+        "completed": summary.completed,
+        "skipped": summary.skipped,
+        "total": summary.total,
+        "message": summary.message,
+        "error_code": summary.error_code,
+        "details": summary.details,
+        "startup_diagnostic_path": _diagnostic_path_text(finish_path or startup_path),
+        "failures": [asdict(failure) for failure in summary.failures],
+    }
+    _write_single_task_payload(payload)
+    return 0 if summary.ok else 1
+
+
+def _diagnostic_path_text(path: Path | None) -> str | None:
+    return str(path) if path is not None else None
+
+
+def _write_single_task_payload(payload: dict[str, object]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _run_enabled_pos_tasks(config_path: Path, *, run_source: str = "manual_cli") -> int:
@@ -318,6 +390,7 @@ def _run_enabled_pos_tasks(config_path: Path, *, run_source: str = "manual_cli")
         run_source=run_source,
         phase="runner_finished",
         config=config,
+        error_code=summary.error_code,
         message=summary.message,
     )
     payload = {

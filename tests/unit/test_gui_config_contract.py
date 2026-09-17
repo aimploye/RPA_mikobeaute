@@ -61,4 +61,4 @@ def test_settings_pages_reflect_loaded_config_counts() -> None:
     reports = next(page for page in pages if page.page_id == "reports")
 
     assert branches.badge == "已啟用 6 項"
-    assert reports.badge == "已啟用 15 項"
+    assert reports.badge == "已啟用 16 項"

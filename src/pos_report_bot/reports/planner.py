@@ -38,12 +38,24 @@ def build_dry_run_plan(
     for report in config.reports:
         if selected_task_ids is not None and report.id not in selected_task_ids:
             continue
-        if not _should_include_report(config, report, base_date, force_weekly_report_ids=forced_weekly):
+        if not _should_include_report(
+            config,
+            report,
+            base_date,
+            force_weekly_report_ids=forced_weekly,
+            explicitly_selected=selected_task_ids is not None,
+        ):
             continue
         if report.branch_mode == "each_branch":
-            for branch in config.branches:
-                if branch.enabled:
-                    outputs.append(_build_output(config, report, base_date, branch=branch))
+            branches = [branch for branch in config.branches if branch.enabled]
+            if selected_task_ids is not None and not branches:
+                # A checked one-run task is an explicit override of scheduling
+                # flags.  When every configured branch is schedule-disabled,
+                # run all configured branches once instead of silently
+                # shrinking the selected task to zero outputs.
+                branches = list(config.branches)
+            for branch in branches:
+                outputs.append(_build_output(config, report, base_date, branch=branch))
         else:
             outputs.append(_build_output(config, report, base_date, branch=None))
 
@@ -56,8 +68,9 @@ def _should_include_report(
     base_date: date,
     *,
     force_weekly_report_ids: set[str],
+    explicitly_selected: bool = False,
 ) -> bool:
-    if not report.enabled or not _is_executable_report(report):
+    if (not report.enabled and not explicitly_selected) or not _is_executable_report(report):
         return False
     if report.id == "W02":
         if not config.w02_order.enabled:
@@ -65,6 +78,11 @@ def _should_include_report(
         if report.id in force_weekly_report_ids:
             return True
         return _w02_run_date_matches(config.w02_order.next_run_date, base_date)
+    if explicitly_selected:
+        # "本次執行" is an explicit one-run command. Frequency and weekday
+        # control scheduled planning only; they must not silently discard a
+        # task the operator selected manually.
+        return True
     if report.id in force_weekly_report_ids:
         return True
     if report.frequency == "weekly":

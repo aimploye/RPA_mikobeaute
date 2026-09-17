@@ -20,7 +20,7 @@ def test_save_project_config_writes_reloadable_yaml_without_secret_fields(tmp_pa
 
     assert reloaded.drive_targets.targets["R01"].folder_id_or_url == "folder_123"
     assert len(reloaded.reports) == 16
-    assert sum(1 for report in reloaded.reports if report.enabled) == 15
+    assert sum(1 for report in reloaded.reports if report.enabled) == 16
     assert len(reloaded.branches) == 6
     assert reloaded.r14_email.recipients == ["r14-save@example.com"]
     assert reloaded.r14_email.subject_template == "R14 {date}"

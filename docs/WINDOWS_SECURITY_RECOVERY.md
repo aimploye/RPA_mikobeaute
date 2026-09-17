@@ -6,6 +6,25 @@ POS 主機安裝或啟動 POSReportBot 時，如果 Windows Defender 顯示威�
 
 ## 立即處置
 
+若症狀是「按下立即執行後 POSReportBot 視窗直接消失」，先不要關閉 Defender。以 PowerShell 執行安裝包內的唯讀證據收集器：
+
+```powershell
+& "C:\Program Files (x86)\POSReportBot\tools\collect_windows_runtime_evidence.ps1" -LookbackHours 24
+```
+
+它會把執行檔 SHA256、Authenticode 狀態，以及與 POSReportBot 有關的 Defender、Code Integrity、Application Error 事件寫到：
+
+```text
+C:\ProgramData\POSReportBot\logs\YYYYMMDD\windows_runtime_evidence_*.json
+```
+
+新版程式還會在同一個日期資料夾寫出：
+
+- `automation_runtime_*.jsonl`：每個 POS 連線／登入／ready／下載邊界，逐筆 flush 到磁碟。
+- `automation_native_crash_*.log`：若 Python 收到可捕捉的原生 fatal signal，保留所有 thread stack。
+
+若 `automation_runtime` 最後停在某個 `*_start`、沒有對應 `*_finished`，就能定位程序消失的確切邊界。若安全事件明確記錄封鎖或隔離，才進入下方簽章／IT 放行流程。
+
 1. 停止使用目前這包 installer / exe。
 2. 用系統管理員身分開啟 PowerShell。
 3. 先清除可能已建立的排程：
@@ -54,6 +73,8 @@ C:\Program Files\POSReportBot
 - Windows Defender 掃描結果或 IT 審核紀錄。
 
 正式 POS 主機不應安裝未簽章 dev build。若企業 IT 需要放行，應採最小範圍、可稽核的方式：以已簽章 publisher、指定檔案 hash 或指定安裝檔處理，不要關閉整台主機的安全防護。
+
+目前專案經使用者明確決定暫緩憑證，因此 build script 允許產生未簽章 artifact。這是暫時的部署選擇，不代表未簽章檔已取得 Windows 信任；若主機恢復防護，仍應以上述 SHA256、事件紀錄與最小範圍規則重新驗證。
 
 ## 發行根因修正
 

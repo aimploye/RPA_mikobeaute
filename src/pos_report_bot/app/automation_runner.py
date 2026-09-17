@@ -1,8 +1,9 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from html import escape
 from importlib import import_module
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,14 +13,32 @@ import shutil
 import subprocess
 import stat
 import sys
+import traceback
 from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Any, Literal
+from uuid import uuid4
+import zipfile
 
 from pos_report_bot.config.models import EmailSettings, ProjectConfig
 from pos_report_bot.core.dates import resolve_date_token
+from pos_report_bot.core.runtime_diagnostics import (
+    RuntimePhaseJournal,
+    process_crash_diagnostics,
+    windows_com_apartment,
+)
+from pos_report_bot.core.run_lock import (
+    AutomationRunAlreadyActiveError,
+    automation_run_lock,
+)
 from pos_report_bot.config.writer import save_project_config
-from pos_report_bot.drive.uploader import DriveUploader, GoogleDriveUploader
+from pos_report_bot.drive.uploader import (
+    DriveTemplateDownloadResult,
+    DriveTemplateDownloader,
+    DriveUploader,
+    GoogleDriveTemplateDownloader,
+    GoogleDriveUploader,
+)
 from pos_report_bot.google.gmail import GmailOAuthSender
 from pos_report_bot.google.oauth import (
     GOOGLE_DRIVE_PROFILE,
@@ -42,6 +61,7 @@ from pos_report_bot.pos.report_automation import (
 from pos_report_bot.pos.save_as_handler import OverwritePolicy, WindowsSaveAsHandler
 from pos_report_bot.pos.ui_probe import (
     UiProbeError,
+    capture_window_screenshot,
     connect_pos_window,
     desktop_window_snapshots,
     probe_window_controls,
@@ -52,17 +72,28 @@ from pos_report_bot.pos.w02_order_automation import W02PosOrderAutomator
 from pos_report_bot.reports.models import PlannedOutput
 from pos_report_bot.reports.planner import build_dry_run_plan
 from pos_report_bot.reports.r14_transformer import (
+    R13UsageData,
     R14_BRANCH_SHEETS,
     R14TransformError,
     load_r14_workbook_snapshot,
     parse_r13_usage_summary,
+    r14_template_actual_month_state_issues,
     r14_template_has_actual_month_state,
     sync_r14_template_actual_month_state,
     sync_r14_template_inventory,
     transform_r13_to_r14,
+    transform_r13_usage_to_r14,
+    validate_r14_template_file,
+)
+from pos_report_bot.storage.r13_no_data import (
+    R13NoDataMarker,
+    clear_r13_no_data_marker,
+    load_r13_no_data_marker,
+    r13_no_data_marker_path,
+    write_r13_no_data_marker,
 )
 from pos_report_bot.reports.w02_order_builder import W02OrderIssue, build_w02_order_plan
-from pos_report_bot.storage.run_state import RunStateStore
+from pos_report_bot.storage.run_state import RunStateStore, write_text_atomic
 from pos_report_bot.storage.runtime_paths import RuntimePaths, runtime_date_folder
 
 
@@ -74,7 +105,19 @@ POS_LOGIN_FAILURE_TEXTS = ("帳號輸入錯誤", "查無此帳號", "帳號或�
 UI_TEXT_NOISE_RE = re.compile(r"[\s　&()（）]+")
 POS_STARTUP_INI_COMBO_AUTOMATION_ID = "M_INI"
 POS_STARTUP_INI_CONFIRM_AUTOMATION_ID = "B_INIOK"
-POS_STARTUP_INI_KNOWN_SUFFIXES = ("tkhspa-正式區.ini", "tkhspa-測試區.ini")
+POS_STARTUP_INI_KNOWN_SUFFIXES = (
+    "tkhspa-正式.ini",
+    "tkhspa -測試.ini",
+    "tkhspa-正式區.ini",
+    "tkhspa-測試區.ini",
+)
+POS_STARTUP_INI_PROFILE_ALIASES = {
+    "tkhspa-正式區.ini": ("tkhspa-正式.ini",),
+    "tkhspa-正式.ini": ("tkhspa-正式區.ini",),
+    "tkhspa-測試區.ini": ("tkhspa -測試.ini", "tkhspa-測試.ini"),
+    "tkhspa -測試.ini": ("tkhspa-測試區.ini", "tkhspa-測試.ini"),
+    "tkhspa-測試.ini": ("tkhspa -測試.ini", "tkhspa-測試區.ini"),
+}
 R14_OUTPUT_REPORT_DATE_RE = re.compile(r"(?P<year>\d{4})\s+demand planning-(?P<mmdd>\d{4})(?:_\d+)?\.xlsx$", re.IGNORECASE)
 LOCAL_REPORT_HANDLERS = {
     "r14_inventory_demand_planning",
@@ -93,6 +136,7 @@ MANUAL_FORCE_WEEKLY_RUN_SOURCES = {"gui_manual", "manual_single_task"}
 MANUAL_FORCE_WEEKLY_REPORT_IDS = {"W01", "W02"}
 VISIBLE_CONTROL_SCAN_MAX_DEPTH = 6
 VISIBLE_CONTROL_SCAN_MAX_CONTROLS = 300
+POS_SESSION_PROFILE_MARKER_FILENAME = "pos_session_profile.json"
 
 ProgressEventType = Literal[
     "start",
@@ -122,6 +166,7 @@ class ReportRunFailure:
     error_code: str
     message: str
     diagnostic_path: str | None = None
+    evidence_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +187,8 @@ class AutomationRunSummary:
     details: str | None = None
     skipped: int = 0
     failures: tuple[ReportRunFailure, ...] = ()
+    evidence_bundle_path: str | None = None
+    evidence_bundle_error: str | None = None
 
 
 SaveAsHandlerFactory = Callable[[ProjectConfig], Any]
@@ -151,6 +198,7 @@ ProgressCallback = Callable[[AutomationProgress], None]
 PosRecoveryFunc = Callable[[ProjectConfig, ProgressCallback | None], Any]
 PosLoginSecretProvider = Callable[[], str | None]
 DriveUploaderFactory = Callable[[ProjectConfig], DriveUploader]
+R14TemplateDownloaderFactory = Callable[[ProjectConfig], DriveTemplateDownloader]
 GmailSenderFactory = Callable[[ProjectConfig], Any]
 R14InventoryClientFactory = Callable[[ProjectConfig], Any]
 W02PosOrderAutomatorFactory = Callable[..., Any]
@@ -172,6 +220,7 @@ class AutomationRunner:
         pos_recovery_func: PosRecoveryFunc | None = None,
         pos_login_secret_provider: PosLoginSecretProvider | None = None,
         drive_uploader_factory: DriveUploaderFactory | None = None,
+        r14_template_downloader_factory: R14TemplateDownloaderFactory | None = None,
         r14_inventory_client_factory: R14InventoryClientFactory | None = None,
         w02_pos_order_automator_factory: W02PosOrderAutomatorFactory | None = None,
         run_state_store: RunStateStore | None = None,
@@ -193,6 +242,9 @@ class AutomationRunner:
         self.pos_recovery_func = pos_recovery_func or self._recover_pos_session
         self.pos_login_secret_provider = pos_login_secret_provider
         self.drive_uploader_factory = drive_uploader_factory or self._build_google_drive_uploader
+        self.r14_template_downloader_factory = (
+            r14_template_downloader_factory or self._build_google_drive_template_downloader
+        )
         self.r14_inventory_client_factory = r14_inventory_client_factory or self._build_r14_inventory_client
         self.w02_pos_order_automator_factory = w02_pos_order_automator_factory or W02PosOrderAutomator
         self.run_state_store = run_state_store
@@ -201,12 +253,110 @@ class AutomationRunner:
         self.selected_task_ids = None if selected_task_ids is None else set(selected_task_ids)
         self._last_visible_control_names: list[str] = []
         self._last_connected_backend = "unknown"
+        self._last_pos_window: Any | None = None
         self._r14_runtime_template_path: Path | None = None
+        self._r14_cloud_template_download_result: DriveTemplateDownloadResult | None = None
         self._r14_synced_inventory_date: date | datetime | None = None
+        self._w02_issue_notification_sent = False
         self._latest_r13_output_path: Path | None = None
         self._latest_r14_output_path: Path | None = None
+        self._pos_launch_process: Any | None = None
+        self._pos_launch_evidence: dict[str, Any] = {}
+        self._runtime_phase_journal: RuntimePhaseJournal | None = None
+        self._native_crash_path: Path | None = None
+        self._active_run_state_store: RunStateStore | None = None
+        self._runtime_run_started_at: datetime | None = None
+        self._pos_startup_ini_profile_verified_this_run: str | None = None
+        self._pos_startup_ini_process_id_verified_this_run: int | None = None
+        self._pos_startup_ini_process_created_at_verified_this_run: str | None = None
+        self._active_pos_session_profile: str | None = None
+        self._active_pos_session_profile_evidence = "unverified"
+        self._preserve_pos_after_run_reason: str | None = None
 
     def run(self, *, on_progress: ProgressCallback | None = None) -> AutomationRunSummary:
+        self._runtime_run_started_at = datetime.now(tz=UTC)
+        self._native_crash_path = None
+        self._active_run_state_store = None
+        self._runtime_phase_journal = None
+        self._pos_startup_ini_profile_verified_this_run = None
+        self._pos_startup_ini_process_id_verified_this_run = None
+        self._pos_startup_ini_process_created_at_verified_this_run = None
+        self._active_pos_session_profile = None
+        self._active_pos_session_profile_evidence = "unverified"
+        self._preserve_pos_after_run_reason = None
+        self._w02_issue_notification_sent = False
+        try:
+            with automation_run_lock(
+                state_dir=self.config.app.state_dir,
+                owner={
+                    "app_version": self.app_version,
+                    "run_source": self.run_source,
+                    "run_date": self.run_date.isoformat(),
+                    "selected_task_ids": (
+                        sorted(self.selected_task_ids) if self.selected_task_ids is not None else None
+                    ),
+                },
+            ):
+                with process_crash_diagnostics(self.runtime_paths.logs_dir) as native_crash_path:
+                    self._native_crash_path = native_crash_path
+                    with windows_com_apartment():
+                        summary = self._run(on_progress=on_progress)
+                    if not summary.ok:
+                        return self._finalize_failed_summary(summary)
+                    return summary
+        except AutomationRunAlreadyActiveError as exc:
+            details = json.dumps(exc.owner, ensure_ascii=False, default=str) if exc.owner else None
+            diagnostic_path = self._write_outer_failure_diagnostic(
+                error_code="AUTOMATION_ALREADY_RUNNING",
+                message="已有另一個 POSReportBot 自動化正在執行；本次未操作 POS。",
+                details=details,
+            )
+            failure = ReportRunFailure(
+                task_id="RUNNER",
+                output_filename="",
+                error_code="AUTOMATION_ALREADY_RUNNING",
+                message="已有另一個 POSReportBot 自動化正在執行；本次未操作 POS。",
+                diagnostic_path=str(diagnostic_path) if diagnostic_path is not None else None,
+            )
+            summary = AutomationRunSummary(
+                ok=False,
+                completed=0,
+                total=0,
+                error_code="AUTOMATION_ALREADY_RUNNING",
+                message="已有另一個 POSReportBot 自動化正在執行；本次未操作 POS。",
+                details=details,
+                failures=(failure,),
+            )
+            return self._finalize_failed_summary(summary)
+        except Exception as exc:
+            message = _redact_evidence_text(
+                f"POSReportBot 執行框架在建立任務或初始化執行狀態時失敗：{type(exc).__name__}: {exc}"
+            )
+            diagnostic_path = self._write_outer_failure_diagnostic(
+                error_code="RUNNER_INITIALIZATION_FAILED",
+                message=message,
+                details=traceback.format_exc(),
+            )
+            failure = ReportRunFailure(
+                task_id="RUNNER",
+                output_filename="",
+                error_code="RUNNER_INITIALIZATION_FAILED",
+                message=message,
+                diagnostic_path=str(diagnostic_path) if diagnostic_path is not None else None,
+            )
+            return self._finalize_failed_summary(
+                AutomationRunSummary(
+                    ok=False,
+                    completed=0,
+                    total=0,
+                    error_code="RUNNER_INITIALIZATION_FAILED",
+                    message=message,
+                    details=message,
+                    failures=(failure,),
+                )
+            )
+
+    def _run(self, *, on_progress: ProgressCallback | None = None) -> AutomationRunSummary:
         # These paths are provenance for this run only.  Reusing them across two
         # runs would allow a failed/new run to consume an older successful file.
         self._latest_r13_output_path = None
@@ -230,7 +380,45 @@ class AutomationRunner:
             )
 
         run_state_store = self.run_state_store or RunStateStore.default_for_config(self.config, run_date=self.run_date)
-        run_state_store.start_run(plan, app_version=self.app_version)
+        snapshot = run_state_store.start_run(plan, app_version=self.app_version)
+        self._active_run_state_store = run_state_store
+        self._runtime_run_started_at = snapshot.started_at
+        self._runtime_phase_journal = RuntimePhaseJournal(
+            self.runtime_paths.logs_dir,
+            execution_id=snapshot.execution_id,
+        )
+        self._write_runtime_phase(
+            "run_started",
+            app_version=self.app_version,
+            run_source=self.run_source,
+            configured_backend=self.config.pos.backend,
+            output_count=len(plan.outputs),
+            selected_task_ids=(sorted(self.selected_task_ids) if self.selected_task_ids is not None else None),
+            planned_task_ids=sorted({output.task_id for output in plan.outputs}),
+            disabled_but_explicitly_selected_task_ids=sorted(
+                report.id
+                for report in self.config.reports
+                if self.selected_task_ids is not None
+                and report.id in self.selected_task_ids
+                and not report.enabled
+            ),
+            all_branches_disabled_but_explicitly_selected_task_ids=sorted(
+                report.id
+                for report in self.config.reports
+                if self.selected_task_ids is not None
+                and report.id in self.selected_task_ids
+                and report.branch_mode == "each_branch"
+                and bool(self.config.branches)
+                and not any(branch.enabled for branch in self.config.branches)
+            ),
+            selected_task_plan_diagnostics=self._selected_task_plan_diagnostics(
+                plan.outputs
+            ),
+            run_state_path=str(run_state_store.path),
+            run_state_primary_path=str(run_state_store.primary_path),
+            run_state_recovery_reason=run_state_store.recovery_reason,
+            run_state_recovery_cleanup_warning=run_state_store.recovery_cleanup_warning,
+        )
 
         upload_preflight_failures = self._google_drive_upload_preflight_failures(plan.outputs)
         if upload_preflight_failures:
@@ -271,7 +459,14 @@ class AutomationRunner:
                 output = plan.outputs[index]
                 report = next(item for item in self.config.reports if item.id == output.task_id)
                 active_output = output
+                if output.task_id == "R13":
+                    clear_r13_no_data_marker(self._r13_no_data_marker_path())
                 run_state_store.mark_task_started(output)
+                self._write_runtime_phase(
+                    "task_started",
+                    task_id=output.task_id,
+                    output_filename=output.output_filename,
+                )
                 task_label = output.output_filename or output.task_name
                 self._emit(
                     on_progress,
@@ -301,16 +496,28 @@ class AutomationRunner:
                                 automator = self._build_automator(window, save_as_handler)
                             except (UiProbeError, RuntimeError) as exc:
                                 message = f"準備 POS 失敗：{exc}"
+                                error_code = self._pos_preparation_error_code(exc, default="POS_CONNECTION_FAILED")
                                 diagnostic_path = self._write_preparation_failure_diagnostic(
                                     plan.outputs[index:],
-                                    error_code="POS_CONNECTION_FAILED",
+                                    error_code=error_code,
                                     message=message,
                                 )
                                 if diagnostic_path is not None:
                                     message = f"{message}；診斷檔：{diagnostic_path}"
-                                pos_preparation_failure = ReportAutomationError("POS_CONNECTION_FAILED", message)
+                                pos_preparation_failure = ReportAutomationError(error_code, message)
                                 raise pos_preparation_failure from exc
+                        self._write_runtime_phase(
+                            "report_download_start",
+                            task_id=output.task_id,
+                            output_filename=output.output_filename,
+                        )
                         result = automator.download_report(output, report, close_after_success=True)
+                        self._write_runtime_phase(
+                            "report_download_finished",
+                            task_id=output.task_id,
+                            ok=bool(result.ok),
+                            error_code=result.error_code,
+                        )
                 except ReportAutomationError as exc:
                     if self._can_switch_pos_backend_for_error(exc):
                         self._emit(
@@ -362,8 +569,28 @@ class AutomationRunner:
                                 output_filename=output.output_filename,
                                 error_code="POS_RECOVERY_FAILED",
                                 message=f"POS 重啟或重新登入失敗：{recovery_exc}",
-                                diagnostic_path=str(exc.diagnostic_path) if exc.diagnostic_path else None,
+                                diagnostic_path=None,
                             )
+                            diagnostic_path = self._write_preparation_failure_diagnostic(
+                                [output],
+                                error_code=failure.error_code,
+                                message=failure.message,
+                                window=pos_window,
+                                note="此失敗發生於 POS 任務錯誤後的重啟／重新登入階段；已保留當下畫面與 bounded UI probe。",
+                            )
+                            if diagnostic_path is not None:
+                                failure = replace(failure, diagnostic_path=str(diagnostic_path))
+                            reconnect_result, failure, abort_pos_tasks = self._reconnect_after_pos_task_failure(
+                                on_progress,
+                                outputs=plan.outputs[index + 1 :],
+                                failed_output=output,
+                                failure=failure,
+                                current_window=pos_window,
+                            )
+                            if reconnect_result is not None:
+                                pos_window = reconnect_result
+                                save_as_handler = self.save_as_handler_factory(self.config)
+                                automator = self._build_automator(pos_window, save_as_handler)
                             failures.append(failure)
                             run_state_store.mark_failed(
                                 output,
@@ -372,7 +599,25 @@ class AutomationRunner:
                             )
                             self._emit_failure(on_progress, failure)
                             active_output = None
-                            break
+                            if abort_pos_tasks:
+                                failures.extend(
+                                    self._mark_pending_outputs_failed(
+                                        run_state_store,
+                                        self._remaining_pos_outputs(plan.outputs[index + 1 :]),
+                                        error_code="POS_CONNECTION_FAILED",
+                                        message=(
+                                            "前一個 POS 任務失敗且重啟／重新連接均失敗，"
+                                            "已停止後續任務以避免連鎖錯誤。"
+                                        ),
+                                    )
+                                )
+                                next_local_index = self._next_local_output_index(plan.outputs, start=index + 1)
+                                if next_local_index is None:
+                                    break
+                                index = next_local_index
+                                continue
+                            index += 1
+                            continue
                         if self.config.pos_recovery.retry_current_task_after_restart:
                             continue
                     failure = ReportRunFailure(
@@ -426,40 +671,147 @@ class AutomationRunner:
                         error_code="UNEXPECTED_RUNNER_ERROR",
                         message=f"背景自動化執行發生未預期錯誤：{exc}",
                     )
-                    failures.append(failure)
                     run_state_store.mark_failed(
                         output,
                         error_code=failure.error_code,
                         message=failure.message,
                     )
-                    self._emit_failure(on_progress, failure)
-                    try:
-                        window = self._reconnect_ready_pos_session(on_progress, plan.outputs[index + 1 :] or [output])
-                        pos_window = window
+                    reconnect_result, failure, abort_pos_tasks = self._reconnect_after_pos_task_failure(
+                        on_progress,
+                        outputs=plan.outputs[index + 1 :],
+                        failed_output=output,
+                        failure=failure,
+                        current_window=pos_window,
+                    )
+                    if reconnect_result is not None:
+                        pos_window = reconnect_result
                         save_as_handler = self.save_as_handler_factory(self.config)
-                        automator = self._build_automator(window, save_as_handler)
-                    except Exception as reconnect_exc:
+                        automator = self._build_automator(pos_window, save_as_handler)
+                    failures.append(failure)
+                    self._emit_failure(on_progress, failure)
+                    active_output = None
+                    if abort_pos_tasks:
+                        failures.extend(
+                            self._mark_pending_outputs_failed(
+                                run_state_store,
+                                self._remaining_pos_outputs(plan.outputs[index + 1 :]),
+                                error_code="POS_CONNECTION_FAILED",
+                                message=(
+                                    "前一個 POS 任務發生未預期錯誤且無法重新連接 SPA-POS，"
+                                    "已停止後續任務以避免連鎖錯誤。"
+                                ),
+                            )
+                        )
+                        next_local_index = self._next_local_output_index(plan.outputs, start=index + 1)
+                        if next_local_index is None:
+                            break
+                        index = next_local_index
+                        continue
+                    index += 1
+                    continue
+                if not result.ok:
+                    result_error = ReportAutomationError(
+                        result.error_code or "REPORT_DOWNLOAD_FAILED",
+                        result.message,
+                        actions=list(getattr(result, "actions", []) or []),
+                        diagnostic_path=getattr(result, "diagnostic_path", None),
+                    )
+                    if self._can_recover_pos(result_error, restart_count):
+                        restart_count += 1
                         self._emit(
                             on_progress,
                             AutomationProgress(
                                 "recovery",
-                                f"{output.task_id} 非預期失敗後重新連接 POS 失敗，仍會嘗試下一個任務：{reconnect_exc}",
+                                f"{output.task_id} 回報 POS 工作流失敗，正在強制重啟 POS 後重跑目前任務（第 {restart_count} 次）",
                                 task_id=output.task_id,
                                 output_filename=output.output_filename,
                             ),
                         )
-                    active_output = None
-                    index += 1
-                    continue
-                if not result.ok:
+                        try:
+                            window = self.pos_recovery_func(self.config, on_progress)
+                            window = self._wait_for_pos_main_menu_ready(self.config, window, [output])
+                            pos_window = window
+                            save_as_handler = self.save_as_handler_factory(self.config)
+                            automator = self._build_automator(window, save_as_handler)
+                        except Exception as recovery_exc:
+                            failure = ReportRunFailure(
+                                task_id=output.task_id,
+                                output_filename=output.output_filename,
+                                error_code="POS_RECOVERY_FAILED",
+                                message=f"{output.task_id} 失敗後 POS 重啟或重新登入失敗：{recovery_exc}",
+                                diagnostic_path=None,
+                            )
+                            diagnostic_path = self._write_preparation_failure_diagnostic(
+                                [output],
+                                error_code=failure.error_code,
+                                message=failure.message,
+                                window=pos_window,
+                                note="此失敗發生於 ReportDownloadResult.ok=False 後的 POS 重啟／重新登入階段；已保留當下畫面與 bounded UI probe。",
+                            )
+                            if diagnostic_path is not None:
+                                failure = replace(failure, diagnostic_path=str(diagnostic_path))
+                            reconnect_result, failure, abort_pos_tasks = self._reconnect_after_pos_task_failure(
+                                on_progress,
+                                outputs=plan.outputs[index + 1 :],
+                                failed_output=output,
+                                failure=failure,
+                                current_window=pos_window,
+                            )
+                            if reconnect_result is not None:
+                                pos_window = reconnect_result
+                                save_as_handler = self.save_as_handler_factory(self.config)
+                                automator = self._build_automator(pos_window, save_as_handler)
+                            failures.append(failure)
+                            run_state_store.mark_failed(
+                                output,
+                                error_code=failure.error_code,
+                                message=failure.message,
+                            )
+                            self._emit_failure(on_progress, failure)
+                            active_output = None
+                            if abort_pos_tasks:
+                                failures.extend(
+                                    self._mark_pending_outputs_failed(
+                                        run_state_store,
+                                        self._remaining_pos_outputs(plan.outputs[index + 1 :]),
+                                        error_code="POS_CONNECTION_FAILED",
+                                        message=(
+                                            "前一個 POS 任務失敗且重啟／重新連接均失敗，"
+                                            "已停止後續任務以避免連鎖錯誤。"
+                                        ),
+                                    )
+                                )
+                                next_local_index = self._next_local_output_index(plan.outputs, start=index + 1)
+                                if next_local_index is None:
+                                    break
+                                index = next_local_index
+                                continue
+                            index += 1
+                            continue
+                        if self.config.pos_recovery.retry_current_task_after_restart:
+                            continue
                     if result.error_code == "NO_REPORT_DATA" and output.task_id == "R13":
+                        marker_path = self._r13_no_data_marker_path()
+                        marker_message = result.message
+                        try:
+                            write_r13_no_data_marker(
+                                marker_path,
+                                app_version=self.app_version,
+                                run_date=self.run_date,
+                                start_date=output.start_date,
+                                end_date=output.end_date,
+                                output_filename=output.output_filename,
+                                message=marker_message,
+                            )
+                        except OSError as exc:
+                            marker_message = f"{marker_message}；R13 無資料狀態寫入失敗：{type(exc).__name__}: {exc}"
                         failure = ReportRunFailure(
                             task_id=output.task_id,
                             output_filename=output.output_filename,
                             error_code=result.error_code,
                             message=(
-                                f"{output.task_id} 無資料：{result.message}；"
-                                "本輪未產生可供 R14 使用的 raw data。"
+                                f"{output.task_id} 無資料：{marker_message}；"
+                                "本輪沒有 POS raw data 檔，已記錄可驗證的零領用狀態供 R14 降級產出。"
                             ),
                             diagnostic_path=(
                                 str(result.diagnostic_path)
@@ -478,22 +830,27 @@ class AutomationRunner:
                         index += 1
                         continue
                     if result.error_code == "NO_REPORT_DATA":
-                        skipped += 1
-                        message = f"{output.task_id} 無資料，已略過：{result.message}"
-                        run_state_store.mark_skipped(
-                            output,
+                        failure = ReportRunFailure(
+                            task_id=output.task_id,
+                            output_filename=output.output_filename,
                             error_code=result.error_code,
-                            message=message,
-                        )
-                        self._emit(
-                            on_progress,
-                            AutomationProgress(
-                                "task_skipped",
-                                message,
-                                task_id=output.task_id,
-                                output_filename=output.output_filename,
+                            message=(
+                                f"{output.task_id} 無資料：{result.message}；"
+                                "本次沒有產出或上傳報表，必須視為失敗並檢查查詢條件或 POS 資料。"
+                            ),
+                            diagnostic_path=(
+                                str(result.diagnostic_path)
+                                if getattr(result, "diagnostic_path", None) is not None
+                                else None
                             ),
                         )
+                        failures.append(failure)
+                        run_state_store.mark_failed(
+                            output,
+                            error_code=failure.error_code,
+                            message=failure.message,
+                        )
+                        self._emit_failure(on_progress, failure)
                         active_output = None
                         index += 1
                         continue
@@ -507,6 +864,11 @@ class AutomationRunner:
                             str(result.diagnostic_path)
                             if getattr(result, "diagnostic_path", None) is not None
                             else None
+                        ),
+                        evidence_paths=(
+                            (str(result.output_path),)
+                            if output.task_id == "W02" and getattr(result, "output_path", None) is not None
+                            else ()
                         ),
                     )
                     run_state_store.mark_failed(
@@ -598,7 +960,11 @@ class AutomationRunner:
                     if drive_file_id is not None:
                         run_state_store.mark_uploaded(output, local_file_path=result.output_path, drive_file_id=drive_file_id)
                         uploaded_to_drive = True
-                r14_email_failure = self._notify_r14_completion_if_needed(output, result.output_path)
+                r14_email_failure = self._notify_r14_completion_if_needed(
+                    output,
+                    result.output_path,
+                    warnings=list(getattr(result, "warnings", [])),
+                )
                 if r14_email_failure is not None:
                     failures.append(r14_email_failure)
                     run_state_store.mark_failed(
@@ -641,9 +1007,36 @@ class AutomationRunner:
                 message=message,
             )
             run_state_store.finish_run(completed=0, failures=len(plan.outputs))
+            cleanup_window = pos_window or self._last_pos_window
+            if cleanup_window is not None:
+                self._close_pos_after_run_if_configured(cleanup_window, on_progress)
             self._emit(on_progress, AutomationProgress("finish", summary.message))
             return summary
+        except (KeyboardInterrupt, SystemExit) as exc:
+            self._write_runtime_phase(
+                "run_cancelled",
+                exception_type=type(exc).__name__,
+                message=str(exc),
+                task_id=active_output.task_id if active_output is not None else None,
+            )
+            if active_output is not None:
+                try:
+                    run_state_store.mark_failed(
+                        active_output,
+                        error_code="RUN_CANCELLED",
+                        message=f"自動化收到終止訊號：{type(exc).__name__}",
+                    )
+                    run_state_store.finish_run(completed=completed + skipped, failures=1)
+                except Exception:
+                    pass
+            raise
         except Exception as exc:
+            self._write_runtime_phase(
+                "run_exception",
+                exception_type=type(exc).__name__,
+                message=str(exc),
+                task_id=active_output.task_id if active_output is not None else None,
+            )
             if active_output is not None:
                 failure = ReportRunFailure(
                     task_id=active_output.task_id,
@@ -678,10 +1071,47 @@ class AutomationRunner:
                     )
                 )
 
-        run_state_store.finish_run(completed=completed + skipped, failures=len(failures))
         summary = self._build_summary(completed=completed, total=len(plan.outputs), failures=failures, skipped=skipped)
-        if completed + skipped + len(failures) >= len(plan.outputs):
-            self._close_pos_after_run_if_configured(pos_window, on_progress)
+        if summary.ok:
+            success_notify_result = self._notify_success_summary_if_needed(
+                run_state_store,
+                completed=completed,
+                total=len(plan.outputs),
+                skipped=skipped,
+            )
+            if success_notify_result is not None and not bool(
+                getattr(success_notify_result, "ok", False)
+            ):
+                failure = ReportRunFailure(
+                    task_id="EMAIL",
+                    output_filename="",
+                    error_code="SUCCESS_SUMMARY_NOTIFICATION_FAILED",
+                    message=f"報表均已完成，但每日完成摘要寄送失敗：{success_notify_result.message}",
+                )
+                failures.append(failure)
+                self._emit_failure(on_progress, failure)
+                summary = AutomationRunSummary(
+                    ok=False,
+                    completed=completed,
+                    total=len(plan.outputs),
+                    error_code=failure.error_code,
+                    message=failure.message,
+                    details=format_report_failures(failures),
+                    skipped=skipped,
+                    failures=tuple(failures),
+                )
+        run_state_store.finish_run(completed=completed + skipped, failures=len(failures))
+        self._write_runtime_phase(
+            "run_finished",
+            ok=summary.ok,
+            completed=summary.completed,
+            skipped=summary.skipped,
+            failure_count=len(summary.failures),
+            error_code=summary.error_code,
+        )
+        cleanup_window = pos_window or self._last_pos_window
+        if cleanup_window is not None:
+            self._close_pos_after_run_if_configured(cleanup_window, on_progress)
         self._emit(on_progress, AutomationProgress("finish", summary.message))
         return summary
 
@@ -690,6 +1120,39 @@ class AutomationRunner:
         if self.selected_task_ids is not None:
             return forced_ids & self.selected_task_ids
         return forced_ids
+
+    def _selected_task_plan_diagnostics(
+        self,
+        outputs: Sequence[PlannedOutput],
+    ) -> list[dict[str, Any]] | None:
+        if self.selected_task_ids is None:
+            return None
+        planned_ids = {output.task_id for output in outputs}
+        reports_by_id = {report.id: report for report in self.config.reports}
+        diagnostics: list[dict[str, Any]] = []
+        for task_id in sorted(self.selected_task_ids):
+            report = reports_by_id.get(task_id)
+            if report is None:
+                diagnostics.append({"task_id": task_id, "planned": False, "report_present": False})
+                continue
+            diagnostics.append(
+                {
+                    "task_id": task_id,
+                    "planned": task_id in planned_ids,
+                    "report_present": True,
+                    "enabled": report.enabled,
+                    "frequency": report.frequency,
+                    "handler": report.handler,
+                    "report_menu_text_present": bool(report.report_menu_text.strip()),
+                    "output_filename_present": bool(report.output_filename.strip()),
+                    "branch_mode": report.branch_mode,
+                    "configured_branch_count": len(self.config.branches),
+                    "enabled_branch_count": sum(
+                        1 for branch in self.config.branches if branch.enabled
+                    ),
+                }
+            )
+        return diagnostics
 
     def _w02_no_due_plan_summary(self) -> AutomationRunSummary | None:
         if "W02" in self._forced_weekly_report_ids():
@@ -768,6 +1231,7 @@ class AutomationRunner:
         *,
         error_code: str,
         message: str,
+        window: Any | None = None,
         note: str = "此失敗發生於報表自動化開始前，因此不會有單一報表 action log。",
     ) -> Path | None:
         log_dir = self.runtime_paths.logs_dir
@@ -775,6 +1239,11 @@ class AutomationRunner:
             log_dir.mkdir(parents=True, exist_ok=True)
             task_ids = "_".join(dict.fromkeys(output.task_id for output in outputs)) or "RUN"
             path = log_dir / f"automation_prepare_failure_{self.run_date.strftime('%Y%m%d')}_{task_ids}.json"
+            evidence = self._write_pos_failure_evidence(
+                window=window,
+                task_ids=task_ids,
+                error_code=error_code,
+            )
             payload = {
                 "schema_version": 1,
                 "created_at": datetime.now(tz=UTC).isoformat(),
@@ -785,6 +1254,7 @@ class AutomationRunner:
                 "required_root_menus": list(self._required_report_root_menus(self.config, outputs)),
                 "visible_control_names": self._visible_control_names_for_diagnostic(),
                 "desktop_windows": desktop_window_snapshots(backend=self.config.pos.backend, limit=30),
+                "failure_evidence": evidence,
                 "outputs": [
                     {
                         "task_id": output.task_id,
@@ -799,11 +1269,19 @@ class AutomationRunner:
                 "runtime": {
                     "app_version": self.app_version,
                     "executable_path": str(Path(sys.executable)),
+                    "rpa_executable_path": str(Path(sys.executable)),
+                    "pos_executable_path_configured": self.config.pos.executable_path,
+                    "pos_executable_path_resolved": self._resolved_pos_executable_path_for_diagnostic(),
+                    "pos_launch": self._pos_launch_evidence_snapshot(),
                     "config_path": str(self.settings_path),
                     "run_source": self.run_source,
                     "run_date": self.run_date.isoformat(),
                     "configured_backend": self.config.pos.backend,
                     "connected_backend": self._last_connected_backend,
+                    "configured_startup_ini_profile": self.config.pos.startup_ini_profile,
+                    "active_pos_session_profile": self._active_pos_session_profile,
+                    "active_pos_session_profile_evidence": self._active_pos_session_profile_evidence,
+                    "pos_session_profile_marker_path": str(self._pos_session_profile_marker_path()),
                     "logs_dir": str(self.runtime_paths.logs_dir),
                     "state_dir": str(self.runtime_paths.state_dir),
                 },
@@ -813,6 +1291,72 @@ class AutomationRunner:
             return path
         except Exception:
             return None
+
+    def _write_pos_failure_evidence(
+        self,
+        *,
+        window: Any | None,
+        task_ids: str,
+        error_code: str,
+    ) -> dict[str, Any]:
+        target_window = window or self._last_pos_window
+        timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S_%f")
+        safe_task_ids = _safe_filename_token(task_ids)
+        safe_error_code = _safe_filename_token(error_code)
+        screenshot_path = self.runtime_paths.logs_dir / (
+            f"automation_failure_{timestamp}_{safe_task_ids}_{safe_error_code}.png"
+        )
+        try:
+            saved_screenshot, screenshot_error, screenshot_source = capture_window_screenshot(
+                target_window,
+                screenshot_path,
+            )
+        except Exception as exc:
+            saved_screenshot, screenshot_error, screenshot_source = None, str(exc), None
+        ui_probe_path = self.runtime_paths.logs_dir / (
+            f"ui_probe_failure_{timestamp}_{safe_task_ids}_{safe_error_code}.json"
+        )
+        ui_probe_error: str | None = None
+        if target_window is not None:
+            try:
+                probe = probe_window_controls(
+                    target_window,
+                    window_title=_safe_control_name(target_window) or self.config.pos.window_title_contains,
+                    backend=self._connected_backend(target_window),
+                    max_depth=6,
+                    max_controls=300,
+                )
+                write_probe_report(probe, ui_probe_path)
+            except Exception as exc:
+                ui_probe_error = str(exc)
+        else:
+            ui_probe_error = "POS 視窗控制項不可用，僅能保留 desktop_windows 與全桌面截圖嘗試結果。"
+        if ui_probe_error is not None:
+            try:
+                ui_probe_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "status": "unavailable",
+                            "error_code": error_code,
+                            "probe_error": ui_probe_error,
+                            "controls": [],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return {
+            "screenshot_path": str(saved_screenshot) if saved_screenshot is not None else None,
+            "screenshot_error": screenshot_error,
+            "screenshot_source": screenshot_source,
+            "ui_probe_path": str(ui_probe_path) if ui_probe_path.exists() else None,
+            "ui_probe_error": ui_probe_error,
+            "window_available": target_window is not None,
+        }
 
     def _upload_report_file(
         self,
@@ -1015,6 +1559,7 @@ class AutomationRunner:
             error_code=result.error_code,
             message=result.message,
             actions=list(result.actions),
+            warnings=list(result.warnings),
         )
         if not result.ok and result.diagnostic_path is None:
             result.diagnostic_path = log_path
@@ -1076,6 +1621,7 @@ class AutomationRunner:
             r13_failure = next((failure for failure in prior_failures or [] if failure.task_id == "R13"), None)
             w01_failure = next((failure for failure in prior_failures or [] if failure.task_id == "W01"), None)
             output_path = initial_output_path
+            no_data_marker = self._load_r13_no_data_marker_for_output(output) if output.task_id == "R14" else None
             if (
                 output.task_id == "R14"
                 and w01_failure is not None
@@ -1098,6 +1644,7 @@ class AutomationRunner:
                 output.task_id == "R14"
                 and r13_failure is not None
                 and not _r13_failure_allows_r14_local_transform(r13_failure)
+                and not (r13_failure.error_code == "NO_REPORT_DATA" and no_data_marker is not None)
             ):
                 return self._finalize_local_transform_result(
                     log_path,
@@ -1114,37 +1661,56 @@ class AutomationRunner:
                     ),
                 )
             expected_end_date = datetime.strptime(output.end_date, "%Y/%m/%d").date()
-            try:
-                raw_path = self._resolve_r14_raw_path(
-                    planned_outputs,
-                    expected_end_date=expected_end_date,
-                    current_r13_output_path=(
-                        self._latest_r13_output_path if output.task_id == "R14" else None
-                    ),
+            raw_path: Path | None = None
+            if no_data_marker is not None:
+                usage_for_template_state = R13UsageData(
+                    start_date=datetime.strptime(no_data_marker.start_date, "%Y/%m/%d"),
+                    end_date=datetime.strptime(no_data_marker.end_date, "%Y/%m/%d"),
+                    report_month=expected_end_date.strftime("%Y/%m"),
+                    rows=(),
                 )
-            except R14TransformError as exc:
-                if output.task_id == "R14" and exc.error_code == "R14_SOURCE_FILE_MISSING" and r13_failure is not None:
-                    return self._finalize_local_transform_result(
-                        log_path,
-                        output,
-                        ReportDownloadResult(
-                            ok=False,
-                            task_id=output.task_id,
-                            output_path=output_path,
-                            error_code="R14_BLOCKED_BY_R13_FAILED",
-                            message=(
-                                "R13 raw data 未產生或找不到，因此未執行 R14 轉換。"
-                                f"前置 R13 失敗代碼：{r13_failure.error_code}。"
-                            ),
+            else:
+                try:
+                    raw_path = self._resolve_r14_raw_path(
+                        planned_outputs,
+                        expected_end_date=expected_end_date,
+                        current_r13_output_path=(
+                            self._latest_r13_output_path if output.task_id == "R14" else None
                         ),
                     )
-                raise
+                except R14TransformError as exc:
+                    if (
+                        output.task_id == "R14"
+                        and exc.error_code == "R14_SOURCE_FILE_MISSING"
+                        and r13_failure is not None
+                    ):
+                        return self._finalize_local_transform_result(
+                            log_path,
+                            output,
+                            ReportDownloadResult(
+                                ok=False,
+                                task_id=output.task_id,
+                                output_path=output_path,
+                                error_code="R14_BLOCKED_BY_R13_FAILED",
+                                message=(
+                                    "R13 raw data 未產生或找不到，因此未執行 R14 轉換。"
+                                    f"前置 R13 失敗代碼：{r13_failure.error_code}。"
+                                ),
+                            ),
+                        )
+                    raise
+                usage_for_template_state = parse_r13_usage_summary(raw_path)
             template_path = self._resolve_r14_transform_template_path()
-            usage_for_template_state = parse_r13_usage_summary(raw_path)
             template_state_action = self._sync_r14_previous_month_state_if_needed(
                 template_path,
                 usage_for_template_state.report_month,
             )
+            template_state_warning = (
+                template_state_action.removeprefix("r14_warning:")
+                if template_state_action is not None and template_state_action.startswith("r14_warning:")
+                else None
+            )
+            planning_baseline_available = template_state_warning is None
             self._write_local_transform_log_event(
                 log_path,
                 "r14_template_month_state_ready",
@@ -1169,7 +1735,8 @@ class AutomationRunner:
                 log_path,
                 "local_transform_inputs",
                 output=output,
-                raw_path=str(raw_path),
+                raw_path=str(raw_path) if raw_path is not None else None,
+                r13_no_data_marker=(str(self._r13_no_data_marker_path()) if no_data_marker is not None else None),
                 template_path=str(template_path),
                 output_path=str(output_path),
                 inventory_date=str(inventory_date) if inventory_date is not None else None,
@@ -1181,16 +1748,31 @@ class AutomationRunner:
                     else "none"
                 ),
             )
-            result = transform_r13_to_r14(
-                raw_path,
-                template_path,
-                output_path,
-                expected_end_date=expected_end_date,
-                branch_inventory=inventory_result.inventories if inventory_result is not None else None,
-                branch_inventory_item_names=inventory_item_names,
-                inventory_date=inventory_date,
-                update_template_path=template_path,
-            )
+            if no_data_marker is not None:
+                result = transform_r13_usage_to_r14(
+                    usage_for_template_state,
+                    template_path,
+                    output_path,
+                    expected_end_date=expected_end_date,
+                    branch_inventory=inventory_result.inventories if inventory_result is not None else None,
+                    branch_inventory_item_names=inventory_item_names,
+                    inventory_date=inventory_date,
+                    update_template_path=template_path if planning_baseline_available else None,
+                    planning_baseline_available=planning_baseline_available,
+                )
+            else:
+                assert raw_path is not None
+                result = transform_r13_to_r14(
+                    raw_path,
+                    template_path,
+                    output_path,
+                    expected_end_date=expected_end_date,
+                    branch_inventory=inventory_result.inventories if inventory_result is not None else None,
+                    branch_inventory_item_names=inventory_item_names,
+                    inventory_date=inventory_date,
+                    update_template_path=template_path if planning_baseline_available else None,
+                    planning_baseline_available=planning_baseline_available,
+                )
             if not result.output_path.exists() or result.output_path.stat().st_size <= 0:
                 return self._finalize_local_transform_result(
                     log_path,
@@ -1212,9 +1794,18 @@ class AutomationRunner:
                     task_id=output.task_id,
                     output_path=result.output_path,
                     actions=[
-                        f"r14_raw:{raw_path}",
+                        *(
+                            [f"r14_no_data_marker:{self._r13_no_data_marker_path()}"]
+                            if no_data_marker is not None
+                            else [f"r14_raw:{raw_path}"]
+                        ),
                         f"r14_template:{template_path}",
-                        f"r14_template_state_updated:{template_path}",
+                        *self._r14_cloud_template_actions(),
+                        *(
+                            [f"r14_template_state_updated:{template_path}"]
+                            if planning_baseline_available
+                            else [f"r14_template_state_not_updated_missing_baseline:{template_path}"]
+                        ),
                         *([template_state_action] if template_state_action is not None else []),
                         f"r14_month:{result.report_month}",
                         f"r14_imported_rows:{result.imported_rows}",
@@ -1223,7 +1814,16 @@ class AutomationRunner:
                         f"r14_inventory_updated:{result.inventory_updated}",
                         f"r14_inventory_unmatched:{result.inventory_unmatched}",
                     ],
-                    message="R14 離線轉換完成。",
+                    warnings=([template_state_warning] if template_state_warning is not None else []),
+                    message=(
+                        "R14 已依 POS 明確無資料狀態降級產出；本期領用量以 0 筆處理。"
+                        if no_data_marker is not None and template_state_warning is None
+                        else "R14 已依 POS 明確無資料狀態降級產出；本期領用量以 0 筆處理，且缺少前月月底基準的規劃欄位已留白。"
+                        if no_data_marker is not None
+                        else "R14 離線轉換完成。"
+                        if template_state_warning is None
+                        else "R14 已降級產出；缺少前月月底基準的規劃欄位已留白，並已加入通知警告。"
+                    ),
                 ),
             )
         except R14TransformError as exc:
@@ -1417,7 +2017,11 @@ class AutomationRunner:
             known_item_codes=getattr(department_result, "known_item_codes", None),
             branch_sheet_names=branch_sheet_names,
         )
-        self._write_w02_order_plan(output_path, plan, department_rows_read=department_result.rows_read)
+        output_path = self._write_w02_order_plan(
+            output_path,
+            plan,
+            department_rows_read=department_result.rows_read,
+        )
         diagnostic_mode = self.config.w02_order.diagnostic_mode
 
         if not plan.forms:
@@ -1557,9 +2161,10 @@ class AutomationRunner:
             window = self._ensure_pos_session(on_progress, [output])
         except (UiProbeError, RuntimeError) as exc:
             message = f"W02 準備 POS 建單失敗：{exc}"
+            error_code = self._pos_preparation_error_code(exc, default="W02_POS_CONNECTION_FAILED")
             diagnostic_path = self._write_preparation_failure_diagnostic(
                 [output],
-                error_code="W02_POS_CONNECTION_FAILED",
+                error_code=error_code,
                 message=message,
                 note="此失敗發生於 W02 POS 建單開始前；訂貨計畫已產生但尚未進 POS 建單。",
             )
@@ -1567,7 +2172,7 @@ class AutomationRunner:
                 ok=False,
                 task_id=output.task_id,
                 output_path=output_path,
-                error_code="W02_POS_CONNECTION_FAILED",
+                error_code=error_code,
                 message=f"{message}；計畫檔：{output_path}",
                 diagnostic_path=diagnostic_path,
             )
@@ -1580,6 +2185,8 @@ class AutomationRunner:
             keyboard_sender=self.keyboard_sender,
         )
         submit_result = submitter.submit_plan(submitted_plan)
+        if not submit_result.ok and bool(getattr(submit_result, "preserve_pos_draft", False)):
+            self._preserve_pos_after_run_reason = "w02_unsaved_draft_available_for_verified_resume"
         submit_skipped_issues = tuple(getattr(submit_result, "skipped_issues", ()) or ())
         all_issues = (*plan.issues, *submit_skipped_issues)
         completed_form_counts_by_branch = getattr(submit_result, "completed_form_counts_by_branch", None) or {}
@@ -1895,7 +2502,7 @@ class AutomationRunner:
         try:
             if not path.is_file() or path.stat().st_size <= 0:
                 return False
-            snapshot = load_r14_workbook_snapshot(path)
+            snapshot = load_r14_workbook_snapshot(path, allow_legacy_missing_n006=True)
         except Exception:
             return False
         report_date = getattr(snapshot, "report_date", None)
@@ -1903,7 +2510,7 @@ class AutomationRunner:
             report_date = report_date.date()
         return report_date == expected_report_date
 
-    def _write_w02_order_plan(self, path: Path, plan: Any, *, department_rows_read: int) -> None:
+    def _write_w02_order_plan(self, path: Path, plan: Any, *, department_rows_read: int) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "created_at": datetime.now(tz=UTC).isoformat(),
@@ -1926,7 +2533,14 @@ class AutomationRunner:
             if self.config.w02_order.diagnostic_mode and plan.forms
             else 0,
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        try:
+            write_text_atomic(path, text)
+            return path
+        except PermissionError:
+            recovery_path = path.with_name(f"{path.stem}_recovery_{uuid4().hex}{path.suffix}")
+            write_text_atomic(recovery_path, text)
+            return recovery_path
 
     def _notify_w02_issues_if_needed(
         self,
@@ -1976,6 +2590,7 @@ class AutomationRunner:
                 error_code=getattr(result, "error_code", None) or "W02_EMAIL_SEND_FAILED",
                 message=f"W02 異常通知 Gmail API 寄送失敗：{getattr(result, 'message', '')}",
             )
+        self._w02_issue_notification_sent = True
         return None
 
     def _notify_w02_error_if_needed(
@@ -2091,6 +2706,12 @@ class AutomationRunner:
     def _resolve_r14_template_path(self) -> Path:
         if self._r14_runtime_template_path is not None and self._r14_runtime_template_path.exists():
             return self._r14_runtime_template_path
+
+        cloud_template = self._download_r14_cloud_template_if_configured()
+        if cloud_template is not None:
+            self._r14_runtime_template_path = cloud_template
+            return cloud_template
+
         state_template = self._find_r14_state_template()
         if state_template is not None:
             return state_template
@@ -2116,7 +2737,62 @@ class AutomationRunner:
             f" 已搜尋：{searched_hint}",
         )
 
+    def _download_r14_cloud_template_if_configured(self) -> Path | None:
+        settings = self.config.r14_transform
+        folder = settings.template_drive_folder_id_or_url.strip()
+        if not folder:
+            return None
+        result = self.r14_template_downloader_factory(self.config).download_latest_template(
+            folder,
+            filename_glob=(
+                settings.template_drive_filename_glob.strip()
+                or "診所stock status - * demand planning-*.xlsx"
+            ),
+            destination_dir=self._r14_writable_template_dir(),
+        )
+        self._r14_cloud_template_download_result = result
+        if result.success and result.local_path is not None:
+            try:
+                validate_r14_template_file(result.local_path)
+            except R14TransformError as exc:
+                result = result.model_copy(
+                    update={
+                        "success": False,
+                        "error_code": "R14_TEMPLATE_DRIVE_WORKBOOK_INVALID",
+                        "message": f"R14 雲端模板檔案格式不符合需求：{exc.message}",
+                    }
+                )
+                self._r14_cloud_template_download_result = result
+        self._write_runtime_phase(
+            "r14_template_drive_download",
+            success=result.success,
+            folder_id=result.folder_id,
+            drive_file_id=result.drive_file_id,
+            source_name=result.source_name,
+            modified_time=result.modified_time,
+            local_path=str(result.local_path) if result.local_path is not None else None,
+            size=result.size,
+            sha256=result.sha256,
+            error_code=result.error_code,
+            message=result.message,
+        )
+        if result.success and result.local_path is not None:
+            return result.local_path
+        if settings.template_drive_fallback_to_local:
+            return None
+        raise R14TransformError(
+            result.error_code or "R14_TEMPLATE_DRIVE_DOWNLOAD_FAILED",
+            result.message or "R14 雲端模板下載失敗；未啟用本機模板備援，因此停止 R14。",
+        )
+
     def _resolve_r14_transform_template_path(self) -> Path:
+        if self._r14_runtime_template_path is not None and self._r14_runtime_template_path.exists():
+            _ensure_writable_file_for_update(self._r14_runtime_template_path)
+            return self._r14_runtime_template_path
+        if self.config.r14_transform.template_drive_folder_id_or_url.strip():
+            template_path = self._resolve_r14_template_path()
+            _ensure_writable_file_for_update(template_path)
+            return template_path
         state_template = self._find_r14_state_template()
         if state_template is not None:
             _ensure_writable_file_for_update(state_template)
@@ -2129,16 +2805,51 @@ class AutomationRunner:
         previous_month = _previous_month_label(report_month)
         previous_month_end = _previous_month_end_date(report_month)
         source_path = self._find_r14_archive_for_report_date(previous_month_end, exclude_path=template_path)
-        if source_path is None and r14_template_has_actual_month_state(template_path, previous_month):
+        if source_path is None and r14_template_has_actual_month_state(
+            template_path,
+            previous_month,
+            allow_legacy_missing_n006=True,
+        ):
             return None
         if source_path is None:
-            raise R14TransformError(
-                "R14_PREVIOUS_MONTH_END_SNAPSHOT_MISSING",
-                (
-                    f"R14 runtime 模板找不到前一月 {previous_month} Actual 狀態，且 downloads/R14 中找不到"
-                    f"前一月最後一天 {previous_month_end:%Y/%m/%d} 的 R14 報表；"
-                    "無法確認 Forecast 使用的是前月最後一天累積量。"
-                ),
+            searched_dirs = "、".join(str(path) for path in self._r14_archive_search_dirs())
+            archive_candidates = self._r14_archive_candidates()
+            matching_filename_candidates = [
+                path for path in archive_candidates if _r14_output_filename_report_date(path.name) == previous_month_end
+            ]
+            candidate_note = ""
+            if matching_filename_candidates:
+                candidate_details = []
+                for path in matching_filename_candidates[:5]:
+                    issues = r14_template_actual_month_state_issues(path, previous_month)
+                    detail = "、".join(issues) if issues else "內容驗證未通過"
+                    candidate_details.append(f"{path.name}（{detail}）")
+                shown_candidates = "、".join(candidate_details)
+                suffix = "" if len(matching_filename_candidates) <= 5 else "…"
+                candidate_note = (
+                    f" 找到符合檔名日期但內容驗證未通過的候選檔：{shown_candidates}{suffix}；"
+                    "該檔未作為規劃基準。"
+                )
+            previous_month_dates = [
+                report_date
+                for path in archive_candidates
+                if (report_date := _r14_output_filename_report_date(path.name)) is not None
+                and report_date.year == previous_month_end.year
+                and report_date.month == previous_month_end.month
+                and report_date <= previous_month_end
+            ]
+            latest_note = (
+                f"最新找到的前月歷史檔名日期為 {max(previous_month_dates):%Y/%m/%d}，但它不是月底完整快照，未拿來推算。"
+                if previous_month_dates
+                else "未找到任何可辨識日期的前月 R14 歷史檔。"
+            )
+            return (
+                "r14_warning:"
+                f"缺少前月月底歷史資料：runtime 模板沒有 {previous_month} Actual，且找不到可驗證的 "
+                f"{previous_month_end:%Y/%m/%d} R14 月底快照。{latest_note}"
+                "本次仍會產出可驗證的 Actual、庫存與週轉資料；Forecast、安庫與下單數已留白。"
+                "空白基準不會寫回 runtime 模板。"
+                f" 已搜尋：{searched_dirs or '無'}。{candidate_note}"
             )
         result = sync_r14_template_actual_month_state(
             template_path,
@@ -2154,17 +2865,20 @@ class AutomationRunner:
         )
 
     def _find_r14_archive_for_report_date(self, report_date: date, *, exclude_path: Path) -> Path | None:
-        archive_dir = self._r14_archive_dir()
-        if not archive_dir.exists():
+        if not any(path.exists() and path.is_dir() for path in self._r14_archive_search_dirs()):
             return None
         excluded = exclude_path.resolve()
-        for path in sorted(archive_dir.glob("*/*.xlsx"), key=lambda candidate: candidate.stat().st_mtime, reverse=True):
+        for path in self._r14_archive_candidates():
             try:
                 if path.resolve() == excluded:
                     continue
                 if _r14_output_filename_report_date(path.name) != report_date:
                     continue
-                if r14_template_has_actual_month_state(path, report_date.strftime("%Y/%m")):
+                if r14_template_has_actual_month_state(
+                    path,
+                    report_date.strftime("%Y/%m"),
+                    allow_legacy_missing_n006=True,
+                ):
                     return path
             except OSError:
                 continue
@@ -2177,6 +2891,7 @@ class AutomationRunner:
                 _ensure_writable_file_for_update(template_path)
             except R14TransformError:
                 return self._copy_r14_template_to_state_for_update(template_path)
+            self._r14_runtime_template_path = template_path
             return template_path
 
         writable_dir = self._r14_writable_template_dir()
@@ -2196,6 +2911,21 @@ class AutomationRunner:
             return self._copy_r14_template_to_state_for_update(template_path)
         self._r14_runtime_template_path = writable_path
         return writable_path
+
+    def _r14_cloud_template_actions(self) -> list[str]:
+        result = self._r14_cloud_template_download_result
+        if result is None or not result.success:
+            return []
+        actions = []
+        if result.drive_file_id:
+            actions.append(f"r14_template_drive_file_id:{result.drive_file_id}")
+        if result.source_name:
+            actions.append(f"r14_template_drive_source_name:{result.source_name}")
+        if result.modified_time:
+            actions.append(f"r14_template_drive_modified_time:{result.modified_time}")
+        if result.sha256:
+            actions.append(f"r14_template_sha256:{result.sha256}")
+        return actions
 
     def _r14_writable_template_dir(self) -> Path:
         configured_dir = self.config.r14_transform.template_search_dir.strip()
@@ -2286,6 +3016,17 @@ class AutomationRunner:
             "找不到 R14 需要的 R13 raw data；請確認 R13 已下載完成，或在「基本設定」指定 R14 raw data 搜尋資料夾。",
         )
 
+    def _r13_no_data_marker_path(self) -> Path:
+        return r13_no_data_marker_path(Path(self.config.app.state_dir), run_date=self.run_date)
+
+    def _load_r13_no_data_marker_for_output(self, output: PlannedOutput) -> R13NoDataMarker | None:
+        return load_r13_no_data_marker(
+            self._r13_no_data_marker_path(),
+            expected_run_date=self.run_date,
+            expected_start_date=output.start_date,
+            expected_end_date=output.end_date,
+        )
+
     @staticmethod
     def _r13_raw_path_matches_expected_date(path: Path, expected_end_date: date) -> bool:
         try:
@@ -2343,6 +3084,44 @@ class AutomationRunner:
     def _r14_archive_dir(self) -> Path:
         return Path(self.config.app.downloads_dir) / "R14"
 
+    def _r14_archive_search_dirs(self) -> list[Path]:
+        configured_downloads = Path(self.config.app.downloads_dir)
+        candidates = [self._r14_archive_dir()]
+        runtime_downloads = self.runtime_paths.downloads_dir
+        candidates.append(runtime_downloads / "R14")
+
+        # The configured value is a base directory.  A prior installer/config
+        # migration may have persisted the current YYYYMMDD folder instead;
+        # recover only that one level so historical R14 files remain findable
+        # without scanning arbitrary parent folders.
+        date_folder_names = {
+            runtime_date_folder(self.run_date),
+            runtime_downloads.name,
+            configured_downloads.name,
+        }
+        if configured_downloads.name in date_folder_names and len(configured_downloads.name) == 8:
+            if configured_downloads.name.isdigit():
+                candidates.append(configured_downloads.parent / "R14")
+
+        unique: dict[Path, Path] = {}
+        for path in candidates:
+            unique.setdefault(path.resolve(), path)
+        return list(unique.values())
+
+    def _r14_archive_candidates(self) -> list[Path]:
+        candidates = [
+            path
+            for archive_dir in self._r14_archive_search_dirs()
+            if archive_dir.exists() and archive_dir.is_dir()
+            for pattern in ("*.xlsx", "*/*.xlsx")
+            for path in archive_dir.glob(pattern)
+            if path.is_file() and not path.name.startswith("~$")
+        ]
+        unique: dict[Path, Path] = {}
+        for path in candidates:
+            unique.setdefault(path.resolve(), path)
+        return sorted(unique.values(), key=lambda path: path.stat().st_mtime, reverse=True)
+
     def _google_drive_upload_preflight_failures(
         self,
         outputs: list[PlannedOutput],
@@ -2380,7 +3159,13 @@ class AutomationRunner:
                 )
         return failures
 
-    def _notify_r14_completion_if_needed(self, output: PlannedOutput, output_path: Path) -> ReportRunFailure | None:
+    def _notify_r14_completion_if_needed(
+        self,
+        output: PlannedOutput,
+        output_path: Path,
+        *,
+        warnings: list[str] | None = None,
+    ) -> ReportRunFailure | None:
         if output.task_id != "R14":
             return None
         if not self.config.r14_email.enabled:
@@ -2397,6 +3182,14 @@ class AutomationRunner:
             output=output,
             subject_date=subject_date,
         )
+        if warnings:
+            warning_lines = "<br>".join(escape(warning) for warning in warnings)
+            body = (
+                f"{body.rstrip()}\n\n"
+                '<p style="border:2px solid #C62828;background:#FFEBEE;padding:10px;">'
+                "<strong>R14 資料品質警告</strong><br>"
+                f"{warning_lines}</p>"
+            )
         body = self._append_r14_friday_analysis(body, output_path)
         try:
             result = self.gmail_sender_factory(self.config).send(
@@ -2451,7 +3244,7 @@ class AutomationRunner:
 
     def _build_r14_friday_analysis_section(self, current_path: Path) -> str:
         try:
-            current = load_r14_workbook_snapshot(current_path)
+            current = load_r14_workbook_snapshot(current_path, allow_legacy_missing_n006=True)
         except Exception:
             return self._format_r14_anomaly_table("週耗用量暴漲/暴跌超過30%:", None)
 
@@ -2472,9 +3265,7 @@ class AutomationRunner:
 
     def _find_r14_snapshot_for_report_date(self, report_date: date, *, current_path: Path) -> Any | None:
         paths = [current_path]
-        archive_dir = self._r14_archive_dir()
-        if archive_dir.exists():
-            paths.extend(sorted(archive_dir.glob("*/*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True))
+        paths.extend(self._r14_archive_candidates())
         seen: set[Path] = set()
         for path in paths:
             resolved = path.resolve()
@@ -2482,7 +3273,7 @@ class AutomationRunner:
                 continue
             seen.add(resolved)
             try:
-                snapshot = load_r14_workbook_snapshot(path)
+                snapshot = load_r14_workbook_snapshot(path, allow_legacy_missing_n006=True)
             except Exception:
                 continue
             if snapshot.report_date.date() == report_date:
@@ -2497,10 +3288,16 @@ class AutomationRunner:
         for item in current.items:
             previous_item = previous_items.get((item.branch, item.item_code))
             two_weeks_ago_item = two_weeks_ago_items.get((item.branch, item.item_code))
-            if previous_item is None or two_weeks_ago_item is None:
+            previous_actual = _r14_snapshot_actual_or_missing_branch_zero(previous, previous_item, item.branch)
+            two_weeks_ago_actual = _r14_snapshot_actual_or_missing_branch_zero(
+                two_weeks_ago,
+                two_weeks_ago_item,
+                item.branch,
+            )
+            if previous_actual is None or two_weeks_ago_actual is None:
                 continue
-            current_week_usage = item.actual - previous_item.actual
-            previous_week_usage = previous_item.actual - two_weeks_ago_item.actual
+            current_week_usage = item.actual - previous_actual
+            previous_week_usage = previous_actual - two_weeks_ago_actual
             growth_rate = _growth_rate(current_week_usage, previous_week_usage)
             if growth_rate is not None and abs(growth_rate) > 0.30:
                 rows.append(R14AnomalyRow(item.branch, item.item_code, item.item_name, growth_rate))
@@ -2572,8 +3369,6 @@ class AutomationRunner:
     ) -> AutomationRunSummary:
         if failures:
             details = format_report_failures(failures)
-            notify_result = self._notify_report_failures(details)
-            notify_suffix = f"；{notify_result.message}" if notify_result else ""
             skipped_suffix = f"，{skipped} 個無資料已略過" if skipped else ""
             summary_error_code = "PARTIAL_REPORT_RUN_FAILED" if completed or skipped else "REPORT_RUN_FAILED"
             if (
@@ -2583,7 +3378,7 @@ class AutomationRunner:
                 and failures[0].error_code == "POS_CONNECTION_FAILED"
             ):
                 summary_error_code = failures[0].error_code
-            summary_message = f"已完成 {completed} 個報表任務下載{skipped_suffix}，{len(failures)} 個失敗{notify_suffix}"
+            summary_message = f"已完成 {completed} 個報表任務下載{skipped_suffix}，{len(failures)} 個失敗"
             if not completed and not skipped and len(failures) == 1 and failures[0].error_code == "POS_CONNECTION_FAILED":
                 summary_message = failures[0].message
             return AutomationRunSummary(
@@ -2614,16 +3409,355 @@ class AutomationRunner:
             message=f"已完成 {total} 個報表任務下載與必要上傳。",
         )
 
+    def _finalize_failed_summary(self, summary: AutomationRunSummary) -> AutomationRunSummary:
+        enriched = self._attach_failure_evidence(summary)
+        details = enriched.details or format_report_failures(list(enriched.failures))
+        notify_result = self._notify_report_failures(details)
+        if notify_result is None:
+            return enriched
+        message = str(getattr(notify_result, "message", ""))
+        if not message:
+            return enriched
+        return replace(enriched, message=f"{enriched.message}；{message}")
+
+    def _write_outer_failure_diagnostic(
+        self,
+        *,
+        error_code: str,
+        message: str,
+        details: str | None,
+    ) -> Path | None:
+        timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S_%f")
+        path = self.runtime_paths.logs_dir / f"automation_runner_outer_failure_{timestamp}.json"
+        payload = {
+            "schema_version": 1,
+            "created_at": datetime.now(tz=UTC).isoformat(),
+            "app_version": self.app_version,
+            "run_source": self.run_source,
+            "run_date": self.run_date.isoformat(),
+            "error_code": error_code,
+            "message": _redact_evidence_text(message),
+            "details": _redact_evidence_text(details or ""),
+        }
+        try:
+            write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        except OSError:
+            return None
+        return path
+
+    def _attach_failure_evidence(self, summary: AutomationRunSummary) -> AutomationRunSummary:
+        try:
+            bundle_path = self._write_failure_evidence_bundle(summary)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            details = _append_summary_detail(summary.details, f"自動蒐證 ZIP 建立失敗：{error}")
+            return replace(summary, details=details, evidence_bundle_error=error)
+        details = _append_summary_detail(summary.details, f"自動蒐證 ZIP：{bundle_path}")
+        return replace(summary, details=details, evidence_bundle_path=str(bundle_path))
+
+    def _write_failure_evidence_bundle(self, summary: AutomationRunSummary) -> Path:
+        execution_id = (
+            self._runtime_phase_journal.execution_id
+            if self._runtime_phase_journal is not None
+            else uuid4().hex
+        )
+        timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S_%f")
+        bundle_path = self.runtime_paths.logs_dir / (
+            f"POSReportBot_failure_evidence_{timestamp}_{execution_id}.zip"
+        )
+        temporary_path = bundle_path.with_suffix(bundle_path.suffix + ".tmp")
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+
+        exact_candidates: list[tuple[Path, str]] = []
+        if self._runtime_phase_journal is not None:
+            exact_candidates.append((self._runtime_phase_journal.path, "runtime_journal"))
+        if self._native_crash_path is not None:
+            exact_candidates.append((self._native_crash_path, "native_crash"))
+        if self._active_run_state_store is not None:
+            exact_candidates.append((self._active_run_state_store.path, "active_run_state"))
+        for failure in summary.failures:
+            if failure.diagnostic_path:
+                exact_candidates.append((Path(failure.diagnostic_path), f"diagnostic:{failure.task_id}"))
+            exact_candidates.extend(
+                (Path(path), f"task_evidence:{failure.task_id}")
+                for path in failure.evidence_paths
+            )
+
+        included: list[dict[str, Any]] = []
+        omitted: list[dict[str, str]] = []
+        total_size = 0
+        max_file_size = 16 * 1024 * 1024
+        max_total_size = _FAILURE_EVIDENCE_MAX_TOTAL_SIZE
+        max_candidates = 96
+        max_elapsed_seconds = 8.0
+        allowed_roots = self._failure_evidence_allowed_roots()
+        queue = list(exact_candidates)
+        seen: set[str] = set()
+        bundle_started = monotonic()
+        stale_primary_identity: str | None = None
+        if (
+            self._active_run_state_store is not None
+            and self._active_run_state_store.path != self._active_run_state_store.primary_path
+        ):
+            try:
+                stale_primary_identity = str(self._active_run_state_store.primary_path.resolve()).casefold()
+            except OSError:
+                stale_primary_identity = str(self._active_run_state_store.primary_path).casefold()
+            omitted.append(
+                {
+                    "path": str(self._active_run_state_store.primary_path),
+                    "reason": "historical_locked_primary_not_current_execution",
+                }
+            )
+        try:
+            with zipfile.ZipFile(
+                temporary_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive:
+                while queue and len(seen) < max_candidates:
+                    candidate, role = queue.pop(0)
+                    if monotonic() - bundle_started > max_elapsed_seconds:
+                        omitted.append({"path": str(candidate), "reason": "bundle_time_limit"})
+                        break
+                    allowed, identity_or_reason = _evidence_candidate_allowed(candidate, allowed_roots)
+                    if not allowed:
+                        if identity_or_reason == "sensitive_filename_denied":
+                            omitted.append(
+                                {
+                                    "path": "<redacted-sensitive-path>",
+                                    "reason": identity_or_reason,
+                                }
+                            )
+                        else:
+                            omitted.append(
+                                {
+                                    "path": _redact_evidence_text(str(candidate)),
+                                    "reason": _redact_evidence_text(identity_or_reason),
+                                }
+                            )
+                        continue
+                    identity = identity_or_reason
+                    if stale_primary_identity is not None and identity == stale_primary_identity:
+                        if not any(
+                            item["path"] == str(candidate)
+                            and item["reason"] == "historical_locked_primary_not_current_execution"
+                            for item in omitted
+                        ):
+                            omitted.append(
+                                {
+                                    "path": str(candidate),
+                                    "reason": "historical_locked_primary_not_current_execution",
+                                }
+                            )
+                        continue
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    try:
+                        data, read_error = _read_bounded_evidence_file(candidate, max_file_size=max_file_size)
+                        if data is None:
+                            omitted.append({"path": str(candidate), "reason": read_error or "read_failed"})
+                            continue
+                        archive_data = _redacted_evidence_bytes(candidate, data)
+                        if total_size + len(archive_data) > max_total_size:
+                            omitted.append(
+                                {
+                                    "path": _redact_evidence_text(str(candidate)),
+                                    "reason": "size_limit_after_redaction",
+                                }
+                            )
+                            continue
+                        referenced_paths = _referenced_evidence_paths(candidate, data)
+                        for referenced_path in referenced_paths:
+                            if len(queue) + len(seen) >= max_candidates:
+                                break
+                            queue.append((referenced_path, f"referenced_by:{candidate.name}"))
+                        index = len(included) + 1
+                        archive_name = f"files/{index:03d}_{candidate.name}"
+                        archive.writestr(archive_name, archive_data)
+                        total_size += len(archive_data)
+                        included.append(
+                            {
+                                "source_path": str(candidate),
+                                "archive_name": archive_name,
+                                "role": role,
+                                "size": len(archive_data),
+                                "sha256": hashlib.sha256(archive_data).hexdigest(),
+                            }
+                        )
+                    except OSError as exc:
+                        omitted.append(
+                            {
+                                "path": str(candidate),
+                                "reason": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                manifest = {
+                    "schema_version": 1,
+                    "created_at": datetime.now(tz=UTC).isoformat(),
+                    "execution_id": execution_id,
+                    "app_version": self.app_version,
+                    "run_source": self.run_source,
+                    "run_date": self.run_date.isoformat(),
+                    "summary": _redact_evidence_object(asdict(summary)),
+                    "run_state_path": (
+                        str(self._active_run_state_store.path)
+                        if self._active_run_state_store is not None
+                        else None
+                    ),
+                    "runtime_journal_path": (
+                        str(self._runtime_phase_journal.path)
+                        if self._runtime_phase_journal is not None
+                        else None
+                    ),
+                    "native_crash_path": (
+                        str(self._native_crash_path)
+                        if self._native_crash_path is not None
+                        else None
+                    ),
+                    "included_files": included,
+                    "omitted_files": omitted,
+                    "limits": {
+                        "max_file_size": max_file_size,
+                        "max_total_size": max_total_size,
+                        "max_candidates": max_candidates,
+                        "max_elapsed_seconds": max_elapsed_seconds,
+                    },
+                }
+                safe_manifest = _redact_evidence_object(manifest)
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(safe_manifest, ensure_ascii=False, indent=2, default=str),
+                )
+            temporary_path.replace(bundle_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return bundle_path
+
+    def _failure_evidence_allowed_roots(self) -> tuple[Path, ...]:
+        roots = (
+            Path(self.config.app.logs_dir),
+            Path(self.config.app.screenshots_dir),
+            Path(self.config.app.state_dir),
+            Path(self.config.app.downloads_dir),
+            self.runtime_paths.logs_dir,
+            self.runtime_paths.screenshots_dir,
+            self.runtime_paths.state_dir,
+            self.runtime_paths.downloads_dir,
+        )
+        unique: dict[str, Path] = {}
+        for root in roots:
+            try:
+                unique.setdefault(str(root.resolve()).casefold(), root.resolve())
+            except OSError:
+                continue
+        return tuple(unique.values())
+
     def _notify_report_failures(self, details: str) -> Any | None:
         if not self.config.email.enabled or not self.config.email.notify_on_failure:
+            self._write_runtime_phase(
+                "email_notification_skipped",
+                notification_type="failure",
+                reason="disabled",
+            )
             return None
         subject = "POSReportBot 報表自動化失敗通知"
+        self._write_runtime_phase(
+            "email_notification_started",
+            notification_type="failure",
+            recipient_count=len(self.config.email.recipients),
+        )
         try:
             if self.failure_notifier is not None:
-                return self.failure_notifier(self.config.email, subject=subject, body=details)
-            return self.gmail_sender_factory(self.config).send(self.config.email, subject=subject, body=details)
+                result = self.failure_notifier(self.config.email, subject=subject, body=details)
+            else:
+                result = self.gmail_sender_factory(self.config).send(
+                    self.config.email,
+                    subject=subject,
+                    body=details,
+                )
         except Exception as exc:
-            return SimpleNamespace(ok=False, message=f"Gmail API 通知失敗：{exc}")
+            result = SimpleNamespace(ok=False, message=f"Gmail API 通知失敗：{exc}")
+        self._write_runtime_phase(
+            "email_notification_finished",
+            notification_type="failure",
+            ok=bool(getattr(result, "ok", False)),
+            message=str(getattr(result, "message", "")),
+        )
+        return result
+
+    def _notify_success_summary_if_needed(
+        self,
+        run_state_store: RunStateStore,
+        *,
+        completed: int,
+        total: int,
+        skipped: int,
+    ) -> Any | None:
+        if self.run_source != "windows_task_scheduler":
+            self._write_runtime_phase(
+                "email_notification_skipped",
+                notification_type="success_summary",
+                reason="not_scheduled_run",
+            )
+            return None
+        if not self.config.email.enabled or not self.config.email.notify_on_success_summary:
+            self._write_runtime_phase(
+                "email_notification_skipped",
+                notification_type="success_summary",
+                reason="disabled",
+            )
+            return None
+        if total == 1 and self._w02_issue_notification_sent:
+            self._write_runtime_phase(
+                "email_notification_skipped",
+                notification_type="success_summary",
+                reason="w02_issue_notification_already_sent",
+            )
+            return None
+        snapshot = run_state_store.load()
+        lines = [
+            "POSReportBot 每日自動化已完成。",
+            "",
+            f"執行日期：{self.run_date.isoformat()}",
+            f"執行來源：{self.run_source}",
+            f"完成：{completed}/{total}",
+        ]
+        if skipped:
+            lines.append(f"略過：{skipped}")
+        lines.extend(["", "任務結果："])
+        if snapshot is not None:
+            for output in snapshot.outputs.values():
+                evidence = f"；Drive file ID：{output.drive_file_id}" if output.drive_file_id else ""
+                lines.append(
+                    f"- {output.task_id}｜{output.output_filename}｜{output.status}{evidence}"
+                )
+        else:
+            lines.append("- 執行狀態檔目前無法讀取；請檢查 runtime log。")
+        subject = "POSReportBot 每日自動化完成摘要"
+        body = "\n".join(lines)
+        self._write_runtime_phase(
+            "email_notification_started",
+            notification_type="success_summary",
+            recipient_count=len(self.config.email.recipients),
+        )
+        try:
+            result = self.gmail_sender_factory(self.config).send(
+                self.config.email,
+                subject=subject,
+                body=body,
+            )
+        except Exception as exc:
+            result = SimpleNamespace(ok=False, message=f"Gmail API 摘要通知失敗：{exc}")
+        self._write_runtime_phase(
+            "email_notification_finished",
+            notification_type="success_summary",
+            ok=bool(getattr(result, "ok", False)),
+            message=str(getattr(result, "message", "")),
+        )
+        return result
 
     def _ensure_pos_session(self, on_progress: ProgressCallback | None, outputs: list[PlannedOutput]) -> Any:
         self._emit(on_progress, AutomationProgress("connect", "檢查 SPA-POS 是否已開啟"))
@@ -2638,13 +3772,22 @@ class AutomationRunner:
             except Exception as exc:
                 raise RuntimeError(f"POS 自動啟動或連線失敗：{exc}") from exc
             self._emit(on_progress, AutomationProgress("connect", "SPA-POS 已啟動並連接"))
+        self._write_runtime_phase("pos_login_check_start")
         window = self._login_if_required(self.config, window)
+        self._validate_or_record_pos_session_profile(self.config, window)
+        self._write_runtime_phase("pos_login_check_finished")
+        self._write_runtime_phase(
+            "pos_readiness_check_start",
+            task_ids=[output.task_id for output in outputs],
+        )
         window = self._wait_for_pos_main_menu_ready(self.config, window, outputs)
+        self._write_runtime_phase("pos_readiness_check_finished")
         return window
 
     def _reconnect_ready_pos_session(self, on_progress: ProgressCallback | None, outputs: list[PlannedOutput]) -> Any:
         window = self._connect_pos_window()
         window = self._login_if_required(self.config, window)
+        self._validate_or_record_pos_session_profile(self.config, window)
         window = self._wait_for_pos_main_menu_ready(self.config, window, outputs)
         self._emit(on_progress, AutomationProgress("recovery", "已重新連接並確認 SPA-POS 主畫面可執行後續任務"))
         return window
@@ -2759,6 +3902,11 @@ class AutomationRunner:
     def _build_google_drive_uploader(self, config: ProjectConfig) -> DriveUploader:
         return GoogleDriveUploader(GoogleOAuthService(config, scopes=GOOGLE_DRIVE_SCOPES, profile=GOOGLE_DRIVE_PROFILE))
 
+    def _build_google_drive_template_downloader(self, config: ProjectConfig) -> DriveTemplateDownloader:
+        return GoogleDriveTemplateDownloader(
+            GoogleOAuthService(config, scopes=GOOGLE_DRIVE_SCOPES, profile=GOOGLE_DRIVE_PROFILE)
+        )
+
     def _build_gmail_sender(self, config: ProjectConfig) -> GmailOAuthSender:
         return GmailOAuthSender(GoogleOAuthService(config, scopes=GOOGLE_GMAIL_SCOPES, profile=GOOGLE_GMAIL_PROFILE))
 
@@ -2766,12 +3914,30 @@ class AutomationRunner:
         return GoogleSheetsInventoryClient(GoogleOAuthService(config, scopes=GOOGLE_SHEETS_SCOPES, profile=GOOGLE_SHEETS_PROFILE))
 
     def _close_pos_after_run_if_configured(self, window: Any | None, on_progress: ProgressCallback | None) -> None:
-        if not self.config.pos.close_after_run:
-            return
         if window is None:
-            self._emit(on_progress, AutomationProgress("finish", "已設定任務結束後關閉 POS，但目前沒有可關閉的 POS 視窗。"))
+            self._emit(on_progress, AutomationProgress("finish", "本輪沒有可關閉的 POS 視窗。"))
             return
-        self._emit(on_progress, AutomationProgress("finish", "所有設定任務已跑完，正在關閉 SPA-POS"))
+        if self._preserve_pos_after_run_reason is not None:
+            self._write_runtime_phase(
+                "pos_close_skipped",
+                reason=self._preserve_pos_after_run_reason,
+                process_id=_safe_control_process_id(window),
+            )
+            self._emit(
+                on_progress,
+                AutomationProgress(
+                    "finish",
+                    "W02 在存檔前中斷，已保留 SPA-POS 與未儲存草稿；下次只會在逐列核對完全一致後接續。",
+                ),
+            )
+            return
+        self._write_runtime_phase(
+            "pos_close_start",
+            active_profile=self._active_pos_session_profile,
+            profile_evidence=self._active_pos_session_profile_evidence,
+            process_id=_safe_control_process_id(window),
+        )
+        self._emit(on_progress, AutomationProgress("finish", "本輪 POS 工作階段已結束，正在關閉 SPA-POS"))
         close = getattr(window, "close", None)
         if not callable(close):
             self._emit(on_progress, AutomationProgress("finish", "目前 POS 視窗沒有提供可用的 close 方法；已略過關閉。"))
@@ -2785,12 +3951,192 @@ class AutomationRunner:
                 self._emit(on_progress, AutomationProgress("finish", f"關閉 SPA-POS 失敗：{exc}"))
         except Exception as exc:
             self._emit(on_progress, AutomationProgress("finish", f"關閉 SPA-POS 失敗：{exc}"))
+            return
+
+        if self._confirm_pos_exit_dialog(window, on_progress):
+            self._clear_pos_session_profile_marker()
+            self._write_runtime_phase("pos_close_finished", method="confirmed_exit")
+            return
+        if self._pos_window_still_open(window):
+            message = "SPA-POS 關閉後仍停留在結束確認視窗，未能按下「是(Y)」；只嘗試終止目前視窗所屬的 POS 程序。"
+            self._emit(on_progress, AutomationProgress("finish", message))
+            self._write_preparation_failure_diagnostic(
+                [],
+                error_code="POS_EXIT_CONFIRMATION_NOT_CONFIRMED",
+                message=message,
+                window=window,
+                note="批次結束時已呼叫 POS close，但確認視窗未完成；已保留自動截圖與 UI probe，只允許依目前視窗 PID 終止，不使用 image name 終止其他 POS。",
+            )
+            if not self._terminate_pos_process(
+                self.config,
+                window=window,
+                allow_image_fallback=False,
+            ):
+                self._write_runtime_phase(
+                    "pos_close_unverified",
+                    reason="current_window_process_termination_unavailable_or_failed",
+                    process_id=_safe_control_process_id(window),
+                )
+                return
+        self._clear_pos_session_profile_marker()
+        self._write_runtime_phase("pos_close_finished", method="window_close_or_forced_termination")
+
+    def _confirm_pos_exit_dialog(self, window: Any, on_progress: ProgressCallback | None) -> bool:
+        direct_confirm = getattr(window, "confirm_exit", None)
+        if callable(direct_confirm):
+            try:
+                if bool(direct_confirm()):
+                    self._emit(on_progress, AutomationProgress("finish", "已按下 SPA-POS 結束確認「是(Y)」。"))
+                    return True
+            except Exception:
+                pass
+
+        deadline = monotonic() + 5.0
+        while monotonic() < deadline:
+            for dialog in self._find_pos_exit_confirmation_dialogs(window):
+                if not self._dialog_contains_exit_confirmation(dialog):
+                    continue
+                button = self._find_pos_exit_yes_button(dialog)
+                if button is None:
+                    continue
+                for method_name in ("click_input", "click", "invoke"):
+                    method = getattr(button, method_name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        method()
+                        self._emit(on_progress, AutomationProgress("finish", "已按下 SPA-POS 結束確認「是(Y)」。"))
+                        return True
+                    except Exception:
+                        continue
+            sleep(0.2)
+        return False
+
+    def _find_pos_exit_confirmation_dialogs(self, window: Any) -> list[Any]:
+        dialogs: list[Any] = []
+        roots = [window]
+        for method_name in ("children", "descendants"):
+            method = getattr(window, method_name, None)
+            if callable(method):
+                try:
+                    roots.extend(list(method()))
+                except Exception:
+                    pass
+        for control in roots:
+            if "結束程式確認" in _safe_control_name(control):
+                dialogs.append(control)
+        if not sys.platform.startswith("win"):
+            return dialogs
+        try:
+            from pywinauto import Desktop  # type: ignore[import-untyped]
+        except ImportError:
+            return dialogs
+        # A global UIA Desktop.windows() scan can raise an uncatchable native
+        # COM failure on SPA-POS. Local-window probing above remains primary;
+        # the desktop fallback is native Win32 only.
+        for backend in ("win32",):
+            try:
+                desktop = Desktop(backend=backend)
+                dialogs.extend(list(desktop.windows(title="結束程式確認", visible_only=True)))
+            except Exception:
+                continue
+        unique: list[Any] = []
+        seen: set[int] = set()
+        for dialog in dialogs:
+            identity = id(dialog)
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(dialog)
+        return unique
+
+    @staticmethod
+    def _dialog_contains_exit_confirmation(dialog: Any) -> bool:
+        parts = [_safe_control_name(dialog)]
+        for method_name in ("children", "descendants"):
+            method = getattr(dialog, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                parts.extend(_safe_control_name(control) for control in method())
+            except Exception:
+                continue
+        text = " ".join(parts)
+        return "結束程式確認" in text or "確定要結束本程式" in text
+
+    @staticmethod
+    def _find_pos_exit_yes_button(dialog: Any) -> Any | None:
+        controls: list[Any] = []
+        for method_name in ("children", "descendants"):
+            method = getattr(dialog, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                controls.extend(list(method()))
+            except Exception:
+                continue
+        for control in controls:
+            name = _safe_control_name(control).strip()
+            automation_id = _safe_automation_id(control)
+            if not (name.startswith("是") or automation_id == "6"):
+                continue
+            is_enabled = getattr(control, "is_enabled", None)
+            if callable(is_enabled):
+                try:
+                    if not bool(is_enabled()):
+                        continue
+                except Exception:
+                    continue
+            return control
+        return None
+
+    @staticmethod
+    def _pos_window_still_open(window: Any) -> bool:
+        for method_name in ("exists", "is_visible"):
+            method = getattr(window, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                return bool(method())
+            except Exception:
+                continue
+        return False
 
     def _connect_pos_window(self, *, backend: str | None = None) -> Any:
-        return self.connect_pos_window_func(
+        selected_backend = backend or self.config.pos.backend
+        self._write_runtime_phase(
+            "pos_connect_start",
+            backend=selected_backend,
             window_title_contains=self.config.pos.window_title_contains,
-            backend=backend or self.config.pos.backend,
         )
+        try:
+            window = self.connect_pos_window_func(
+                window_title_contains=self.config.pos.window_title_contains,
+                backend=selected_backend,
+            )
+        except BaseException as exc:
+            self._write_runtime_phase(
+                "pos_connect_error",
+                backend=selected_backend,
+                exception_type=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
+        self._last_pos_window = window
+        self._last_connected_backend = self._connected_backend(window)
+        self._write_runtime_phase(
+            "pos_connect_success",
+            backend=self._last_connected_backend,
+        )
+        return window
+
+    def _write_runtime_phase(self, phase: str, **details: Any) -> Path | None:
+        journal = self._runtime_phase_journal
+        if journal is None:
+            return None
+        try:
+            return journal.write(phase, **details)
+        except OSError:
+            return None
 
     def _build_automator(self, window: Any, save_as_handler: Any) -> ReportWindowAutomator:
         return self.automator_factory(
@@ -2807,6 +4153,9 @@ class AutomationRunner:
                 "config_path": str(self.settings_path),
                 "configured_backend": self.config.pos.backend,
                 "connected_backend": self._connected_backend(window),
+                "configured_startup_ini_profile": self.config.pos.startup_ini_profile,
+                "active_pos_session_profile": self._active_pos_session_profile,
+                "active_pos_session_profile_evidence": self._active_pos_session_profile_evidence,
                 "run_source": self.run_source,
                 "run_date": self.run_date.isoformat(),
                 "downloads_dir": str(self.runtime_paths.downloads_dir),
@@ -2872,31 +4221,63 @@ class AutomationRunner:
     def _can_recover_pos(self, exc: ReportAutomationError, restart_count: int) -> bool:
         if not self.config.pos_recovery.enabled:
             return False
-        if exc.error_code not in {
+        recoverable_codes = {
             "POS_NOT_RESPONDING",
             "EXPORT_PROGRESS_TIMEOUT",
             "POS_SESSION_INVALID",
+            "VIEW_REPORT_NOT_TRIGGERED",
             "EXPORT_BUTTON_NOT_READY",
             "EXPORT_MENU_OPEN_FAILED",
             "EXPORT_FORMAT_NOT_FOUND",
             "EXPORT_FORMAT_NOT_ACTIVATED",
-        }:
+            "EXPORT_MENU_NOT_OPENED",
+            "SAVE_AS_DIALOG_NOT_FOUND",
+            "REPORT_SCREEN_NOT_OPENED",
+            "REPORT_ROOT_MENU_NOT_FOUND",
+        }
+        if exc.error_code == "REPORT_MENU_NOT_FOUND":
+            # Only retry a menu failure when the log proves the transient
+            # POS-owned menu recovery path ran. A plain label mismatch should
+            # remain a normal report failure, not trigger a blind restart.
+            recoverable = any(
+                "menu_root_reopen" in action or "skip_click_hidden_menu_item" in action
+                for action in exc.actions
+            )
+        else:
+            recoverable = exc.error_code in recoverable_codes
+        if not recoverable:
             return False
         return restart_count < self.config.pos_recovery.max_restarts_per_run
 
     def _recover_pos_session(self, config: ProjectConfig, on_progress: ProgressCallback | None) -> Any:
+        self._pos_startup_ini_profile_verified_this_run = None
+        self._pos_startup_ini_process_id_verified_this_run = None
+        self._pos_startup_ini_process_created_at_verified_this_run = None
         if config.pos_recovery.kill_process_on_hang:
             self._emit(on_progress, AutomationProgress("recovery", "強制關閉 SPA-POS"))
-            self._terminate_pos_process(config)
+            if self._terminate_pos_process(
+                config,
+                window=self._last_pos_window,
+                allow_image_fallback=self._last_pos_window is None,
+            ):
+                self._clear_pos_session_profile_marker()
         sleep(max(config.pos_recovery.restart_delay_seconds, 0))
         if config.pos_recovery.relaunch_after_kill:
             self._emit(on_progress, AutomationProgress("recovery", "重新啟動 SPA-POS"))
             self._launch_pos_process(config)
         window = self._wait_for_reconnected_pos_window(config)
         window = self._login_if_required(config, window)
+        self._validate_or_record_pos_session_profile(config, window)
         return window
 
-    def _terminate_pos_process(self, config: ProjectConfig) -> None:
+    def _terminate_pos_process(
+        self,
+        config: ProjectConfig,
+        *,
+        window: Any | None = None,
+        allow_image_fallback: bool = True,
+    ) -> bool:
+        process_id = _safe_control_process_id(window) if window is not None else None
         resolution = resolve_pos_executable_path(config.pos.executable_path)
         executable_path = resolution.path
         if executable_path is not None and executable_path.suffix.lower() == ".exe":
@@ -2904,29 +4285,114 @@ class AutomationRunner:
         else:
             process_name = DEFAULT_POS_EXECUTABLE_NAME
         if not sys.platform.startswith("win"):
-            return
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/IM", process_name],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+            return False
+        if process_id is not None:
+            command = ["taskkill", "/F", "/T", "/PID", str(process_id)]
+        elif allow_image_fallback:
+            command = ["taskkill", "/F", "/T", "/IM", process_name]
+        else:
+            return False
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return False
+        return int(getattr(result, "returncode", 0) or 0) == 0
 
     def _launch_pos_process(self, config: ProjectConfig) -> None:
         resolution = resolve_pos_executable_path(config.pos.executable_path)
         if not resolution.ok or resolution.path is None:
             raise RuntimeError(resolution.failure_message())
         executable_path = resolution.path
+        self._pos_launch_process = None
+        self._pos_launch_evidence = {
+            "configured_path": config.pos.executable_path,
+            "resolved_path": str(executable_path),
+            "launch_kind": "appref-ms" if executable_path.suffix.lower() == ".appref-ms" else "executable",
+            "working_dir": config.pos.working_dir or None,
+            "launch_args_present": bool(config.pos.launch_args.strip()),
+            "launch_requested": False,
+            "requested_at": datetime.now(tz=UTC).isoformat(timespec="microseconds"),
+            "pid": None,
+            "alive": None,
+            "returncode": None,
+        }
         if executable_path.suffix.lower() == ".appref-ms":
             startfile = getattr(os, "startfile", None)
             if startfile is None:
                 raise RuntimeError("appref-ms 啟動只支援 Windows。")
-            startfile(str(executable_path))
+            try:
+                startfile(str(executable_path))
+            except OSError as exc:
+                self._pos_launch_evidence.update(
+                    launch_error=str(exc),
+                    launch_error_type=type(exc).__name__,
+                )
+                raise RuntimeError(f"啟動 POS ClickOnce appref 失敗：{exc}") from exc
+            self._pos_launch_evidence.update(
+                launch_requested=True,
+                process_tracking="shell_startfile_unavailable",
+            )
             return
         command = [str(executable_path)]
         if config.pos.launch_args:
             command.extend(shlex.split(config.pos.launch_args, posix=False))
-        subprocess.Popen(command, cwd=config.pos.working_dir or None)
+        try:
+            self._pos_launch_process = subprocess.Popen(command, cwd=config.pos.working_dir or None)
+        except OSError as exc:
+            self._pos_launch_evidence.update(
+                launch_error=str(exc),
+                launch_error_type=type(exc).__name__,
+            )
+            raise RuntimeError(f"啟動 POS 執行檔失敗：{exc}") from exc
+        self._pos_launch_evidence.update(
+            launch_requested=True,
+            pid=getattr(self._pos_launch_process, "pid", None),
+            process_tracking="popen",
+        )
+        self._refresh_pos_launch_evidence()
+
+    def _refresh_pos_launch_evidence(self) -> None:
+        process = self._pos_launch_process
+        if process is None:
+            return
+        poll = getattr(process, "poll", None)
+        if not callable(poll):
+            return
+        try:
+            returncode = poll()
+        except Exception as exc:
+            self._pos_launch_evidence.update(
+                process_poll_error=str(exc),
+                process_poll_error_type=type(exc).__name__,
+            )
+            return
+        self._pos_launch_evidence.update(
+            pid=getattr(process, "pid", self._pos_launch_evidence.get("pid")),
+            returncode=returncode,
+            alive=returncode is None,
+        )
+
+    def _pos_launch_evidence_snapshot(self) -> dict[str, Any]:
+        self._refresh_pos_launch_evidence()
+        if self._pos_launch_evidence:
+            return dict(self._pos_launch_evidence)
+        return {
+            "configured_path": self.config.pos.executable_path,
+            "resolved_path": self._resolved_pos_executable_path_for_diagnostic(),
+            "launch_requested": False,
+        }
+
+    def _resolved_pos_executable_path_for_diagnostic(self) -> str | None:
+        try:
+            resolution = resolve_pos_executable_path(self.config.pos.executable_path)
+        except Exception:
+            return None
+        return str(resolution.path) if resolution.path is not None else None
 
     def _wait_for_reconnected_pos_window(self, config: ProjectConfig) -> Any:
         deadline = monotonic() + max(config.pos.startup_wait_seconds, 1)
@@ -2949,18 +4415,25 @@ class AutomationRunner:
             password: str | None = None
             try:
                 window = self._prepare_pos_window_for_login(config, window)
+                _raise_if_invalid_window_handle(window)
                 login_visible = self._login_screen_visible(config, window)
                 if not login_visible:
-                    if self._pos_main_screen_visible(window):
+                    if self._pos_main_screen_visible(window) or self._pos_report_surface_visible(window):
                         return window
-                    if self._visible_control_names(window):
-                        ready_window = self._wait_for_login_or_main_screen(config, window)
-                        if ready_window is None:
-                            raise RuntimeError("POS 尚未出現登入畫面或完整主選單，不能開始輸入帳密或執行報表。")
-                        window = ready_window
-                        login_visible = self._login_screen_visible(config, window)
-                        if not login_visible and self._pos_main_screen_visible(window):
-                            return window
+                    # A connected POS can briefly expose an incomplete MDI tree
+                    # while it is starting or switching forms. Never fall
+                    # through to credential input without positive login evidence.
+                    ready_window = self._wait_for_login_or_main_screen(config, window)
+                    if ready_window is None:
+                        raise RuntimeError("POS 尚未出現登入畫面或完整主選單，不能開始輸入帳密或執行報表。")
+                    window = ready_window
+                    login_visible = self._login_screen_visible(config, window)
+                    if not login_visible and (
+                        self._pos_main_screen_visible(window) or self._pos_report_surface_visible(window)
+                    ):
+                        return window
+                    if not login_visible:
+                        raise RuntimeError("POS 等待後仍不是可辨識的登入畫面，已停止輸入帳密。")
                 password = self._pos_login_password(config)
                 direct_login = _safe_method(window, "login_pos")
                 if callable(direct_login):
@@ -2997,6 +4470,12 @@ class AutomationRunner:
                 if _is_invalid_window_handle_error(exc):
                     if password is None:
                         password = self._pos_login_password(config)
+                    # A stale pywinauto wrapper does not imply that the new
+                    # login form also requires keyboard fallback. Reconnect
+                    # once and retry the normal, verifiable control path first.
+                    if attempt == 0:
+                        window = self._wait_for_reconnected_pos_window(config)
+                        continue
                     if self._keyboard_login_available():
                         fresh_window = self._wait_for_reconnected_pos_window(config)
                         keyboard_window = self._keyboard_login_and_wait(config, password, window=fresh_window)
@@ -3006,9 +4485,6 @@ class AutomationRunner:
                             "POS_LOGIN_FAILED: POS 自動登入失敗：登入視窗 handle 已失效，"
                             "重連並用鍵盤輸入帳密後仍未登入。"
                         ) from exc
-                    if attempt == 0:
-                        window = self._wait_for_reconnected_pos_window(config)
-                        continue
                 raise
         return window
 
@@ -3087,11 +4563,17 @@ class AutomationRunner:
                 "POS_STARTUP_INI_SELECTION_FAILED: 偵測到 POS 啟動 ini 選擇視窗，"
                 f"但無法確認已選中設定的 ini：{target_profile}；目前選取值：{current}"
             )
+        selection_process_id = _safe_control_process_id(window)
+        selection_process_created_at = _safe_process_creation_time(selection_process_id)
         self._write_pos_startup_ini_log_event(
             "selection_verified",
             target_profile=target_profile,
             controls=controls,
             current_selected=self._pos_startup_ini_selected_text(combo),
+            selection_process_id=selection_process_id,
+            selection_process_created_at=selection_process_created_at,
+            launch_requested=bool(self._pos_launch_evidence.get("launch_requested")),
+            launch_requested_at=self._pos_launch_evidence.get("requested_at"),
         )
         click = _safe_method(confirm_button, "click_input") or _safe_method(confirm_button, "click")
         if not callable(click):
@@ -3120,12 +4602,349 @@ class AutomationRunner:
             target_profile=target_profile,
             controls=controls,
             current_selected=self._pos_startup_ini_selected_text(combo),
+            selection_process_id=selection_process_id,
+            selection_process_created_at=selection_process_created_at,
+            launch_requested=bool(self._pos_launch_evidence.get("launch_requested")),
+            launch_requested_at=self._pos_launch_evidence.get("requested_at"),
         )
+        self._pos_startup_ini_profile_verified_this_run = target_profile
+        self._pos_startup_ini_process_id_verified_this_run = selection_process_id
+        self._pos_startup_ini_process_created_at_verified_this_run = selection_process_created_at
         sleep(0.5)
         try:
             return self._connect_pos_window()
         except Exception:
             return window
+
+    @staticmethod
+    def _pos_preparation_error_code(exc: Exception, *, default: str) -> str:
+        message = str(exc)
+        for error_code in (
+            "POS_ACTIVE_SESSION_PROFILE_MISMATCH",
+            "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED",
+        ):
+            if error_code in message:
+                return error_code
+        return default
+
+    def _pos_session_profile_marker_path(self) -> Path:
+        return Path(self.config.app.state_dir) / POS_SESSION_PROFILE_MARKER_FILENAME
+
+    def _validate_or_record_pos_session_profile(self, config: ProjectConfig, window: Any) -> None:
+        if not config.pos.startup_ini_selection_enabled:
+            self._active_pos_session_profile = None
+            self._active_pos_session_profile_evidence = "selection_disabled"
+            return
+        target_profile = config.pos.startup_ini_profile.strip()
+        if not target_profile:
+            self._active_pos_session_profile = None
+            self._active_pos_session_profile_evidence = "target_empty"
+            return
+
+        selected_this_run = self._pos_startup_ini_profile_verified_this_run
+        if selected_this_run is not None:
+            if not self._pos_startup_ini_profile_matches(selected_this_run, target_profile):
+                raise RuntimeError(
+                    "POS_ACTIVE_SESSION_PROFILE_MISMATCH: 本次 POS 啟動時確認的 ini 與目前設定不一致；"
+                    f"啟動時={selected_this_run}；目前設定={target_profile}。"
+                )
+            selected_process_id = self._pos_startup_ini_process_id_verified_this_run
+            current_process_id = _safe_control_process_id(window)
+            selected_process_created_at = self._pos_startup_ini_process_created_at_verified_this_run
+            current_process_created_at = _safe_process_creation_time(current_process_id)
+            process_handoff_verified = False
+            same_process_fresh_rebind_verified = False
+            same_process_run_scoped_verified = False
+            if (
+                selected_process_id is not None
+                or current_process_id is not None
+            ) and selected_process_id != current_process_id:
+                process_handoff_verified = self._pos_startup_process_handoff_verified(
+                    current_process_id=current_process_id,
+                    current_process_created_at=current_process_created_at,
+                )
+                if not process_handoff_verified:
+                    raise RuntimeError(
+                        "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: ini 選擇證據與目前 SPA-POS 不屬於同一個程序，"
+                        "且無法證明是本輪 RPA 啟動後的合法程序交棒；"
+                        "請先關閉 SPA-POS，再由 RPA 依目前設定重新啟動。"
+                    )
+            elif (
+                current_process_id is not None
+                and selected_process_id == current_process_id
+                and selected_process_created_at is None
+            ):
+                # On the real ClickOnce host, querying the chooseini process
+                # creation time can transiently fail even though its PID stays
+                # unchanged through the final SPA-POS window. Rebind only when
+                # the final creation time proves this is a process born after
+                # this runner's own launch request.
+                same_process_fresh_rebind_verified = self._pos_startup_process_handoff_verified(
+                    current_process_id=current_process_id,
+                    current_process_created_at=current_process_created_at,
+                )
+                if current_process_created_at is None:
+                    same_process_run_scoped_verified = (
+                        self._pos_startup_same_process_run_scoped_verified(
+                            selected_process_id=selected_process_id,
+                            current_process_id=current_process_id,
+                        )
+                    )
+            if current_process_id is not None and (
+                not process_handoff_verified
+                and not same_process_fresh_rebind_verified
+                and not same_process_run_scoped_verified
+                and (
+                    selected_process_created_at is None
+                    or current_process_created_at is None
+                    or selected_process_created_at != current_process_created_at
+                )
+            ):
+                raise RuntimeError(
+                    "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: ini 選擇證據與目前 SPA-POS 的程序建立時間不一致；"
+                    "請先關閉 SPA-POS，再由 RPA 依目前設定重新啟動。"
+                )
+            if same_process_run_scoped_verified:
+                self._active_pos_session_profile = selected_this_run
+                self._active_pos_session_profile_evidence = (
+                    "selected_this_run_same_pid_run_scoped"
+                )
+                self._pos_launch_evidence["profile_run_scoped_bound_process_id"] = (
+                    current_process_id
+                )
+                self._write_runtime_phase(
+                    "pos_session_profile_verified",
+                    configured_profile=target_profile,
+                    active_profile=selected_this_run,
+                    evidence=self._active_pos_session_profile_evidence,
+                    process_id=current_process_id,
+                    process_created_at=None,
+                    persistence="run_scoped_only",
+                    marker_path=None,
+                )
+                return
+            self._record_pos_session_profile(
+                selected_this_run,
+                process_id=current_process_id,
+                process_created_at=current_process_created_at,
+                evidence=(
+                    "selected_this_run_launched_process_handoff"
+                    if process_handoff_verified
+                    else (
+                        "selected_this_run_fresh_process_rebound"
+                        if same_process_fresh_rebind_verified
+                        else "selected_this_run_process_bound"
+                    )
+                ),
+            )
+            if process_handoff_verified or same_process_fresh_rebind_verified:
+                self._pos_launch_evidence["profile_handoff_bound_process_id"] = current_process_id
+                self._pos_launch_evidence["profile_handoff_bound_process_created_at"] = current_process_created_at
+                self._pos_startup_ini_process_id_verified_this_run = current_process_id
+                self._pos_startup_ini_process_created_at_verified_this_run = current_process_created_at
+            return
+
+        marker_path = self._pos_session_profile_marker_path()
+        if not marker_path.exists():
+            current_process_id = _safe_control_process_id(window)
+            self._active_pos_session_profile = None
+            self._active_pos_session_profile_evidence = "existing_session_without_marker"
+            self._write_runtime_phase(
+                "pos_session_profile_unverified",
+                reason="marker_missing",
+                configured_profile=target_profile,
+                process_id=current_process_id,
+            )
+            if current_process_id is not None:
+                raise RuntimeError(
+                    "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: 目前已開啟的 SPA-POS 沒有可驗證的 ini 環境證明；"
+                    "請先關閉 SPA-POS，再由 RPA 依目前設定重新啟動。"
+                )
+            return
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            self._active_pos_session_profile = None
+            self._active_pos_session_profile_evidence = "invalid_marker"
+            raise RuntimeError(
+                "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: 既有 SPA-POS 的環境證明檔無法讀取；"
+                "請先關閉 SPA-POS，再由 RPA 依目前設定重新啟動。"
+            ) from exc
+
+        marker_profile = str(marker.get("profile") or "").strip()
+        marker_process_id = _coerce_positive_int(marker.get("process_id"))
+        marker_process_created_at = str(marker.get("process_created_at") or "").strip() or None
+        current_process_id = _safe_control_process_id(window)
+        if marker_process_id is None or current_process_id is None or marker_process_id != current_process_id:
+            self._active_pos_session_profile = None
+            self._active_pos_session_profile_evidence = "process_identity_mismatch"
+            raise RuntimeError(
+                "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: 目前 SPA-POS 不是環境證明檔所綁定的同一個程序；"
+                "請先關閉 SPA-POS，再由 RPA 依目前設定重新啟動。"
+            )
+        current_process_created_at = _safe_process_creation_time(current_process_id)
+        if (
+            marker_process_created_at is None
+            or current_process_created_at is None
+            or marker_process_created_at != current_process_created_at
+        ):
+            self._active_pos_session_profile = None
+            self._active_pos_session_profile_evidence = "process_creation_time_mismatch"
+            raise RuntimeError(
+                "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: SPA-POS 的 PID 相同，但程序建立時間與環境證明不一致；"
+                "請先關閉 SPA-POS，再由 RPA 依目前設定重新啟動。"
+            )
+        if not marker_profile or not self._pos_startup_ini_profile_matches(marker_profile, target_profile):
+            self._active_pos_session_profile = marker_profile or None
+            self._active_pos_session_profile_evidence = "attested_profile_mismatch"
+            raise RuntimeError(
+                "POS_ACTIVE_SESSION_PROFILE_MISMATCH: 目前已開啟的 SPA-POS 環境與 RPA 設定不同；"
+                f"實際工作階段={marker_profile or '(無法辨識)'}；目前設定={target_profile}。"
+                "請先關閉 SPA-POS，再重新執行，讓 RPA 在啟動視窗選擇正確環境。"
+            )
+
+        self._active_pos_session_profile = marker_profile
+        self._active_pos_session_profile_evidence = "process_bound_marker"
+        self._write_runtime_phase(
+            "pos_session_profile_verified",
+            configured_profile=target_profile,
+            active_profile=marker_profile,
+            evidence=self._active_pos_session_profile_evidence,
+            process_id=current_process_id,
+            process_created_at=current_process_created_at,
+            marker_path=str(marker_path),
+        )
+
+    def _pos_startup_process_handoff_verified(
+        self,
+        *,
+        current_process_id: int | None,
+        current_process_created_at: str | None,
+    ) -> bool:
+        if current_process_id is None or current_process_created_at is None:
+            return False
+        if not bool(self._pos_launch_evidence.get("launch_requested")):
+            return False
+        if self._pos_launch_evidence.get("profile_handoff_bound_process_id") is not None:
+            return False
+        launch_requested_at = _parse_utc_datetime(self._pos_launch_evidence.get("requested_at"))
+        current_created_at = _parse_utc_datetime(current_process_created_at)
+        if launch_requested_at is None or current_created_at is None:
+            return False
+        return current_created_at >= launch_requested_at - timedelta(seconds=2)
+
+    def _pos_startup_same_process_run_scoped_verified(
+        self,
+        *,
+        selected_process_id: int | None,
+        current_process_id: int | None,
+    ) -> bool:
+        if (
+            selected_process_id is None
+            or current_process_id is None
+            or selected_process_id != current_process_id
+        ):
+            return False
+        if not bool(self._pos_launch_evidence.get("launch_requested")):
+            return False
+        if self._pos_launch_evidence.get("profile_handoff_bound_process_id") is not None:
+            return False
+        bound_process_id = _coerce_positive_int(
+            self._pos_launch_evidence.get("profile_run_scoped_bound_process_id")
+        )
+        if bound_process_id is not None:
+            return bound_process_id == current_process_id
+        launch_requested_at = _parse_utc_datetime(self._pos_launch_evidence.get("requested_at"))
+        if launch_requested_at is None:
+            return False
+        now = datetime.now(tz=UTC)
+        return (
+            launch_requested_at <= now + timedelta(seconds=2)
+            and now - launch_requested_at <= timedelta(minutes=10)
+        )
+
+    def _record_pos_session_profile(
+        self,
+        profile: str,
+        *,
+        process_id: int | None,
+        process_created_at: str | None,
+        evidence: str = "selected_this_run_process_bound",
+    ) -> None:
+        self._active_pos_session_profile = profile
+        if process_id is None:
+            self._active_pos_session_profile_evidence = "selected_this_run_process_unknown"
+            self._write_runtime_phase(
+                "pos_session_profile_attestation_not_written",
+                configured_profile=self.config.pos.startup_ini_profile,
+                active_profile=profile,
+                reason="process_id_unavailable",
+            )
+            return
+        if process_created_at is None:
+            self._active_pos_session_profile_evidence = "selected_this_run_process_creation_time_unknown"
+            self._write_runtime_phase(
+                "pos_session_profile_attestation_not_written",
+                configured_profile=self.config.pos.startup_ini_profile,
+                active_profile=profile,
+                process_id=process_id,
+                reason="process_creation_time_unavailable",
+            )
+            raise RuntimeError(
+                "POS_ACTIVE_SESSION_PROFILE_UNVERIFIED: 已選擇 ini，但無法讀取 SPA-POS 程序建立時間；"
+                "為避免把重用的 PID 誤認為同一環境，本次未執行報表。"
+            )
+        marker_path = self._pos_session_profile_marker_path()
+        payload = {
+            "schema_version": 1,
+            "recorded_at": datetime.now(tz=UTC).isoformat(),
+            "profile": profile,
+            "process_id": process_id,
+            "process_created_at": process_created_at,
+            "app_version": self.app_version,
+            "run_source": self.run_source,
+            "attestation_evidence": evidence,
+            "selection_process_id": self._pos_startup_ini_process_id_verified_this_run,
+            "selection_process_created_at": self._pos_startup_ini_process_created_at_verified_this_run,
+            "launch_requested_at": self._pos_launch_evidence.get("requested_at"),
+        }
+        try:
+            write_text_atomic(marker_path, json.dumps(payload, ensure_ascii=False, indent=2))
+        except OSError as exc:
+            self._active_pos_session_profile_evidence = "selected_this_run_marker_write_failed"
+            self._write_runtime_phase(
+                "pos_session_profile_attestation_not_written",
+                configured_profile=self.config.pos.startup_ini_profile,
+                active_profile=profile,
+                process_id=process_id,
+                reason="marker_write_failed",
+                message=str(exc),
+            )
+            return
+        self._active_pos_session_profile_evidence = evidence
+        self._write_runtime_phase(
+            "pos_session_profile_verified",
+            configured_profile=self.config.pos.startup_ini_profile,
+            active_profile=profile,
+            evidence=self._active_pos_session_profile_evidence,
+            process_id=process_id,
+            process_created_at=process_created_at,
+            marker_path=str(marker_path),
+        )
+
+    def _clear_pos_session_profile_marker(self) -> None:
+        marker_path = self._pos_session_profile_marker_path()
+        try:
+            marker_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._write_runtime_phase(
+                "pos_session_profile_marker_clear_failed",
+                marker_path=str(marker_path),
+                message=str(exc),
+            )
+            return
+        self._active_pos_session_profile = None
+        self._active_pos_session_profile_evidence = "session_closed"
 
     def _write_pos_startup_ini_log_event(self, event: str, *, target_profile: str, controls: list[Any], **payload: Any) -> None:
         try:
@@ -3220,6 +5039,12 @@ class AutomationRunner:
 
     def _select_pos_startup_ini_profile(self, combo: Any, target_profile: str) -> bool:
         candidates = self._pos_startup_ini_profile_candidates(target_profile)
+        # Some POS builds reopen this dialog with the configured profile already
+        # selected. Calling select() again can invalidate the native wrapper
+        # before the confirmation button is clicked, so leave an exact match
+        # untouched and only verify it.
+        if self._pos_startup_ini_selection_verified(combo, candidates):
+            return True
         first_error: Exception | None = None
         for candidate in candidates:
             for method_name in ("select", "Select"):
@@ -3289,11 +5114,7 @@ class AutomationRunner:
         target_profile: str,
         selected_index: int | None,
     ) -> bool:
-        if selected_index is None:
-            if "正式區" in target_profile:
-                selected_index = 0
-            elif "測試區" in target_profile:
-                selected_index = 1
+        del target_profile
         if selected_index is None:
             return False
         for method_name in ("set_focus", "click_input", "click"):
@@ -3401,9 +5222,17 @@ class AutomationRunner:
     @staticmethod
     def _pos_startup_ini_profile_candidates(target_profile: str) -> list[str]:
         candidates: list[str] = []
-        drive_case_variants = [target_profile]
-        if len(target_profile) >= 2 and target_profile[1] == ":":
-            drive_case_variants.extend((target_profile[0].lower() + target_profile[1:], target_profile[0].upper() + target_profile[1:]))
+        normalized_target = target_profile.replace("/", "\\")
+        parent, separator, filename = normalized_target.rpartition("\\")
+        profile_variants = [target_profile]
+        for alias_filename in POS_STARTUP_INI_PROFILE_ALIASES.get(filename.lower(), ()):
+            profile_variants.append(f"{parent}{separator}{alias_filename}" if separator else alias_filename)
+        drive_case_variants = list(profile_variants)
+        for profile in profile_variants:
+            if len(profile) >= 2 and profile[1] == ":":
+                drive_case_variants.extend(
+                    (profile[0].lower() + profile[1:], profile[0].upper() + profile[1:])
+                )
         for variant in drive_case_variants:
             for value in (variant, variant.replace("\\", "/"), variant.replace("/", "\\")):
                 if value and value not in candidates:
@@ -3518,7 +5347,10 @@ class AutomationRunner:
 
     def _login_failure_visible(self, config: ProjectConfig, window: Any) -> bool:
         markers = (*POS_LOGIN_FAILURE_TEXTS, config.login.login_failure_text)
-        names = self._visible_control_names(window)
+        names = [
+            _safe_control_name(control).replace("\r", "").replace("\n", "")
+            for control in self._visible_login_surface_controls(window)
+        ]
         return any(marker and any(marker in name for name in names) for marker in markers)
 
     def _find_button_by_prefix(self, window: Any, prefix: str) -> Any | None:
@@ -3526,7 +5358,7 @@ class AutomationRunner:
         normalized_prefix = _normalize_ui_text(prefix)
         for control in controls:
             control_type = _safe_control_type(control).lower()
-            if "button" not in control_type:
+            if "button" not in control_type or not self._is_visible_login_surface_control(control):
                 continue
             name = _safe_control_name(control)
             if _normalize_ui_text(name).startswith(normalized_prefix):
@@ -3558,21 +5390,53 @@ class AutomationRunner:
         return str(password)
 
     def _generic_login(self, config: ProjectConfig, window: Any, password: str) -> None:
-        controls = _safe_child_controls(window)
+        controls = self._visible_login_surface_controls(window)
         edit_controls = self._login_edit_controls(config, controls)
         values = [config.login.username, password]
         if config.login.company_code:
             values.append(config.login.company_code)
         for control, value in zip(edit_controls, values, strict=False):
             self._set_login_text(control, value)
-        for control in controls:
-            name = _safe_control_name(control)
-            if config.login.login_button_text and config.login.login_button_text in name:
-                click = _safe_method(control, "click_input") or _safe_method(control, "click")
-                if callable(click):
-                    click()
-                    return
+        login_button = self._find_login_button(config, controls, edit_controls)
+        if login_button is not None:
+            click = _safe_method(login_button, "click_input") or _safe_method(login_button, "click")
+            if callable(click):
+                click()
+                return
         raise RuntimeError("找不到 POS 登入按鈕，無法自動登入。")
+
+    def _find_login_button(
+        self,
+        config: ProjectConfig,
+        controls: list[Any],
+        edit_controls: list[Any],
+    ) -> Any | None:
+        configured_text = _normalize_ui_text(config.login.login_button_text)
+        buttons: list[Any] = []
+        seen_ids: set[int] = set()
+        for control in controls:
+            if id(control) in seen_ids:
+                continue
+            seen_ids.add(id(control))
+            if (
+                "button" in _safe_control_type(control).lower()
+                and _safe_is_enabled(control)
+                and self._is_visible_login_surface_control(control)
+            ):
+                buttons.append(control)
+        for control in buttons:
+            if configured_text and configured_text in _normalize_ui_text(_safe_control_name(control)):
+                return control
+
+        # WinForms owner-drawn login buttons can expose no accessible name. A
+        # nameless fallback is safe only when the login form has the expected
+        # fields and exactly one enabled button; ambiguous forms stay fail-closed.
+        if len(edit_controls) < (3 if config.login.company_code else 2):
+            return None
+        unnamed_buttons = [control for control in buttons if not _normalize_ui_text(_safe_control_name(control))]
+        if len(unnamed_buttons) == 1 and len(buttons) == 1:
+            return unnamed_buttons[0]
+        return None
 
     def _login_edit_controls(self, config: ProjectConfig, controls: list[Any]) -> list[Any]:
         expected_count = 3 if config.login.company_code else 2
@@ -3614,6 +5478,8 @@ class AutomationRunner:
             return named_control
         for index, control in enumerate(controls):
             if "edit" in str(_safe_control_type(control)).lower():
+                continue
+            if not _is_login_field_label_control(control):
                 continue
             if _normalize_ui_text(label) not in _normalize_ui_text(_safe_control_name(control)):
                 continue
@@ -3675,16 +5541,36 @@ class AutomationRunner:
         return candidates[0][1]
 
     def _login_screen_visible(self, config: ProjectConfig, window: Any) -> bool:
-        controls = [
-            window,
-            *_safe_child_controls(window),
-        ]
+        controls = self._visible_login_surface_controls(window)
         normalized_names = [_safe_control_name(control).replace("\r", "").replace("\n", "") for control in controls]
         has_account_field = any("帳號" in name for name in normalized_names)
         has_secret_field = any("密碼" in name for name in normalized_names)
-        has_login_button = any(config.login.login_button_text and config.login.login_button_text in name for name in normalized_names)
-        has_edit_controls = any("edit" in _safe_control_type(control).lower() for control in controls)
+        has_login_button = any(
+            config.login.login_button_text
+            and config.login.login_button_text in _safe_control_name(control)
+            and "button" in _safe_control_type(control).lower()
+            and _safe_is_enabled(control)
+            for control in controls
+        )
+        has_edit_controls = any(
+            "edit" in _safe_control_type(control).lower() and _safe_is_enabled(control)
+            for control in controls
+        )
         return (has_account_field and has_secret_field) or (has_login_button and has_edit_controls)
+
+    def _visible_login_surface_controls(self, window: Any) -> list[Any]:
+        controls = [window, *_safe_descendant_controls_limited(window, max_depth=6, max_controls=300)]
+        return [control for control in controls if self._is_visible_login_surface_control(control)]
+
+    @staticmethod
+    def _is_visible_login_surface_control(control: Any) -> bool:
+        if not _safe_is_visible(control):
+            return False
+        rect = _safe_rectangle_tuple(control)
+        if rect is None:
+            return True
+        left, top, right, bottom = rect
+        return right > left and bottom > top
 
     def _pos_main_screen_visible(self, window: Any) -> bool:
         names = self._visible_control_names(window)
@@ -3694,12 +5580,60 @@ class AutomationRunner:
             return True
         return self._pos_menu_shell_visible(names) and self._pos_main_ready_status_visible(self.config, names)
 
+    def _pos_report_surface_visible(self, window: Any) -> bool:
+        """Recognize a logged-in POS when reconnect exposes an MDI report child."""
+        controls = [
+            window,
+            *_safe_descendant_controls_limited(
+                window,
+                max_depth=VISIBLE_CONTROL_SCAN_MAX_DEPTH,
+                max_controls=VISIBLE_CONTROL_SCAN_MAX_CONTROLS,
+            ),
+        ]
+        report_form_ids = {
+            "ClassService_Report",
+            "ProdSale_Report",
+            "CustomerSource_Report",
+            "Appointment_Report",
+            "MemberRemain_Report",
+            "InventoryConsumable_Report",
+        }
+        report_form_names = {
+            "課程服務明細表",
+            "商品銷售明細表",
+            "客戶來源與產值統計表",
+            "預約紀錄查詢統計表",
+            "會員剩餘點數殘值統計表",
+            "沙貨耗材領用查詢表",
+        }
+        has_report_form = any(
+            _safe_is_visible(control)
+            and (
+                _safe_automation_id(control) in report_form_ids
+                or _normalize_ui_text(_safe_control_name(control)) in report_form_names
+            )
+            for control in controls
+        )
+        has_report_viewer = any(
+            _safe_is_visible(control)
+            and (
+                _safe_automation_id(control) in {"reportToolBar", "reportViewer1"}
+                or _normalize_ui_text(_safe_control_name(control)) == "ReportToolBar"
+            )
+            for control in controls
+        )
+        return has_report_form and has_report_viewer
+
     def _wait_for_login_or_main_screen(self, config: ProjectConfig, window: Any) -> Any | None:
         deadline = monotonic() + max(config.pos.startup_wait_seconds, 1)
         while monotonic() < deadline:
             window = self._handle_pos_update_dialog_if_present(config, window)
             window = self._handle_pos_startup_ini_dialog_if_present(config, window)
-            if self._login_screen_visible(config, window) or self._pos_main_screen_visible(window):
+            if (
+                self._login_screen_visible(config, window)
+                or self._pos_main_screen_visible(window)
+                or self._pos_report_surface_visible(window)
+            ):
                 return window
             try:
                 window = self._connect_pos_window()
@@ -4055,6 +5989,164 @@ def format_report_failures(failures: list[ReportRunFailure]) -> str:
     return "\n".join(lines).strip()
 
 
+def _append_summary_detail(existing: str | None, detail: str) -> str:
+    return f"{existing}\n\n{detail}" if existing else detail
+
+
+_EVIDENCE_TEXT_SUFFIXES = {".json", ".jsonl", ".log", ".txt"}
+_FAILURE_EVIDENCE_MAX_TOTAL_SIZE = 64 * 1024 * 1024
+_EVIDENCE_DENIED_NAME_RE = re.compile(
+    r"(?i)(?:^|[._-])(password|passwd|secret|credential|oauth|token|access[_-]?token|refresh[_-]?token|client[_-]?secret)(?:[._-]|$)"
+)
+_EVIDENCE_SECRET_KEY_RE = re.compile(
+    r"(?i)(password|passwd|secret|credential|oauth|token|access[_-]?token|refresh[_-]?token|client[_-]?secret)"
+)
+_EVIDENCE_PATH_KEY_RE = re.compile(r"(?i)(?:^|_)(?:path|paths)$")
+_EVIDENCE_SECRET_VALUE_RE = re.compile(
+    r"(?i)((?:password|passwd|secret|credential|oauth|token|access[_-]?token|refresh[_-]?token|client[_-]?secret)\s*[\"']?\s*[:=]\s*)([^\r\n]*)"
+)
+_EVIDENCE_BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]{12,}")
+_EVIDENCE_POS_SECRET_RE = re.compile(r"(?i)\bA0042[A-Za-z0-9_-]{8,}\b")
+
+
+def _redact_evidence_text(text: str) -> str:
+    redacted = _EVIDENCE_SECRET_VALUE_RE.sub(r"\1<redacted>", str(text))
+    redacted = _EVIDENCE_BEARER_RE.sub(r"\1<redacted>", redacted)
+    return _EVIDENCE_POS_SECRET_RE.sub("<redacted-pos-secret>", redacted)
+
+
+def _redact_evidence_object(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "<redacted>"
+                if _EVIDENCE_SECRET_KEY_RE.search(str(key))
+                else _redact_evidence_path_value(item)
+                if _EVIDENCE_PATH_KEY_RE.search(str(key))
+                else _redact_evidence_object(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_evidence_object(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_evidence_object(item) for item in value)
+    if isinstance(value, str):
+        return _redact_evidence_text(value)
+    return value
+
+
+def _redact_evidence_path_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact_evidence_path_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_evidence_path_value(item) for item in value)
+    if not isinstance(value, str):
+        return _redact_evidence_object(value)
+    path = Path(value)
+    if (
+        any(_EVIDENCE_DENIED_NAME_RE.search(part) for part in path.parts)
+        or path.name.casefold() in {"app.yaml", "app.yml", "config.yaml", "config.yml"}
+        or path.suffix.casefold() in {".yaml", ".yml", ".pfx", ".pem", ".key"}
+    ):
+        return "<redacted-sensitive-path>"
+    return _redact_evidence_text(value)
+
+
+def _evidence_candidate_allowed(candidate: Path, allowed_roots: tuple[Path, ...]) -> tuple[bool, str]:
+    try:
+        if candidate.is_symlink():
+            return False, "symlink_not_allowed"
+        resolved = candidate.resolve()
+    except OSError as exc:
+        return False, f"resolve_failed:{type(exc).__name__}"
+    identity = str(resolved).casefold()
+    if not any(_is_relative_to_path(resolved, root) for root in allowed_roots):
+        return False, "outside_runtime_roots"
+    name = candidate.name
+    if (
+        _EVIDENCE_DENIED_NAME_RE.search(name)
+        or name.casefold() in {"app.yaml", "app.yml", "config.yaml", "config.yml"}
+        or candidate.suffix.casefold() in {".yaml", ".yml", ".pfx", ".pem", ".key"}
+    ):
+        return False, "sensitive_filename_denied"
+    if name.startswith("POSReportBot_failure_evidence_"):
+        return False, "nested_evidence_bundle_denied"
+    return True, identity
+
+
+def _read_bounded_evidence_file(candidate: Path, *, max_file_size: int) -> tuple[bytes | None, str | None]:
+    try:
+        if not candidate.is_file():
+            return None, "missing"
+        with candidate.open("rb") as handle:
+            data = handle.read(max_file_size + 1)
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if len(data) > max_file_size:
+        return None, "file_size_limit"
+    return data, None
+
+
+def _redacted_evidence_bytes(candidate: Path, data: bytes) -> bytes:
+    if candidate.suffix.casefold() not in _EVIDENCE_TEXT_SUFFIXES:
+        return data
+    text = data.decode("utf-8", errors="replace")
+    try:
+        if candidate.suffix.casefold() == ".json":
+            return json.dumps(
+                _redact_evidence_object(json.loads(text)),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ).encode("utf-8")
+        if candidate.suffix.casefold() == ".jsonl":
+            redacted_lines = [
+                json.dumps(
+                    _redact_evidence_object(json.loads(line)),
+                    ensure_ascii=False,
+                    default=str,
+                )
+                for line in text.splitlines()
+                if line.strip()
+            ]
+            return ("\n".join(redacted_lines) + ("\n" if redacted_lines else "")).encode("utf-8")
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return _redact_evidence_text(text).encode("utf-8")
+
+
+def _referenced_evidence_paths(candidate: Path, data: bytes) -> list[Path]:
+    if candidate.suffix.casefold() not in {".json", ".jsonl"}:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    payloads: list[Any] = []
+    try:
+        if candidate.suffix.casefold() == ".json":
+            payloads.append(json.loads(text))
+        else:
+            for line in text.splitlines()[:4000]:
+                if line.strip():
+                    payloads.append(json.loads(line))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    found: list[Path] = []
+    stack = list(payloads)
+    visited = 0
+    while stack and visited < 10000 and len(found) < 96:
+        value = stack.pop()
+        visited += 1
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+        elif isinstance(value, str):
+            path = Path(value)
+            if path.is_absolute():
+                found.append(path)
+    return list(dict.fromkeys(found))
+
+
 def _normalize_ui_text(value: str) -> str:
     return UI_TEXT_NOISE_RE.sub("", value.replace("\r", "").replace("\n", ""))
 
@@ -4070,6 +6162,30 @@ def _ui_text_matches(expected: str, actual: str) -> bool:
     if not expected_text or not actual_text:
         return False
     return expected_text == actual_text or expected_text in actual_text
+
+
+def _is_login_field_label_control(control: Any) -> bool:
+    """Return true only for controls that can safely represent field labels."""
+    control_type = _safe_control_type(control).strip().lower()
+    return any(token in control_type for token in ("text", "static", "label"))
+
+
+def _raise_if_invalid_window_handle(control: Any) -> None:
+    """Preserve stale-wrapper evidence that the generic safe readers suppress."""
+    for method_name in ("window_text", "children"):
+        try:
+            method = object.__getattribute__(control, method_name)
+        except Exception as exc:
+            if _is_invalid_window_handle_error(exc):
+                raise
+            continue
+        if not callable(method):
+            continue
+        try:
+            method()
+        except Exception as exc:
+            if _is_invalid_window_handle_error(exc):
+                raise
 
 
 def _safe_control_name(control: Any) -> str:
@@ -4252,6 +6368,27 @@ def _safe_is_enabled(control: Any) -> bool:
         return False
 
 
+def _safe_is_visible(control: Any) -> bool:
+    checker = _safe_method(control, "is_visible")
+    if checker is not None:
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    try:
+        visible = object.__getattribute__(control, "visible")
+    except Exception:
+        visible = None
+    if isinstance(visible, bool):
+        return visible
+    try:
+        element_info = object.__getattribute__(control, "element_info")
+        visible = getattr(element_info, "visible", None)
+    except Exception:
+        visible = None
+    return bool(visible) if isinstance(visible, bool) else True
+
+
 def _safe_rectangle_tuple(control: Any) -> tuple[int, int, int, int] | None:
     rectangle = _safe_method(control, "rectangle")
     if rectangle is None:
@@ -4333,6 +6470,103 @@ def _safe_window_handle(control: Any) -> int | None:
     return None
 
 
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted > 0 else None
+
+
+def _safe_control_process_id(control: Any) -> int | None:
+    for attr_name in ("process_id", "process"):
+        try:
+            value = object.__getattribute__(control, attr_name)
+        except Exception:
+            value = None
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+        process_id = _coerce_positive_int(value)
+        if process_id is not None:
+            return process_id
+    try:
+        element_info = object.__getattribute__(control, "element_info")
+    except Exception:
+        element_info = None
+    for attr_name in ("process_id", "process"):
+        value = getattr(element_info, attr_name, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = None
+        process_id = _coerce_positive_int(value)
+        if process_id is not None:
+            return process_id
+    handle = _safe_window_handle(control)
+    if handle is None or not sys.platform.startswith("win"):
+        return None
+    try:
+        win32process = import_module("win32process")
+        _thread_id, process_id = win32process.GetWindowThreadProcessId(handle)
+    except Exception:
+        return None
+    return _coerce_positive_int(process_id)
+
+
+def _safe_process_creation_time(process_id: int | None) -> str | None:
+    if process_id is None or not sys.platform.startswith("win"):
+        return None
+    process_handle: Any | None = None
+    try:
+        win32api = import_module("win32api")
+        win32con = import_module("win32con")
+        win32process = import_module("win32process")
+        query_access = getattr(
+            win32con,
+            "PROCESS_QUERY_LIMITED_INFORMATION",
+            getattr(win32con, "PROCESS_QUERY_INFORMATION", 0x0400),
+        )
+        process_handle = win32api.OpenProcess(query_access, False, process_id)
+        process_times = win32process.GetProcessTimes(process_handle)
+        creation_time = process_times.get("CreationTime") if isinstance(process_times, dict) else process_times[0]
+        timestamp = getattr(creation_time, "timestamp", None)
+        if callable(timestamp):
+            return datetime.fromtimestamp(float(timestamp()), tz=UTC).isoformat(timespec="microseconds")
+        if isinstance(creation_time, datetime):
+            value = creation_time
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            return value.astimezone(UTC).isoformat(timespec="microseconds")
+        return str(creation_time).strip() or None
+    except Exception:
+        return None
+    finally:
+        if process_handle is not None:
+            close = getattr(process_handle, "Close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _is_invalid_window_handle_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return (
@@ -4344,6 +6578,18 @@ def _is_invalid_window_handle_error(exc: Exception) -> bool:
 
 def _r14_item_actuals_by_key(snapshot: Any) -> dict[tuple[str, str], Any]:
     return {(item.branch, item.item_code): item for item in snapshot.items}
+
+
+def _r14_snapshot_actual_or_missing_branch_zero(
+    snapshot: Any,
+    item: Any | None,
+    branch: str,
+) -> float | None:
+    if item is not None:
+        return float(item.actual)
+    if branch in getattr(snapshot, "missing_branches", ()):
+        return 0.0
+    return None
 
 
 def _growth_rate(current_value: float, previous_value: float) -> float | None:

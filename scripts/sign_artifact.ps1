@@ -61,3 +61,8 @@ $SignArgs += $Path
 if ($LASTEXITCODE -ne 0) {
   throw "signtool failed for artifact: $Path"
 }
+
+$VerifiedSignature = Get-AuthenticodeSignature -LiteralPath $Path
+if ($VerifiedSignature.Status -ne "Valid") {
+  throw "Signature verification failed for artifact: $Path ($($VerifiedSignature.Status))"
+}

@@ -138,6 +138,82 @@ def test_dry_run_selected_w02_can_be_explicitly_forced_before_next_run_date() ->
     assert [output.task_id for output in plan.outputs] == ["W02"]
 
 
+def test_explicitly_selected_r06_runs_even_when_schedule_is_disabled() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        report.enabled = report.id != "R06"
+
+    scheduled_plan = build_dry_run_plan(config, today=date(2026, 9, 2))
+    assert "R06" not in {output.task_id for output in scheduled_plan.outputs}
+
+    manual_plan = build_dry_run_plan(
+        config,
+        today=date(2026, 9, 2),
+        selected_task_ids={"R06"},
+    )
+    assert [output.task_id for output in manual_plan.outputs] == ["R06"] * 6
+
+
+def test_explicitly_selected_weekly_r06_runs_outside_scheduled_weekday() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    report = next(report for report in config.reports if report.id == "R06")
+    report.frequency = "weekly"
+    config.r14_inventory_source.apply_weekday = "friday"
+
+    scheduled_plan = build_dry_run_plan(config, today=date(2026, 9, 2))
+    assert "R06" not in {output.task_id for output in scheduled_plan.outputs}
+
+    manual_plan = build_dry_run_plan(
+        config,
+        today=date(2026, 9, 2),
+        selected_task_ids={"R06"},
+    )
+
+    assert [output.task_id for output in manual_plan.outputs] == ["R06"] * 6
+
+
+def test_explicitly_selected_r06_uses_all_configured_branches_when_all_are_schedule_disabled() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        report.enabled = report.id == "R06"
+    for branch in config.branches:
+        branch.enabled = False
+
+    scheduled_plan = build_dry_run_plan(config, today=date(2026, 9, 2))
+    assert scheduled_plan.outputs == []
+
+    manual_plan = build_dry_run_plan(
+        config,
+        today=date(2026, 9, 2),
+        selected_task_ids={"R06"},
+    )
+    assert [output.task_id for output in manual_plan.outputs] == ["R06"] * 6
+    assert [output.branch_code for output in manual_plan.outputs] == [
+        "N001",
+        "N002",
+        "N003",
+        "N004",
+        "N005",
+        "N006",
+    ]
+
+
+def test_explicitly_selected_r06_preserves_partial_branch_disable_settings() -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        report.enabled = report.id == "R06"
+    for branch in config.branches:
+        branch.enabled = branch.code == "N001"
+
+    manual_plan = build_dry_run_plan(
+        config,
+        today=date(2026, 9, 2),
+        selected_task_ids={"R06"},
+    )
+
+    assert [output.branch_code for output in manual_plan.outputs] == ["N001"]
+
+
 def test_dry_run_force_does_not_override_w02_disabled_setting() -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     config.w02_order.enabled = False

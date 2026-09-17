@@ -1,15 +1,28 @@
-from datetime import date
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
 import json
+import os
 from pathlib import Path
 import stat
+import sys
 from types import SimpleNamespace
+import zipfile
 
 from openpyxl import Workbook, load_workbook
 import pytest
 
-from pos_report_bot.app.automation_runner import AutomationRunner, forced_weekly_report_ids_for_run_source
+from pos_report_bot.app.automation_runner import (
+    AutomationRunner,
+    AutomationRunSummary,
+    ReportRunFailure,
+    forced_weekly_report_ids_for_run_source,
+)
 from pos_report_bot.config.loader import load_project_config
-from pos_report_bot.drive.uploader import DriveUploadResult, MockDriveUploader
+from pos_report_bot.drive.uploader import (
+    DriveTemplateDownloadResult,
+    DriveUploadResult,
+    MockDriveUploader,
+)
 from pos_report_bot.google.oauth import (
     GOOGLE_DRIVE_PROFILE,
     GOOGLE_DRIVE_SCOPES,
@@ -25,6 +38,7 @@ from pos_report_bot.pos.ui_probe import UiProbeError
 from pos_report_bot.reports.models import PlannedOutput
 from pos_report_bot.reports.planner import build_dry_run_plan
 from pos_report_bot.reports.r14_transformer import R14TransformError
+from pos_report_bot.storage.r13_no_data import write_r13_no_data_marker
 from pos_report_bot.storage.run_state import RunStateStore
 import pos_report_bot.app.automation_runner as automation_runner_module
 from tests.unit.test_report_automation import FakePosControl, FakeRectPosControl
@@ -40,6 +54,15 @@ class FakeClosablePosWindow(FakePosControl):
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeProcessBoundPosWindow(FakeClosablePosWindow):
+    def __init__(self, process_id: int) -> None:
+        super().__init__()
+        self._process_id = process_id
+
+    def process_id(self) -> int:
+        return self._process_id
 
 
 def _ready_pos_window(*roots: str) -> FakePosControl:
@@ -85,8 +108,8 @@ class FakeKeyboardSelectableStartupIniCombo(FakePosControl):
     def __init__(self) -> None:
         super().__init__("", "ComboBox", automation_id="M_INI")
         self.items = [
-            r"c:\tkhspa\tkhspa-正式區.ini",
-            r"c:\tkhspa\tkhspa-測試區.ini",
+            r"c:\tkhspa\tkhspa -測試.ini",
+            r"c:\tkhspa\tkhspa-正式.ini",
         ]
         self.focused = False
         self.dropdown_opened = False
@@ -124,9 +147,18 @@ class FakeUnverifiableStartupIniCombo(FakePosControl):
 class FakeTextsOnlyStartupIniCombo(FakeUnverifiableStartupIniCombo):
     def texts(self) -> list[str]:
         return [
-            r"c:\tkhspa\tkhspa-正式區.ini",
-            r"c:\tkhspa\tkhspa-測試區.ini",
+            r"c:\tkhspa\tkhspa -測試.ini",
+            r"c:\tkhspa\tkhspa-正式.ini",
         ]
+
+
+class FakeAlreadySelectedStartupIniCombo(FakePosControl):
+    def __init__(self, selected_value: str) -> None:
+        super().__init__("", "ComboBox", automation_id="M_INI")
+        self.selected_value = selected_value
+
+    def select(self, _value: str) -> None:
+        raise RuntimeError("select must not be called for an already selected profile")
 
 
 def _pos_startup_ini_window_with_combo(combo: FakePosControl) -> tuple[FakePosControl, FakePosControl]:
@@ -139,6 +171,9 @@ def _pos_startup_ini_window_with_combo(combo: FakePosControl) -> tuple[FakePosCo
 def _load_runner_config(tmp_path: Path):  # type: ignore[no-untyped-def]
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     config.app.state_dir = str(tmp_path / "state")
+    # Tests must opt in to external notification explicitly.  Production
+    # defaults remain enabled in config_templates/app.template.yaml.
+    config.email.enabled = False
     return config
 
 
@@ -154,12 +189,103 @@ def _set_runtime_dirs(config, tmp_path: Path) -> None:  # type: ignore[no-untype
     config.app.state_dir = str(tmp_path / "state")
 
 
+class FakeR14TemplateDownloader:
+    def __init__(
+        self,
+        source_path: Path | None,
+        *,
+        error_code: str = "R14_TEMPLATE_DRIVE_FILE_MISSING",
+    ) -> None:
+        self.source_path = source_path
+        self.error_code = error_code
+        self.calls: list[dict[str, object]] = []
+
+    def download_latest_template(  # type: ignore[no-untyped-def]
+        self,
+        folder_id_or_url: str,
+        *,
+        filename_glob: str,
+        destination_dir: Path,
+    ) -> DriveTemplateDownloadResult:
+        self.calls.append(
+            {
+                "folder_id_or_url": folder_id_or_url,
+                "filename_glob": filename_glob,
+                "destination_dir": destination_dir,
+            }
+        )
+        if self.source_path is None:
+            return DriveTemplateDownloadResult(
+                success=False,
+                folder_id="folder123",
+                error_code=self.error_code,
+                message="R14 雲端模板資料夾沒有符合檔名規則的 .xlsx 檔案。",
+            )
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / self.source_path.name
+        destination.write_bytes(self.source_path.read_bytes())
+        return DriveTemplateDownloadResult(
+            success=True,
+            drive_file_id="drive-template-1",
+            folder_id="folder123",
+            source_name=self.source_path.name,
+            modified_time="2026-09-03T02:27:44Z",
+            local_path=destination,
+            size=destination.stat().st_size,
+            sha256="fake-sha256",
+            message="Mock R14 template download completed.",
+        )
+
+
 def test_forced_weekly_report_ids_are_manual_only() -> None:
     assert forced_weekly_report_ids_for_run_source("gui_manual") == {"W01", "W02"}
     assert forced_weekly_report_ids_for_run_source("manual_cli") == set()
     assert forced_weekly_report_ids_for_run_source("manual_single_task") == {"W01", "W02"}
     assert forced_weekly_report_ids_for_run_source("windows_task_scheduler") == set()
     assert forced_weekly_report_ids_for_run_source("dry_run") == set()
+
+
+def test_automation_runner_refuses_to_touch_pos_when_another_process_holds_run_lock(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    config = _load_runner_config(tmp_path)
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    connect_calls = 0
+
+    def fail_connect(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal connect_calls
+        connect_calls += 1
+        raise AssertionError("runner must not touch POS while another process owns the lock")
+
+    @contextmanager
+    def blocked_run_lock(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise automation_runner_module.AutomationRunAlreadyActiveError(
+            owner={"pid": 1234, "run_source": "historical_backfill"}
+        )
+        yield
+
+    monkeypatch.setattr(automation_runner_module, "automation_run_lock", blocked_run_lock)
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=fail_connect,
+        run_source="windows_task_scheduler",
+        run_date=date(2026, 8, 11),
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is False
+    assert summary.error_code == "AUTOMATION_ALREADY_RUNNING"
+    assert summary.completed == 0
+    assert summary.total == 0
+    assert "historical_backfill" in (summary.details or "")
+    assert connect_calls == 0
+    assert summary.evidence_bundle_path is not None
+    assert Path(summary.evidence_bundle_path).exists()
 
 
 def test_gui_manual_force_is_limited_to_selected_weekly_tasks(tmp_path: Path) -> None:
@@ -281,8 +407,419 @@ def test_automation_runner_selects_pos_startup_ini_before_login(tmp_path: Path) 
     handled = runner._prepare_pos_window_for_login(config, window)
 
     assert handled is window
-    assert combo.selected_value == r"c:\tkhspa\tkhspa-測試區.ini"
+    assert combo.selected_value == r"c:\tkhspa\tkhspa -測試.ini"
     assert confirm.clicked is True
+
+
+def test_existing_pos_session_with_different_attested_ini_is_blocked(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    _disable_uploads(config)
+    config.email.enabled = False
+    config.login.required = False
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": r"c:\tkhspa\tkhspa -測試.ini",
+                "process_id": 4242,
+                "process_created_at": "2026-09-02T08:00:00.000000+00:00",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda _process_id: "2026-09-02T08:00:00.000000+00:00",
+    )
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code=None,
+                message="saved",
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: FakeProcessBoundPosWindow(4242),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is False
+    assert calls == []
+    assert summary.failures[0].error_code == "POS_ACTIVE_SESSION_PROFILE_MISMATCH"
+    assert "POS_ACTIVE_SESSION_PROFILE_MISMATCH" in summary.failures[0].message
+
+
+def test_existing_process_bound_pos_without_ini_attestation_is_blocked(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+    )
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4242))
+
+
+def test_pos_session_ini_selection_is_recorded_with_process_identity(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        run_source="gui_manual",
+    )
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda _process_id: "2026-09-02T08:00:00.000000+00:00",
+    )
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 4242
+    runner._pos_startup_ini_process_created_at_verified_this_run = "2026-09-02T08:00:00.000000+00:00"
+
+    runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4242))
+
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert payload["profile"] == r"c:\tkhspa\tkhspa-正式.ini"
+    assert payload["process_id"] == 4242
+    assert payload["process_created_at"] == "2026-09-02T08:00:00.000000+00:00"
+    assert payload["run_source"] == "gui_manual"
+
+
+def test_pos_session_ini_selection_cannot_be_rebound_to_a_different_process(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 1111
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(2222))
+
+    assert not (Path(config.app.state_dir) / "pos_session_profile.json").exists()
+
+
+def test_pos_session_ini_selection_accepts_fresh_runner_launched_process_handoff(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_launch_evidence = {
+        "launch_requested": True,
+        "requested_at": "2026-09-02T08:00:00.000000+00:00",
+    }
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 1111
+    runner._pos_startup_ini_process_created_at_verified_this_run = "2026-09-02T08:00:01.000000+00:00"
+    creation_times = {
+        1111: "2026-09-02T08:00:01.000000+00:00",
+        2222: "2026-09-02T08:00:02.000000+00:00",
+        3333: "2026-09-02T08:00:03.000000+00:00",
+    }
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda process_id: creation_times.get(process_id),
+    )
+
+    runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(2222))
+
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert payload["profile"] == config.pos.startup_ini_profile
+    assert payload["process_id"] == 2222
+    assert payload["process_created_at"] == "2026-09-02T08:00:02.000000+00:00"
+    assert runner._active_pos_session_profile_evidence == "selected_this_run_launched_process_handoff"
+    assert runner._pos_launch_evidence["profile_handoff_bound_process_id"] == 2222
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(3333))
+
+
+def test_pos_session_ini_selection_accepts_same_fresh_process_when_selection_creation_time_was_unreadable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_launch_evidence = {
+        "launch_requested": True,
+        "requested_at": "2026-09-02T13:43:41.519161+00:00",
+    }
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 8496
+    runner._pos_startup_ini_process_created_at_verified_this_run = None
+    creation_time_reads: list[int | None] = []
+
+    def read_creation_time_once(process_id: int | None) -> str | None:
+        creation_time_reads.append(process_id)
+        if process_id == 8496 and len(creation_time_reads) == 1:
+            return "2026-09-02T13:43:42.000000+00:00"
+        return None
+
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        read_creation_time_once,
+    )
+
+    runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(8496))
+
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert payload["process_id"] == 8496
+    assert payload["process_created_at"] == "2026-09-02T13:43:42.000000+00:00"
+    assert payload["selection_process_created_at"] is None
+    assert runner._active_pos_session_profile_evidence == "selected_this_run_fresh_process_rebound"
+    assert creation_time_reads == [8496]
+
+
+def test_pos_session_ini_selection_rejects_same_preexisting_process_when_selection_creation_time_was_unreadable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_launch_evidence = {
+        "launch_requested": True,
+        "requested_at": "2026-09-02T13:43:41.519161+00:00",
+    }
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 8496
+    runner._pos_startup_ini_process_created_at_verified_this_run = None
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda process_id: (
+            "2026-09-02T13:40:00.000000+00:00" if process_id == 8496 else None
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(8496))
+
+    assert not (Path(config.app.state_dir) / "pos_session_profile.json").exists()
+
+
+def test_pos_session_ini_selection_uses_run_scoped_same_pid_proof_when_creation_time_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_launch_evidence = {
+        "launch_requested": True,
+        "requested_at": datetime.now(tz=UTC).isoformat(),
+    }
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 4432
+    runner._pos_startup_ini_process_created_at_verified_this_run = None
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda _process_id: None,
+    )
+
+    runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4432))
+    runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4432))
+
+    assert runner._active_pos_session_profile == config.pos.startup_ini_profile
+    assert runner._active_pos_session_profile_evidence == "selected_this_run_same_pid_run_scoped"
+    assert runner._pos_launch_evidence["profile_run_scoped_bound_process_id"] == 4432
+    assert not (Path(config.app.state_dir) / "pos_session_profile.json").exists()
+
+
+def test_pos_session_ini_selection_rejects_stale_run_scoped_launch_proof(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_launch_evidence = {
+        "launch_requested": True,
+        "requested_at": (datetime.now(tz=UTC) - timedelta(minutes=11)).isoformat(),
+    }
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 4432
+    runner._pos_startup_ini_process_created_at_verified_this_run = None
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda _process_id: None,
+    )
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4432))
+
+    assert not (Path(config.app.state_dir) / "pos_session_profile.json").exists()
+
+
+def test_pos_exit_confirmation_desktop_fallback_never_uses_global_uia(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    backends: list[str] = []
+    dialog = SimpleNamespace(window_text=lambda: "結束程式確認")
+
+    class FakeDesktop:
+        def __init__(self, *, backend: str) -> None:
+            backends.append(backend)
+            if backend == "uia":
+                raise AssertionError("global Desktop UIA enumeration must not run")
+
+        def windows(self, *, title: str, visible_only: bool):
+            assert title == "結束程式確認"
+            assert visible_only is True
+            return [dialog]
+
+    window = SimpleNamespace(children=lambda: [], descendants=lambda: [])
+    monkeypatch.setattr(automation_runner_module.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "pywinauto", SimpleNamespace(Desktop=FakeDesktop))
+
+    dialogs = runner._find_pos_exit_confirmation_dialogs(window)
+
+    assert dialogs == [dialog]
+    assert backends == ["win32"]
+
+
+def test_pos_session_ini_selection_rejects_preexisting_process_as_launch_handoff(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._pos_launch_evidence = {
+        "launch_requested": True,
+        "requested_at": "2026-09-02T08:00:00.000000+00:00",
+    }
+    runner._pos_startup_ini_profile_verified_this_run = config.pos.startup_ini_profile
+    runner._pos_startup_ini_process_id_verified_this_run = 1111
+    runner._pos_startup_ini_process_created_at_verified_this_run = "2026-09-02T08:00:01.000000+00:00"
+    creation_times = {
+        1111: "2026-09-02T08:00:01.000000+00:00",
+        2222: "2026-09-02T07:59:00.000000+00:00",
+    }
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda process_id: creation_times.get(process_id),
+    )
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(2222))
+
+    assert not (Path(config.app.state_dir) / "pos_session_profile.json").exists()
+
+
+def test_pos_session_marker_rejects_reused_pid_with_different_creation_time(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": config.pos.startup_ini_profile,
+                "process_id": 4242,
+                "process_created_at": "old-process-instance",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_safe_process_creation_time",
+        lambda _process_id: "new-process-instance",
+        raising=False,
+    )
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4242))
+
+
+def test_pos_session_marker_rejects_process_identity_without_creation_time(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = True
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": config.pos.startup_ini_profile,
+                "process_id": 4242,
+                "process_created_at": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(automation_runner_module, "_safe_process_creation_time", lambda _process_id: None)
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+
+    with pytest.raises(RuntimeError, match="POS_ACTIVE_SESSION_PROFILE_UNVERIFIED"):
+        runner._validate_or_record_pos_session_profile(config, FakeProcessBoundPosWindow(4242))
 
 
 def test_automation_runner_uses_keyboard_fallback_when_ini_select_is_noop(tmp_path: Path) -> None:
@@ -303,12 +840,14 @@ def test_automation_runner_uses_keyboard_fallback_when_ini_select_is_noop(tmp_pa
     assert handled is window
     assert combo.focused is True
     assert combo.dropdown_opened is True
-    assert combo.selected_value == r"c:\tkhspa\tkhspa-測試區.ini"
+    assert combo.selected_value == r"c:\tkhspa\tkhspa -測試.ini"
     assert confirm.clicked is True
 
 
 def test_automation_runner_uses_keyboard_fallback_for_production_ini(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
+    # 2.1.2 persisted this obsolete profile name.  The 2026-08-06 POS
+    # diagnostic exposes only tkhspa-正式.ini and lists it second.
     config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式區.ini"
     combo = FakeKeyboardSelectableStartupIniCombo()
     window, confirm = _pos_startup_ini_window_with_combo(combo)
@@ -325,7 +864,29 @@ def test_automation_runner_uses_keyboard_fallback_for_production_ini(tmp_path: P
 
     assert handled is window
     assert combo.dropdown_opened is True
-    assert combo.selected_value == r"c:\tkhspa\tkhspa-正式區.ini"
+    assert combo.selected_value == r"c:\tkhspa\tkhspa-正式.ini"
+    assert confirm.clicked is True
+
+
+def test_automation_runner_keeps_already_selected_pos_startup_ini(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    target_profile = r"c:\tkhspa\tkhspa-正式.ini"
+    config.pos.startup_ini_profile = target_profile
+    combo = FakeAlreadySelectedStartupIniCombo(target_profile)
+    window, confirm = _pos_startup_ini_window_with_combo(combo)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: window,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+    )
+
+    handled = runner._prepare_pos_window_for_login(config, window)
+
+    assert handled is window
+    assert combo.selected_value == target_profile
     assert confirm.clicked is True
 
 
@@ -350,13 +911,19 @@ def test_wait_for_reconnected_pos_window_handles_startup_ini_and_writes_log(tmp_
     window = runner._wait_for_reconnected_pos_window(config)
     log_path = runner.runtime_paths.logs_dir / f"automation_pos_startup_ini_{runner.run_date:%Y%m%d}.jsonl"
     log_text = log_path.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in log_text.splitlines()]
+    selection_record = next(record for record in records if record["event"] == "selection_verified")
 
     assert window is ready_window
-    assert combo.selected_value == r"c:\tkhspa\tkhspa-測試區.ini"
+    assert combo.selected_value == r"c:\tkhspa\tkhspa -測試.ini"
     assert confirm.clicked is True
     assert "dialog_detected" in log_text
     assert "selection_verified" in log_text
     assert "confirm_clicked" in log_text
+    assert "selection_process_id" in selection_record
+    assert "selection_process_created_at" in selection_record
+    assert selection_record["launch_requested"] is False
+    assert "launch_requested_at" in selection_record
 
 
 def test_automation_runner_does_not_confirm_unverified_pos_startup_ini_selection(tmp_path: Path) -> None:
@@ -422,8 +989,22 @@ def test_automation_runner_does_not_click_generic_confirm_without_ini_dialog(tmp
     assert confirm.clicked is False
 
 
-def _write_r14_snapshot(path: Path, *, report_date: date, item_actuals: dict[str, float]) -> Path:
-    branches = ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓")
+def _write_r14_snapshot(
+    path: Path,
+    *,
+    report_date: date,
+    item_actuals: dict[str, float],
+    include_n006: bool = True,
+) -> Path:
+    branches = [
+        "站前4樓",
+        "站前11樓",
+        "忠孝國際醫學3樓",
+        "忠孝7樓",
+        "忠孝健康7樓",
+    ]
+    if include_n006:
+        branches.append("忠孝預防醫學3樓")
     workbook = Workbook()
     summary = workbook.active
     summary.title = "Summary"
@@ -595,6 +1176,7 @@ def test_automation_runner_continues_after_failed_report(tmp_path: Path) -> None
         config,
         settings_path=tmp_path / "app.yaml",
         app_version="test",
+        run_source="windows_task_scheduler",
         connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
@@ -913,6 +1495,85 @@ def test_automation_runner_runs_r14_without_connecting_pos(tmp_path: Path) -> No
     assert output_path.exists()
 
 
+def test_automation_runner_r14_missing_month_end_snapshot_still_outputs_with_blank_planning_warning(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path / "downloads")
+    config.app.logs_dir = str(tmp_path / "logs")
+    config.app.screenshots_dir = str(tmp_path / "screenshots")
+    config.google_drive.upload_enabled = False
+    config.email.enabled = True
+    config.r14_email.enabled = True
+    template_path = tmp_path / "診所stock status - 2026 demand planning-template.xlsx"
+    template_path.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx").read_bytes()
+    )
+    workbook = load_workbook(template_path)
+    may_group = _summary_actual_group_columns(workbook["Summary"], "2026/05", allow_legacy=True)
+    workbook["Summary"].delete_cols(may_group[0], len(may_group))
+    workbook.save(template_path)
+    config.r14_transform.template_path = str(template_path)
+    config.r14_transform.raw_search_dir = str(ROOT / "tests" / "R14_TEST")
+    partial_history = (
+        tmp_path
+        / "downloads"
+        / "R14"
+        / "20260523"
+        / "診所stock status - 2026 demand planning-0523.xlsx"
+    )
+    partial_history.parent.mkdir(parents=True)
+    partial_history.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0608.xlsx").read_bytes()
+    )
+    for report in config.reports:
+        report.enabled = report.id == "R14"
+        report.upload_enabled = False
+    sent_messages: list[tuple[str, str, list[Path]]] = []
+
+    class FakeGmailSender:
+        def send(self, _settings, *, subject, body, attachments=None):  # type: ignore[no-untyped-def]
+            sent_messages.append((subject, body, list(attachments or [])))
+            return SimpleNamespace(ok=True, message="sent", gmail_message_id="gmail-r14-warning")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("R14 offline transform must not connect to POS")
+        ),
+        gmail_sender_factory=lambda _config: FakeGmailSender(),
+        run_date=date(2026, 6, 9),
+    )
+
+    summary = runner.run()
+
+    output_path = tmp_path / "downloads" / "R14" / "20260609" / "診所stock status - 2026 demand planning-0608.xlsx"
+    assert summary.ok is True
+    assert output_path.exists()
+    output_workbook = load_workbook(output_path, data_only=False)
+    branch_sheet = output_workbook["站前4樓"]
+    item_row = _find_workbook_item_row(branch_sheet, "6050010")
+    planning_columns: dict[str, int] = {}
+    for col in range(1, branch_sheet.max_column + 1):
+        for row in (2, 3):
+            label = branch_sheet.cell(row, col).value
+            if label in {"Forecast", "下單數", "安庫"}:
+                planning_columns[str(label)] = col
+    assert branch_sheet.cell(item_row, planning_columns["Forecast"]).value is None
+    assert branch_sheet.cell(item_row, planning_columns["下單數"]).value is None
+    assert branch_sheet.cell(item_row, planning_columns["安庫"]).value is None
+    assert len(sent_messages) == 1
+    assert "缺少前月月底歷史資料" in sent_messages[0][1]
+    assert "最新找到的前月歷史檔名日期為 2026/05/23" in sent_messages[0][1]
+    assert "Forecast、安庫與下單數已留白" in sent_messages[0][1]
+    state_template = tmp_path / "state" / "r14_templates" / template_path.name
+    state_workbook = load_workbook(state_template, data_only=False)
+    with pytest.raises(AssertionError, match="2026/05"):
+        _summary_actual_group_columns(state_workbook["Summary"], "2026/05")
+
+
 def test_automation_runner_reads_r14_inventory_before_configured_weekday_transform(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path / "downloads")
@@ -965,7 +1626,9 @@ def test_automation_runner_reads_r14_inventory_before_configured_weekday_transfo
     state_template = tmp_path / "state" / "r14_templates" / template_path.name
     assert state_template.exists()
     state_workbook = load_workbook(state_template, data_only=False)
-    assert _summary_actual_group_columns(state_workbook["Summary"], "2026/06") == list(range(121, 127))
+    may_group = _summary_actual_group_columns(state_workbook["Summary"], "2026/05")
+    june_group = _summary_actual_group_columns(state_workbook["Summary"], "2026/06")
+    assert june_group == list(range(may_group[-1] + 1, may_group[-1] + 8))
 
 
 def test_automation_runner_r14_uses_unique_output_path_when_same_day_file_exists(tmp_path: Path) -> None:
@@ -1469,6 +2132,92 @@ def test_automation_runner_r14_template_path_prefers_existing_state_template_ove
     assert runner._resolve_r14_template_path() == state_template
 
 
+def test_automation_runner_r14_cloud_template_overrides_existing_state_template(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.r14_transform.template_drive_folder_id_or_url = "https://drive.google.com/drive/u/3/folders/folder123"
+    config.r14_transform.template_search_dir = str(tmp_path / "templates")
+    cloud_template = tmp_path / "cloud" / "診所stock status - 2026 demand planning-0901.xlsx"
+    cloud_template.parent.mkdir(parents=True)
+    cloud_template.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx").read_bytes()
+    )
+    state_template = tmp_path / "state" / "r14_templates" / "診所stock status - 2026 demand planning-template.xlsx"
+    state_template.parent.mkdir(parents=True)
+    state_template.write_bytes(cloud_template.read_bytes())
+    downloader = FakeR14TemplateDownloader(cloud_template)
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        r14_template_downloader_factory=lambda _config: downloader,
+    )
+
+    resolved = runner._resolve_r14_transform_template_path()
+
+    assert resolved == tmp_path / "templates" / cloud_template.name
+    assert downloader.calls == [
+        {
+            "folder_id_or_url": "https://drive.google.com/drive/u/3/folders/folder123",
+            "filename_glob": "診所stock status - * demand planning-*.xlsx",
+            "destination_dir": tmp_path / "templates",
+        }
+    ]
+
+
+def test_automation_runner_r14_cloud_template_failure_does_not_fall_back_to_state_by_default(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.r14_transform.template_drive_folder_id_or_url = "folder123"
+    state_template = tmp_path / "state" / "r14_templates" / "診所stock status - 2026 demand planning-template.xlsx"
+    state_template.parent.mkdir(parents=True)
+    state_template.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx").read_bytes()
+    )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        r14_template_downloader_factory=lambda _config: FakeR14TemplateDownloader(None),
+    )
+
+    with pytest.raises(R14TransformError) as error:
+        runner._resolve_r14_transform_template_path()
+
+    assert error.value.error_code == "R14_TEMPLATE_DRIVE_FILE_MISSING"
+    assert "沒有符合檔名規則" in error.value.message
+
+
+def test_automation_runner_r14_cloud_template_rejects_invalid_workbook(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.r14_transform.template_drive_folder_id_or_url = "folder123"
+    invalid_template = tmp_path / "cloud" / "診所stock status - 2026 demand planning-0901.xlsx"
+    invalid_template.parent.mkdir(parents=True)
+    invalid_template.write_bytes(b"not an excel workbook")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        r14_template_downloader_factory=lambda _config: FakeR14TemplateDownloader(invalid_template),
+    )
+
+    with pytest.raises(R14TransformError) as error:
+        runner._resolve_r14_transform_template_path()
+
+    assert error.value.error_code == "R14_TEMPLATE_DRIVE_WORKBOOK_INVALID"
+    assert "雲端模板檔案格式不符合需求" in error.value.message
+
+
 def test_automation_runner_repairs_r14_previous_month_state_from_archive(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     _set_runtime_dirs(config, tmp_path)
@@ -1501,9 +2250,62 @@ def test_automation_runner_repairs_r14_previous_month_state_from_archive(tmp_pat
     assert "r14_template_previous_month_state_synced:2026/06" in action
     assert str(archive_report) in action
     assert str(newer_wrong_report) not in action
-    assert group == list(range(121, 127))
+    assert len(group) == 7
+    assert group == list(range(group[0], group[0] + 7))
     assert summary["F2"].value.date() == date(2026, 6, 25)
     assert summary.cell(item_row, group[0]).value == 1
+
+
+def test_automation_runner_finds_r14_previous_month_archive_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    state_template = tmp_path / "state" / "r14_templates" / "診所stock status - 2026 demand planning-template.xlsx"
+    state_template.parent.mkdir(parents=True)
+    state_template.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx").read_bytes()
+    )
+    archive_report = tmp_path / "downloads" / "R14" / "診所stock status - 2026 demand planning-0630.xlsx"
+    archive_report.parent.mkdir(parents=True)
+    archive_report.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0608.xlsx").read_bytes()
+    )
+    monkeypatch.setattr(automation_runner_module, "r14_template_has_actual_month_state", lambda *_args, **_kwargs: True)
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+
+    source = runner._find_r14_archive_for_report_date(date(2026, 6, 30), exclude_path=state_template)
+
+    assert source == archive_report
+
+
+def test_automation_runner_finds_r14_archive_root_when_downloads_config_is_dated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    dated_downloads = tmp_path / "downloads" / "20260724"
+    config.app.downloads_dir = str(dated_downloads)
+    archive_report = tmp_path / "downloads" / "R14" / "診所stock status - 2026 demand planning-0630.xlsx"
+    archive_report.parent.mkdir(parents=True)
+    archive_report.write_bytes(
+        (ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0608.xlsx").read_bytes()
+    )
+    monkeypatch.setattr(automation_runner_module, "r14_template_has_actual_month_state", lambda *_args, **_kwargs: True)
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        run_date=date(2026, 7, 24),
+    )
+
+    source = runner._find_r14_archive_for_report_date(
+        date(2026, 6, 30),
+        exclude_path=tmp_path / "state" / "template.xlsx",
+    )
+
+    assert source == archive_report
 
 
 def test_automation_runner_w01_does_not_overwrite_existing_state_template_with_seed(
@@ -1956,6 +2758,37 @@ def test_automation_runner_r14_friday_email_adds_growth_tables_from_archived_r14
     assert "ITEM002" not in section
 
 
+def test_automation_runner_r14_friday_email_reads_named_snapshots_from_daily_r14_folders(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path / "downloads")
+    _write_r14_snapshot(
+        tmp_path / "downloads" / "R14" / "20260605" / "診所stock status - 2026 demand planning-0604.xlsx",
+        report_date=date(2026, 6, 4),
+        item_actuals={"站前4樓": 90},
+        include_n006=False,
+    )
+    _write_r14_snapshot(
+        tmp_path / "downloads" / "R14" / "20260612" / "診所stock status - 2026 demand planning-0611.xlsx",
+        report_date=date(2026, 6, 11),
+        item_actuals={"站前4樓": 100},
+        include_n006=False,
+    )
+    current = _write_r14_snapshot(
+        tmp_path / "downloads" / "R14" / "20260619" / "診所stock status - 2026 demand planning-0618.xlsx",
+        report_date=date(2026, 6, 18),
+        item_actuals={"站前4樓": 130},
+        include_n006=False,
+    )
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test", run_date=date(2026, 6, 19))
+
+    section = runner._build_r14_friday_analysis_section(current)  # type: ignore[attr-defined]
+
+    assert "數據量累積不足，暫無法提供" not in section
+    assert "200.0%" in section
+
+
 def test_automation_runner_r14_friday_email_pivots_items_by_branch_and_colors_rates() -> None:
     def snapshot(*items: SimpleNamespace) -> SimpleNamespace:
         return SimpleNamespace(items=list(items))
@@ -1996,6 +2829,23 @@ def test_automation_runner_r14_friday_email_pivots_items_by_branch_and_colors_ra
     assert 'color:#c00000;font-weight:600;">100.0%</td>' in section
     assert 'color:#c00000;font-weight:600;">300.0%</td>' in section
     assert 'color:#008000;font-weight:600;">-150.0%</td>' in section
+
+
+def test_automation_runner_r14_weekly_analysis_treats_missing_legacy_branch_as_zero() -> None:
+    def snapshot(*items: SimpleNamespace, missing_branches: tuple[str, ...] = ()) -> SimpleNamespace:
+        return SimpleNamespace(items=list(items), missing_branches=missing_branches)
+
+    def item(actual: float) -> SimpleNamespace:
+        return SimpleNamespace(branch="忠孝預防醫學3樓", item_code="ITEM_N006", item_name="新增分館品項", actual=actual)
+
+    rows = AutomationRunner._r14_weekly_usage_growth_rows(
+        snapshot(item(40)),
+        snapshot(item(10)),
+        snapshot(missing_branches=("忠孝預防醫學3樓",)),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].growth_rate == pytest.approx(2.0)
 
 
 def test_automation_runner_skips_r14_completion_email_when_r14_email_disabled(tmp_path: Path) -> None:
@@ -2388,7 +3238,7 @@ def test_automation_runner_blocks_r14_after_r13_download_failure_even_if_stale_r
     assert not (r14_dir.exists() and any(r14_dir.rglob("*.xlsx")))
 
 
-def test_automation_runner_blocks_r14_after_r13_no_data_even_if_stale_raw_exists(tmp_path: Path) -> None:
+def test_automation_runner_outputs_zero_usage_r14_after_r13_no_data_without_using_stale_raw(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     downloads_dir = tmp_path / "downloads"
     config.app.downloads_dir = str(downloads_dir)
@@ -2433,12 +3283,60 @@ def test_automation_runner_blocks_r14_after_r13_no_data_even_if_stale_raw_exists
 
     assert calls == ["R13"]
     assert summary.ok is False
-    assert [failure.task_id for failure in summary.failures] == ["R13", "R14"]
+    assert summary.completed == 1
+    assert [failure.task_id for failure in summary.failures] == ["R13"]
     assert summary.failures[0].error_code == "NO_REPORT_DATA"
-    assert summary.failures[1].error_code == "R14_BLOCKED_BY_R13_FAILED"
-    assert "本輪未產生可供 R14 使用的 raw data" in summary.failures[0].message
+    assert "已記錄可驗證的零領用狀態" in summary.failures[0].message
     r14_dir = downloads_dir / "R14"
-    assert not (r14_dir.exists() and any(r14_dir.rglob("*.xlsx")))
+    assert any(r14_dir.rglob("診所stock status - 2026 demand planning-0608.xlsx"))
+    marker_path = tmp_path / "state" / "20260609" / "r13_no_report_data.json"
+    assert marker_path.exists()
+    r14_logs = list((tmp_path / "logs" / "20260609").glob("automation_local_transform_*_R14.jsonl"))
+    assert len(r14_logs) == 1
+    log_text = r14_logs[0].read_text(encoding="utf-8")
+    assert "r14_no_data_marker" in log_text
+    assert "r14_imported_rows:0" in log_text
+
+
+def test_automation_runner_r14_only_child_consumes_exact_prior_r13_no_data_marker(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    downloads_dir = tmp_path / "downloads"
+    config.app.downloads_dir = str(downloads_dir)
+    config.app.logs_dir = str(tmp_path / "logs")
+    config.r14_email.enabled = False
+    config.r14_transform.template_path = str(
+        ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx"
+    )
+    config.r14_transform.raw_search_dir = str(downloads_dir)
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R14"
+    marker_path = tmp_path / "state" / "20260609" / "r13_no_report_data.json"
+    write_r13_no_data_marker(
+        marker_path,
+        app_version="test",
+        run_date=date(2026, 6, 9),
+        start_date="2026/06/01",
+        end_date="2026/06/08",
+        output_filename="診所stock status - 2026 demand planning-0608-rawdata.xls",
+        message="POS 明確回覆無領用資料。",
+    )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("R14 marker transform must not connect to POS")
+        ),
+        run_date=date(2026, 6, 9),
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert summary.completed == 1
+    assert any((downloads_dir / "R14").rglob("診所stock status - 2026 demand planning-0608.xlsx"))
 
 
 def test_automation_runner_closes_pos_after_all_outputs_when_enabled(tmp_path: Path) -> None:
@@ -2644,13 +3542,17 @@ def test_automation_runner_closes_each_r06_branch_window(tmp_path: Path) -> None
     assert all(close_after_success is True for _branch_code, close_after_success in close_flags)
 
 
-def test_automation_runner_treats_r06_no_data_branch_as_skipped_not_failure(tmp_path: Path) -> None:
+def test_automation_runner_treats_any_no_data_as_failure_and_sends_notification(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
     _disable_uploads(config)
+    config.email.enabled = True
+    config.email.notify_on_failure = True
+    config.email.recipients = ["ops@example.com"]
     for report in config.reports:
         report.enabled = report.id == "R06"
     progress_messages: list[str] = []
+    sent_messages: list[tuple[str, str, list[str]]] = []
     run_state_store = RunStateStore(tmp_path / "state" / "run_state_latest.json")
 
     class FakeAutomator:
@@ -2678,6 +3580,11 @@ def test_automation_runner_treats_r06_no_data_branch_as_skipped_not_failure(tmp_
                 actions=[],
             )
 
+    class FakeGmailSender:
+        def send(self, settings, *, subject, body):  # type: ignore[no-untyped-def]
+            sent_messages.append((subject, body, list(settings.recipients)))
+            return SimpleNamespace(ok=True, message="Gmail API message sent.", gmail_message_id="gmail-1")
+
     runner = AutomationRunner(
         config,
         settings_path=tmp_path / "app.yaml",
@@ -2686,21 +3593,29 @@ def test_automation_runner_treats_r06_no_data_branch_as_skipped_not_failure(tmp_
         save_as_handler_factory=lambda _config: MockSaveAsHandler(),
         automator_factory=FakeAutomator,  # type: ignore[arg-type]
         run_state_store=run_state_store,
+        gmail_sender_factory=lambda _config: FakeGmailSender(),
     )
 
     summary = runner.run(on_progress=lambda event: progress_messages.append(event.message))
     snapshot = RunStateStore(tmp_path / "state" / "run_state_latest.json").load()
 
-    assert summary.ok is True
+    assert summary.ok is False
     assert summary.completed == 5
-    assert summary.skipped == 1
-    assert summary.failures == ()
-    assert "1 個 POS 回覆無資料並已略過" in summary.message
-    assert any("無資料，已略過" in message for message in progress_messages)
+    assert summary.skipped == 0
+    assert len(summary.failures) == 1
+    assert summary.failures[0].task_id == "R06"
+    assert summary.failures[0].error_code == "NO_REPORT_DATA"
+    assert "R06 失敗：NO_REPORT_DATA" in progress_messages
+    assert len(sent_messages) == 1
+    subject, body, recipients = sent_messages[0]
+    assert subject == "POSReportBot 報表自動化失敗通知"
+    assert "任務：R06" in body
+    assert "錯誤代碼：NO_REPORT_DATA" in body
+    assert recipients == ["ops@example.com"]
     assert snapshot is not None
-    assert snapshot.status == "success"
+    assert snapshot.status == "partial_failed"
     n006_state = next(output for output in snapshot.outputs.values() if output.branch_code == "N006")
-    assert n006_state.status == "skipped"
+    assert n006_state.status == "failed"
     assert n006_state.error_code == "NO_REPORT_DATA"
     assert n006_state.local_file_path is None
 
@@ -2750,6 +3665,118 @@ def test_automation_runner_uses_gmail_api_for_failure_notification(tmp_path: Pat
     assert "Gmail API message sent." in summary.message
 
 
+def test_automation_runner_sends_configured_success_summary_with_output_evidence(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.email.enabled = True
+    config.email.notify_on_success_summary = True
+    config.email.recipients = ["ops@example.com"]
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    sent_messages: list[tuple[str, str, list[str]]] = []
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    class FakeGmailSender:
+        def send(self, settings, *, subject, body):  # type: ignore[no-untyped-def]
+            sent_messages.append((subject, body, list(settings.recipients)))
+            return SimpleNamespace(ok=True, message="Gmail API message sent.", gmail_message_id="gmail-1")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        run_date=date(2026, 9, 3),
+        run_source="windows_task_scheduler",
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        gmail_sender_factory=lambda _config: FakeGmailSender(),
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is True
+    assert len(sent_messages) == 1
+    subject, body, recipients = sent_messages[0]
+    assert subject == "POSReportBot 每日自動化完成摘要"
+    assert "執行日期：2026-09-03" in body
+    assert "R01" in body
+    assert "課程服務明細表" in body
+    assert recipients == ["ops@example.com"]
+
+
+def test_automation_runner_does_not_hide_success_summary_delivery_failure(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.email.enabled = True
+    config.email.notify_on_failure = False
+    config.email.notify_on_success_summary = True
+    config.email.recipients = ["ops@example.com"]
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    run_state_store = RunStateStore(tmp_path / "state" / "run_state_latest.json")
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+            )
+
+    class FailedGmailSender:
+        @staticmethod
+        def send(settings, *, subject, body):  # type: ignore[no-untyped-def]
+            del settings, subject, body
+            return SimpleNamespace(ok=False, message="Gmail API rejected the message")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        run_source="windows_task_scheduler",
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        run_state_store=run_state_store,
+        gmail_sender_factory=lambda _config: FailedGmailSender(),
+    )
+
+    summary = runner.run()
+    snapshot = run_state_store.load()
+
+    assert summary.ok is False
+    assert summary.error_code == "SUCCESS_SUMMARY_NOTIFICATION_FAILED"
+    assert "Gmail API rejected the message" in summary.message
+    assert snapshot is not None
+    assert snapshot.status == "partial_failed"
+
+
 def test_automation_runner_finishes_run_state_on_unexpected_task_error(tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
@@ -2783,6 +3810,288 @@ def test_automation_runner_finishes_run_state_on_unexpected_task_error(tmp_path:
     r01_state = next(iter(state.outputs.values()))
     assert r01_state.status == "failed"
     assert r01_state.error_code == "UNEXPECTED_RUNNER_ERROR"
+
+
+def test_automation_runner_automatically_bundles_failure_evidence(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+
+    unrelated_path = Path(config.app.logs_dir) / "unrelated_other_execution.json"
+    sensitive_path = Path(config.app.logs_dir) / "oauth_token.json"
+    production_token_path = Path(config.app.state_dir) / "google_drive_user_token.bin"
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            diagnostic_path = Path(config.app.logs_dir) / "automatic_failure_source.json"
+            diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            unrelated_path.write_text('{"execution_id": "other"}', encoding="utf-8")
+            sensitive_path.write_text('{"access_token": "must-not-escape"}', encoding="utf-8")
+            production_token_path.parent.mkdir(parents=True, exist_ok=True)
+            production_token_path.write_bytes(b"dpapi-token-must-not-escape")
+            diagnostic_path.write_text(
+                json.dumps(
+                    {
+                        "failure": True,
+                        "sensitive_reference": str(sensitive_path),
+                        "production_token_reference": str(production_token_path),
+                        "password": "alpha beta gamma",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                ok=False,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code="TEST_REPORT_FAILED",
+                message="simulated report failure",
+                actions=["simulated_failure"],
+                diagnostic_path=diagnostic_path,
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is False
+    assert summary.evidence_bundle_path is not None
+    bundle_path = Path(summary.evidence_bundle_path)
+    assert bundle_path.exists()
+    assert bundle_path.suffix == ".zip"
+    with zipfile.ZipFile(bundle_path) as archive:
+        names = archive.namelist()
+        assert "manifest.json" in names
+        assert any(name.endswith("automatic_failure_source.json") for name in names)
+        assert any("automation_runtime_" in name for name in names)
+        assert any("run_state_" in name for name in names)
+        assert not any("unrelated_other_execution" in name for name in names)
+        assert not any("oauth_token" in name for name in names)
+        assert not any("google_drive_user_token" in name for name in names)
+        diagnostic_member = next(name for name in names if name.endswith("automatic_failure_source.json"))
+        diagnostic_text = archive.read(diagnostic_member).decode("utf-8")
+        assert "alpha beta gamma" not in diagnostic_text
+        assert '"password": "<redacted>"' in diagnostic_text
+        manifest = json.loads(archive.read("manifest.json"))
+        denied_items = [
+            item
+            for item in manifest["omitted_files"]
+            if item["reason"] == "sensitive_filename_denied"
+        ]
+        assert len(denied_items) >= 2
+        assert all(item["path"] == "<redacted-sensitive-path>" for item in denied_items)
+        assert all("path_sha256" not in item for item in denied_items)
+        manifest_text = json.dumps(manifest, ensure_ascii=False)
+        assert "oauth_token.json" not in manifest_text
+        assert "google_drive_user_token.bin" not in manifest_text
+
+
+def test_failure_evidence_total_limit_uses_redacted_archive_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+    max_total_size = 8 * 1024
+    monkeypatch.setattr(
+        automation_runner_module,
+        "_FAILURE_EVIDENCE_MAX_TOTAL_SIZE",
+        max_total_size,
+    )
+    diagnostic_path = Path(config.app.logs_dir) / "expanding_failure.json"
+    raw_diagnostic = json.dumps(
+        {"values": [0] * 1500},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(raw_diagnostic) < max_total_size
+    assert (
+        len(automation_runner_module._redacted_evidence_bytes(diagnostic_path, raw_diagnostic))
+        > max_total_size
+    )
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            diagnostic_path.write_bytes(raw_diagnostic)
+            return SimpleNamespace(
+                ok=False,
+                task_id=output.task_id,
+                output_path=tmp_path / output.output_filename,
+                error_code="TEST_REPORT_FAILED",
+                message="simulated report failure",
+                actions=["simulated_failure"],
+                diagnostic_path=diagnostic_path,
+            )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+
+    summary = runner.run()
+
+    assert summary.evidence_bundle_path is not None
+    with zipfile.ZipFile(summary.evidence_bundle_path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert sum(item["size"] for item in manifest["included_files"]) <= max_total_size
+        assert not any(name.endswith("expanding_failure.json") for name in archive.namelist())
+        assert any(
+            item["reason"] == "size_limit_after_redaction"
+            for item in manifest["omitted_files"]
+        )
+
+
+def test_failure_manifest_redacts_sensitive_summary_path_fields() -> None:
+    manifest = {
+        "summary": {
+            "failures": [
+                {
+                    "diagnostic_path": r"C:\ProgramData\POSReportBot\logs\client_secret.txt",
+                    "evidence_paths": [
+                        r"C:\ProgramData\POSReportBot\state\oauth_token.json",
+                        r"C:\ProgramData\POSReportBot\logs\safe_diagnostic.json",
+                    ],
+                }
+            ]
+        }
+    }
+
+    redacted = automation_runner_module._redact_evidence_object(manifest)
+    failure = redacted["summary"]["failures"][0]
+
+    assert failure["diagnostic_path"] == "<redacted-sensitive-path>"
+    assert failure["evidence_paths"] == [
+        "<redacted-sensitive-path>",
+        r"C:\ProgramData\POSReportBot\logs\safe_diagnostic.json",
+    ]
+    text = json.dumps(redacted, ensure_ascii=False)
+    assert "client_secret.txt" not in text
+    assert "oauth_token.json" not in text
+
+
+def test_automation_runner_bundles_planner_initialization_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    monkeypatch.setattr(
+        automation_runner_module,
+        "build_dry_run_plan",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("planner exploded")),
+    )
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+    )
+
+    summary = runner.run()
+
+    assert summary.ok is False
+    assert summary.error_code == "RUNNER_INITIALIZATION_FAILED"
+    assert summary.evidence_bundle_path is not None
+    with zipfile.ZipFile(summary.evidence_bundle_path) as archive:
+        assert any("automation_runner_outer_failure_" in name for name in archive.namelist())
+
+
+def test_failure_bundle_includes_explicit_w02_plan_but_excludes_stale_primary_state(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        run_date=date(2026, 9, 1),
+    )
+    plan_path = Path(config.app.downloads_dir) / "W02" / "20260901" / "w02_order_plan_20260901.json"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text('{"forms": [{"branch": "站前4樓"}]}', encoding="utf-8")
+    diagnostic_path = Path(config.app.logs_dir) / "automation_w02_pos_order_test.json"
+    diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic_path.write_text('{"error_code": "W02_TEST"}', encoding="utf-8")
+    primary_path = Path(config.app.state_dir) / "20260901" / "run_state_latest.json"
+    recovery_path = primary_path.with_name("run_state_recovery_current.json")
+    primary_path.parent.mkdir(parents=True, exist_ok=True)
+    primary_path.write_text('{"execution_id": "stale"}', encoding="utf-8")
+    recovery_path.write_text('{"execution_id": "current"}', encoding="utf-8")
+    journal_path = Path(config.app.logs_dir) / "automation_runtime_current.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            {
+                "execution_id": "current",
+                "run_state_path": str(recovery_path),
+                "run_state_primary_path": str(primary_path),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    store = RunStateStore(primary_path)
+    store.path = recovery_path
+    store.recovery_reason = "LATEST_STATE_REPLACE_DENIED"
+    runner._active_run_state_store = store
+    runner._runtime_phase_journal = SimpleNamespace(
+        path=journal_path,
+        execution_id="current",
+    )
+    summary = AutomationRunSummary(
+        ok=False,
+        completed=0,
+        total=1,
+        error_code="REPORT_RUN_FAILED",
+        message="W02 failed password=manifest-secret-value",
+        failures=(
+            ReportRunFailure(
+                task_id="W02",
+                output_filename="",
+                error_code="W02_TEST",
+                message="failed password=manifest-secret-value",
+                diagnostic_path=str(diagnostic_path),
+                evidence_paths=(str(plan_path),),
+            ),
+        ),
+    )
+
+    bundled = runner._attach_failure_evidence(summary)
+
+    assert bundled.evidence_bundle_path is not None
+    with zipfile.ZipFile(bundled.evidence_bundle_path) as archive:
+        names = archive.namelist()
+        assert any(name.endswith("w02_order_plan_20260901.json") for name in names)
+        assert any(name.endswith("run_state_recovery_current.json") for name in names)
+        assert not any(name.endswith("run_state_latest.json") for name in names)
+        manifest = json.loads(archive.read("manifest.json"))
+        assert "manifest-secret-value" not in json.dumps(manifest, ensure_ascii=False)
+        assert any(
+            item["reason"] == "historical_locked_primary_not_current_execution"
+            for item in manifest["omitted_files"]
+        )
 
 
 def test_automation_runner_continues_after_unexpected_task_error(tmp_path: Path) -> None:
@@ -2836,6 +4145,66 @@ def test_automation_runner_continues_after_unexpected_task_error(tmp_path: Path)
     assert r09_state.status == "failed"
     assert r10_state.status == "completed"
     assert r11_state.status == "completed"
+
+
+def test_automation_runner_stops_remaining_pos_tasks_when_unexpected_error_reconnect_fails(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    for report in config.reports:
+        report.enabled = report.id in {"R09", "R10", "R11"}
+    calls: list[str] = []
+    connection_count = 0
+    stale_window = False
+
+    def connect_pos(**_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal connection_count
+        connection_count += 1
+        if connection_count == 1:
+            return _ready_pos_window()
+        raise UiProbeError("POS error dialog remained open")
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            nonlocal stale_window
+            calls.append(output.task_id)
+            stale_window = True
+            raise RuntimeError("unexpected POS modal")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=connect_pos,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+    )
+    original_prepare = runner._prepare_pos_window_for_automation
+
+    def prepare_pos(config_value, window):  # type: ignore[no-untyped-def]
+        if stale_window:
+            raise RuntimeError("stale POS modal")
+        return original_prepare(config_value, window)
+
+    runner._prepare_pos_window_for_automation = prepare_pos  # type: ignore[method-assign]
+
+    summary = runner.run()
+    state = RunStateStore.default_for_config(config).load()
+
+    assert calls == ["R09"]
+    assert summary.ok is False
+    assert summary.completed == 0
+    assert len(summary.failures) == 3
+    assert state is not None
+    states = {output.task_id: output for output in state.outputs.values()}
+    assert states["R09"].error_code == "UNEXPECTED_RUNNER_ERROR"
+    assert states["R10"].error_code == "POS_CONNECTION_FAILED"
+    assert states["R11"].error_code == "POS_CONNECTION_FAILED"
 
 
 def test_automation_runner_returns_no_enabled_reports_without_pos_connection(tmp_path: Path) -> None:
@@ -2950,7 +4319,9 @@ def test_automation_runner_recovers_pos_and_retries_current_task(tmp_path: Path)
     assert summary.failures == ()
 
 
-def test_automation_runner_does_not_restart_pos_for_export_menu_not_opened(tmp_path: Path) -> None:
+def test_automation_runner_restarts_pos_for_export_menu_not_opened_and_retries_current_task(
+    tmp_path: Path,
+) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
     _disable_uploads(config)
@@ -2967,7 +4338,7 @@ def test_automation_runner_does_not_restart_pos_for_export_menu_not_opened(tmp_p
 
         def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
             calls.append(output.task_id)
-            if output.task_id == "R01":
+            if output.task_id == "R01" and len(calls) == 1:
                 raise ReportAutomationError(
                     "EXPORT_MENU_NOT_OPENED",
                     "已點擊報表工具列的「匯出」，但未確認匯出格式選單。",
@@ -2998,14 +4369,87 @@ def test_automation_runner_does_not_restart_pos_for_export_menu_not_opened(tmp_p
 
     summary = runner.run()
 
-    assert calls == ["R01", "R02"]
-    assert recoveries == []
-    assert summary.ok is False
-    assert summary.completed == 1
-    assert [failure.task_id for failure in summary.failures] == ["R01"]
+    assert calls == ["R01", "R01", "R02"]
+    assert recoveries == ["recover"]
+    assert summary.ok is True
+    assert summary.completed == 2
+    assert summary.failures == ()
 
 
-def test_automation_runner_recovers_export_button_not_ready_and_retries_current_task(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "error_code",
+    ["EXPORT_MENU_NOT_OPENED", "VIEW_REPORT_NOT_TRIGGERED", "SAVE_AS_DIALOG_NOT_FOUND"],
+)
+def test_automation_runner_restarts_pos_for_recoverable_failed_result_and_retries_current_task(
+    error_code: str,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.app.downloads_dir = str(tmp_path)
+    _disable_uploads(config)
+    config.pos_recovery.enabled = True
+    config.pos_recovery.max_restarts_per_run = 1
+    for report in config.reports:
+        report.enabled = report.id in {"R11", "R12"}
+    calls: list[str] = []
+    recoveries: list[str] = []
+
+    class FakeAutomator:
+        def __init__(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+        def download_report(self, output, report, *, close_after_success=True):  # type: ignore[no-untyped-def]
+            calls.append(output.task_id)
+            if output.task_id == "R11" and calls.count("R11") == 1:
+                return SimpleNamespace(
+                    ok=False,
+                    task_id=output.task_id,
+                    output_path=tmp_path / output.output_filename,
+                    error_code=error_code,
+                    message="POS 報表預覽或匯出工作流未完成",
+                    actions=["strategy:匯出:R11使用有界原生popup探測避免UIA阻塞"],
+                    diagnostic_path=None,
+                )
+            output_path = tmp_path / output.output_filename
+            output_path.write_bytes(b"excel-bytes")
+            return SimpleNamespace(
+                ok=True,
+                task_id=output.task_id,
+                output_path=output_path,
+                error_code=None,
+                message="saved",
+                actions=[],
+                diagnostic_path=None,
+            )
+
+    def recover_pos(_config, _on_progress):  # type: ignore[no-untyped-def]
+        recoveries.append("recover")
+        return _ready_pos_window()
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: _ready_pos_window(),
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        automator_factory=FakeAutomator,  # type: ignore[arg-type]
+        pos_recovery_func=recover_pos,
+    )
+
+    summary = runner.run()
+
+    assert calls == ["R11", "R11", "R12"]
+    assert recoveries == ["recover"]
+    assert summary.ok is True
+    assert summary.completed == 2
+    assert summary.failures == ()
+
+
+@pytest.mark.parametrize("error_code", ["EXPORT_BUTTON_NOT_READY", "VIEW_REPORT_NOT_TRIGGERED"])
+def test_automation_runner_recovers_preview_failure_and_retries_current_task(
+    error_code: str,
+    tmp_path: Path,
+) -> None:
     config = _load_runner_config(tmp_path)
     config.app.downloads_dir = str(tmp_path)
     _disable_uploads(config)
@@ -3024,7 +4468,7 @@ def test_automation_runner_recovers_export_button_not_ready_and_retries_current_
             calls.append(output.task_id)
             if len(calls) == 1:
                 raise ReportAutomationError(
-                    "EXPORT_BUTTON_NOT_READY",
+                    error_code,
                     "報表已按下「檢視報表」，但工具列的「匯出」沒有啟用。",
                 )
             output_path = tmp_path / output.output_filename
@@ -3485,6 +4929,63 @@ def test_automation_runner_launches_latest_clickonce_pos_when_configured_path_is
     assert launched == [[str(latest)]]
 
 
+def test_preparation_failure_diagnostic_records_pos_launch_lifecycle(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    pos_executable = tmp_path / "SPA1.exe"
+    pos_executable.write_bytes(b"fake-pos")
+    config.pos.executable_path = str(pos_executable)
+    config.pos.startup_wait_seconds = 1
+    _set_runtime_dirs(config, tmp_path)
+
+    class ExitedProcess:
+        pid = 4321
+
+        @staticmethod
+        def poll() -> int:
+            return 23
+
+    monkeypatch.setattr(
+        "pos_report_bot.app.automation_runner.subprocess.Popen",
+        lambda command, cwd=None: ExitedProcess(),
+    )
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+    )
+    runner._launch_pos_process(config)
+
+    output = SimpleNamespace(
+        task_id="R01",
+        output_filename="r01.xls",
+        start_date="2026/07/01",
+        end_date="2026/07/28",
+        branch_code=None,
+        branch_display_name=None,
+        drive_folder_id=None,
+        upload_enabled=False,
+    )
+    diagnostic_path = runner._write_preparation_failure_diagnostic(
+        [output],
+        error_code="POS_CONNECTION_FAILED",
+        message="POS 視窗未出現",
+    )
+
+    assert diagnostic_path is not None
+    payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    runtime = payload["runtime"]
+    assert runtime["rpa_executable_path"]
+    assert runtime["pos_executable_path_configured"] == str(pos_executable)
+    assert runtime["pos_executable_path_resolved"] == str(pos_executable)
+    assert runtime["pos_launch"]["pid"] == 4321
+    assert runtime["pos_launch"]["returncode"] == 23
+    assert runtime["pos_launch"]["alive"] is False
+
+
 def test_automation_runner_recovery_terminates_spa1_when_launch_path_is_appref(monkeypatch, tmp_path: Path) -> None:
     config = _load_runner_config(tmp_path)
     config.pos.executable_path = str(tmp_path / "SPA POS.appref-ms")
@@ -3559,6 +5060,240 @@ def test_automation_runner_logs_in_before_first_report_when_login_screen_is_visi
     assert login_button.clicked is True
     assert calls == ["R01"]
     assert summary.ok is True
+
+
+def test_automation_runner_logs_in_with_a_single_unnamed_login_button(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    config.login.username = "A0042"
+    account_edit = FakePosControl("", "Edit")
+    secret_edit = FakePosControl("", "Edit")
+    login_window = FakePosControl("帳號登入", "Window")
+
+    def complete_login() -> None:
+        login_window.name = "SPA-POS 主畫面"
+        login_window.children_controls = [FakePosControl("統計報表", "MenuItem")]
+
+    unnamed_login_button = FakePosControl("", "Button", on_click=complete_login)
+    login_window.children_controls = [
+        FakePosControl("帳號", "Text"),
+        account_edit,
+        FakePosControl("密碼", "Text"),
+        secret_edit,
+        unnamed_login_button,
+    ]
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: login_window,
+        pos_login_secret_provider=lambda: "fake-login-secret",
+    )
+
+    result = runner._login_if_required(config, login_window)
+
+    assert result is login_window
+    assert unnamed_login_button.clicked is True
+    assert account_edit.text_value == "A0042"
+    assert secret_edit.text_value == "fake-login-secret"
+
+
+def test_automation_runner_treats_open_report_child_as_logged_in_after_reconnect(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+    report_toolbar = FakePosControl("ReportToolBar", "Pane", automation_id="reportToolBar")
+    report_form = FakePosControl(
+        "商品銷售明細表",
+        "Dialog",
+        automation_id="ProdSale_Report",
+        children=[report_toolbar],
+    )
+    report_window = FakePosControl(
+        "SPA-POS Ver.1.5.19.15",
+        "Dialog",
+        automation_id="MainForm",
+        children=[report_form],
+    )
+
+    def unexpected_password_lookup() -> str:
+        raise AssertionError("a logged-in report child must not trigger login")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: report_window,
+        pos_login_secret_provider=unexpected_password_lookup,
+    )
+
+    assert runner._login_if_required(config, report_window) is report_window
+
+
+def test_automation_runner_ignores_hidden_stale_login_controls_on_logged_in_pos(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.login.required = True
+
+    class HiddenControl(FakePosControl):
+        def is_visible(self) -> bool:
+            return False
+
+    main_window = FakePosControl(
+        "SPA-POS 主畫面",
+        "Window",
+        children=[
+            FakePosControl("統計報表", "MenuItem"),
+            HiddenControl("帳號", "Text"),
+            HiddenControl("密碼", "Text"),
+            HiddenControl("登入", "Button"),
+            HiddenControl("", "Edit"),
+            HiddenControl("", "Edit"),
+        ],
+    )
+
+    def unexpected_password_lookup() -> str:
+        raise AssertionError("hidden stale login controls must not trigger credential lookup")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=lambda **_kwargs: main_window,
+        pos_login_secret_provider=unexpected_password_lookup,
+    )
+
+    assert runner._login_if_required(config, main_window) is main_window
+
+
+def test_automation_runner_closes_pos_even_when_legacy_flag_is_false(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    config.pos.close_after_run = False
+    window = FakeClosablePosWindow()
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+
+    runner._close_pos_after_run_if_configured(window, None)
+
+    assert window.closed is True
+
+
+def test_automation_runner_keeps_pos_open_for_verified_w02_unsaved_draft_resume(
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    window = FakeClosablePosWindow()
+    progress_messages: list[str] = []
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._preserve_pos_after_run_reason = "w02_unsaved_draft_available_for_verified_resume"
+
+    runner._close_pos_after_run_if_configured(
+        window,
+        lambda event: progress_messages.append(event.message),
+    )
+
+    assert window.closed is False
+    assert any("已保留 SPA-POS 與未儲存草稿" in message for message in progress_messages)
+
+
+def test_automation_runner_confirms_pos_exit_dialog_with_yes(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    window = FakeClosablePosWindow()
+    confirmed: list[str] = []
+
+    def confirm_exit() -> bool:
+        confirmed.append("yes")
+        return True
+
+    window.confirm_exit = confirm_exit  # type: ignore[attr-defined]
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+
+    runner._close_pos_after_run_if_configured(window, None)
+
+    assert window.closed is True
+    assert confirmed == ["yes"]
+
+
+def test_pos_close_fallback_terminates_only_the_current_window_process(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text('{"profile":"formal","process_id":4242}', encoding="utf-8")
+    commands: list[list[str]] = []
+
+    class StubbornWindow(FakeProcessBoundPosWindow):
+        def close(self) -> None:
+            return
+
+        def is_visible(self) -> bool:
+            return True
+
+    monkeypatch.setattr(automation_runner_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        automation_runner_module.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or SimpleNamespace(returncode=0),
+    )
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    monkeypatch.setattr(runner, "_confirm_pos_exit_dialog", lambda *_args, **_kwargs: False)
+
+    runner._close_pos_after_run_if_configured(StubbornWindow(4242), None)
+
+    assert commands == [["taskkill", "/F", "/T", "/PID", "4242"]]
+    assert not marker_path.exists()
+
+
+def test_pos_close_fallback_never_kills_all_by_image_when_window_pid_is_unknown(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    marker_path = Path(config.app.state_dir) / "pos_session_profile.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text('{"profile":"formal","process_id":4242}', encoding="utf-8")
+    commands: list[list[str]] = []
+
+    class StubbornWindow(FakeClosablePosWindow):
+        def close(self) -> None:
+            return
+
+        def is_visible(self) -> bool:
+            return True
+
+    monkeypatch.setattr(automation_runner_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        automation_runner_module.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or SimpleNamespace(returncode=0),
+    )
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    monkeypatch.setattr(runner, "_confirm_pos_exit_dialog", lambda *_args, **_kwargs: False)
+
+    runner._close_pos_after_run_if_configured(StubbornWindow(), None)
+
+    assert commands == []
+    assert marker_path.exists()
+
+
+def test_pos_recovery_with_existing_unknown_pid_window_disables_image_fallback(monkeypatch, tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    config.pos.startup_ini_selection_enabled = False
+    config.login.required = False
+    config.pos_recovery.kill_process_on_hang = True
+    config.pos_recovery.relaunch_after_kill = False
+    config.pos_recovery.restart_delay_seconds = 0
+    current_window = FakeClosablePosWindow()
+    ready_window = _ready_pos_window()
+    calls: list[dict[str, object]] = []
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+    runner._last_pos_window = current_window
+    monkeypatch.setattr(
+        runner,
+        "_terminate_pos_process",
+        lambda _config, **kwargs: calls.append(kwargs) or False,
+    )
+    monkeypatch.setattr(runner, "_wait_for_reconnected_pos_window", lambda _config: ready_window)
+
+    assert runner._recover_pos_session(config, None) is ready_window
+    assert calls == [{"window": current_window, "allow_image_fallback": False}]
 
 
 def test_automation_runner_handles_pos_update_dialog_before_typing_login(tmp_path: Path) -> None:
@@ -5673,6 +7408,11 @@ def test_automation_runner_writes_diagnostic_when_pos_never_reaches_required_men
     assert payload["required_root_menus"] == ["庫存管理"]
     assert payload["visible_control_names"] == []
     assert "desktop_windows" in payload
+    evidence = payload["failure_evidence"]
+    assert evidence["ui_probe_path"] is not None
+    assert Path(evidence["ui_probe_path"]).exists()
+    probe_payload = json.loads(Path(evidence["ui_probe_path"]).read_text(encoding="utf-8"))
+    assert probe_payload["window_title"] == "SPA-POS"
     assert "診斷檔" in summary.message
 
 
@@ -6306,8 +8046,124 @@ def test_automation_runner_reports_startup_failure_when_pos_not_running_and_path
     assert "找不到 POS 啟動檔" in summary.message
 
 
-def _summary_actual_group_columns(sheet, month_label: str) -> list[int]:  # type: ignore[no-untyped-def]
-    branches = ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓")
+def test_automation_runner_records_cancellation_then_propagates_system_exit(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    _disable_uploads(config)
+    config.google_drive.upload_enabled = False
+    config.email.enabled = False
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+        if report.id == "R06":
+            report.frequency = "weekly"
+    for branch in config.branches:
+        branch.enabled = False
+
+    def exit_during_pos_connect(**_kwargs):  # type: ignore[no-untyped-def]
+        raise SystemExit("simulated dependency exit")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=exit_during_pos_connect,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+        run_source="gui_manual",
+        selected_task_ids={"R01", "R06"},
+    )
+
+    with pytest.raises(SystemExit, match="simulated dependency exit"):
+        runner.run()
+
+    state_payload = json.loads(
+        (tmp_path / "state" / date.today().strftime("%Y%m%d") / "run_state_latest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    output_state = next(iter(state_payload["outputs"].values()))
+    assert state_payload["status"] == "failed"
+    assert output_state["status"] == "failed"
+    assert output_state["error_code"] == "RUN_CANCELLED"
+    journal_path = next((tmp_path / "logs").rglob("automation_runtime_*.jsonl"))
+    phase_records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+    assert phase_records[0]["selected_task_ids"] == ["R01", "R06"]
+    assert phase_records[0]["planned_task_ids"] == ["R01", "R06"]
+    assert phase_records[0]["disabled_but_explicitly_selected_task_ids"] == ["R06"]
+    assert phase_records[0]["all_branches_disabled_but_explicitly_selected_task_ids"] == ["R06"]
+    selected_diagnostics = {
+        item["task_id"]: item for item in phase_records[0]["selected_task_plan_diagnostics"]
+    }
+    assert selected_diagnostics["R01"]["planned"] is True
+    assert selected_diagnostics["R06"]["planned"] is True
+    assert selected_diagnostics["R06"]["frequency"] == "weekly"
+    assert selected_diagnostics["R06"]["branch_mode"] == "each_branch"
+    assert selected_diagnostics["R06"]["configured_branch_count"] == 6
+    assert phase_records[0]["output_count"] == 7
+    assert [record["phase"] for record in phase_records] == [
+        "run_started",
+        "task_started",
+        "pos_connect_start",
+        "pos_connect_error",
+        "run_cancelled",
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing semantics only")
+def test_automation_runner_records_recovery_state_path_when_latest_is_locked(tmp_path: Path) -> None:
+    config = _load_runner_config(tmp_path)
+    _set_runtime_dirs(config, tmp_path)
+    _disable_uploads(config)
+    config.google_drive.upload_enabled = False
+    config.email.enabled = False
+    for report in config.reports:
+        report.enabled = report.id == "R01"
+
+    state_dir = tmp_path / "state" / date.today().strftime("%Y%m%d")
+    state_dir.mkdir(parents=True)
+    latest_path = state_dir / "run_state_latest.json"
+    latest_path.write_text('{"historical": true}', encoding="utf-8")
+
+    def exit_during_pos_connect(**_kwargs):  # type: ignore[no-untyped-def]
+        raise SystemExit("simulated dependency exit")
+
+    runner = AutomationRunner(
+        config,
+        settings_path=tmp_path / "app.yaml",
+        app_version="test",
+        connect_pos_window_func=exit_during_pos_connect,
+        save_as_handler_factory=lambda _config: MockSaveAsHandler(),
+    )
+
+    with latest_path.open("r", encoding="utf-8"):
+        with pytest.raises(SystemExit, match="simulated dependency exit"):
+            runner.run()
+
+    recovery_paths = list(state_dir.glob("run_state_recovery_*.json"))
+    assert len(recovery_paths) == 1
+    recovery_payload = json.loads(recovery_paths[0].read_text(encoding="utf-8"))
+    assert recovery_payload["status"] == "failed"
+    assert latest_path.read_text(encoding="utf-8") == '{"historical": true}'
+    journal_path = next((tmp_path / "logs").rglob("automation_runtime_*.jsonl"))
+    run_started = json.loads(journal_path.read_text(encoding="utf-8").splitlines()[0])
+    assert run_started["run_state_path"] == str(recovery_paths[0])
+    assert run_started["run_state_primary_path"] == str(latest_path)
+    assert run_started["run_state_recovery_reason"] == "LATEST_STATE_REPLACE_DENIED"
+
+
+def _summary_actual_group_columns(  # type: ignore[no-untyped-def]
+    sheet,
+    month_label: str,
+    *,
+    allow_legacy: bool = False,
+) -> list[int]:
+    branches = (
+        "站前4樓",
+        "站前11樓",
+        "忠孝7樓",
+        "忠孝國際醫學3樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+    )
     for col in range(1, sheet.max_column + 1):
         if sheet.cell(2, col).value != month_label or sheet.cell(3, col).value != "Actual":
             continue
@@ -6319,6 +8175,8 @@ def _summary_actual_group_columns(sheet, month_label: str) -> list[int]:  # type
             columns.append(next_col)
         if len(columns) == 1 + len(branches):
             return columns
+        if allow_legacy and len(columns) == len(branches):
+            return columns
     raise AssertionError(f"Summary Actual group not found: {month_label}")
 
 
@@ -6327,3 +8185,16 @@ def _find_workbook_item_row(sheet, item_code: str) -> int:  # type: ignore[no-un
         if str(sheet.cell(row, 2).value).strip() == item_code:
             return row
     raise AssertionError(f"item not found: {item_code}")
+
+
+@pytest.mark.parametrize("error_code", ["REPORT_SCREEN_NOT_OPENED", "REPORT_ROOT_MENU_NOT_FOUND"])
+def test_automation_runner_treats_report_surface_failure_as_recoverable(
+    error_code: str,
+    tmp_path: Path,
+) -> None:
+    config = _load_runner_config(tmp_path)
+    config.pos_recovery.enabled = True
+    config.pos_recovery.max_restarts_per_run = 1
+    runner = AutomationRunner(config, settings_path=tmp_path / "app.yaml", app_version="test")
+
+    assert runner._can_recover_pos(ReportAutomationError(error_code, "POS 報表畫面失效"), 0) is True

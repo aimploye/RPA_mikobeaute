@@ -1,6 +1,5 @@
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 
 from pos_report_bot.pos.save_as_handler import (
     DesktopWindowProbeRecord,
@@ -315,7 +314,7 @@ def test_windows_save_as_default_blind_fallback_waits_full_timeout() -> None:
     assert handler.blind_keyboard_fallback_delay_seconds == 45
 
 
-def test_windows_save_as_wait_for_dialog_prefers_window_enumeration() -> None:
+def test_windows_save_as_wait_for_dialog_prefers_platform_backend_enumeration() -> None:
     dialog = FakeSaveAsControl("另存新檔", "Window", rect=FakeRect(360, 210, 980, 680))
     handler = WindowsSaveAsHandler(wait_timeout_seconds=1)
     backend_calls: list[str] = []
@@ -327,7 +326,8 @@ def test_windows_save_as_wait_for_dialog_prefers_window_enumeration() -> None:
     handler._desktop_factory = desktop_factory  # type: ignore[attr-defined]
 
     assert handler._wait_for_dialog(allow_desktop_scan=True) is dialog  # type: ignore[attr-defined]
-    assert backend_calls == ["uia"]
+    expected_backend = "win32" if sys.platform.startswith("win") else "uia"
+    assert backend_calls == [expected_backend]
 
 
 def test_windows_save_as_wait_for_dialog_accepts_native_dialog_by_controls() -> None:
@@ -387,12 +387,11 @@ def test_windows_save_as_short_wait_does_not_enter_slow_desktop_scan(monkeypatch
         raise AssertionError("missing SaveAs dialog should time out")
 
 
-def test_windows_save_as_save_uses_blind_keyboard_when_dialog_handle_is_not_detected(
+def test_windows_save_as_fails_closed_when_dialog_handle_is_not_detected(
     tmp_path: Path,
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
     handler = WindowsSaveAsHandler(wait_timeout_seconds=1)
-    handler.blind_keyboard_fallback_delay_seconds = 0.1
     target = tmp_path / "R01.xls"
     sent_keys: list[str] = []
     clipboard_values: list[str] = []
@@ -400,22 +399,18 @@ def test_windows_save_as_save_uses_blind_keyboard_when_dialog_handle_is_not_dete
     handler.set_action_logger(actions.append)
     handler._keyboard_sender = lambda keys, **_kwargs: sent_keys.append(keys)  # type: ignore[attr-defined]
     handler._clipboard_setter = lambda value: clipboard_values.append(value)  # type: ignore[attr-defined]
-    handler._fast_foreground_window_handle = lambda: None  # type: ignore[attr-defined]
-    handler._fast_top_level_window_handle = lambda **_kwargs: None  # type: ignore[attr-defined]
-    handler._desktop_factory = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("normal save must not scan desktop"))  # type: ignore[attr-defined]
-    monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(
-        "pos_report_bot.pos.save_as_handler.validate_file",
-        lambda *_args, **_kwargs: SimpleNamespace(ok=True),
+    handler._wait_for_dialog = lambda: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+        SaveAsDialogTimeoutError("等待另存新檔視窗逾時", observed_windows=[])
     )
+    monkeypatch.setattr(sys, "platform", "win32")
 
     result = handler.save(target)
 
-    assert result.error_code is None
+    assert result.error_code == "SAVE_AS_DIALOG_NOT_FOUND"
     assert result.output_path == target
-    assert clipboard_values == [str(target)]
-    assert sent_keys[-1] == "{ENTER}"
-    assert any(action.startswith("fallback:另存新檔鍵盤盲填:") for action in actions)
+    assert clipboard_values == []
+    assert sent_keys == []
+    assert "skip:另存新檔鍵盤盲填:no_verified_dialog" in actions
 
 
 def test_windows_save_as_does_not_blind_type_while_pos_export_is_still_running(

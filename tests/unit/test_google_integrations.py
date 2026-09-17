@@ -2,6 +2,8 @@ import base64
 from datetime import date
 from email import message_from_bytes
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +11,7 @@ from pos_report_bot.config.loader import load_project_config
 from pos_report_bot.drive.uploader import GoogleDriveUploader
 from pos_report_bot.google.gmail import GmailOAuthSender
 from pos_report_bot.google.oauth import (
+    GOOGLE_OAUTH_SCOPES,
     GOOGLE_DRIVE_PROFILE,
     GOOGLE_DRIVE_SCOPES,
     GOOGLE_GMAIL_PROFILE,
@@ -158,9 +161,9 @@ class FakeSheetsValuesService:
                 "values": [
                     ["*自2025/1起調整為最小單位(發/點/支)"],
                     ["料件編號 新", "採購分類", "凱惠料號", "品名", "盒入數", "庫存\n 單位", "隸屬部門", "2026/6/25"],
-                    [None, None, None, None, None, None, None, "站前4樓", "忠孝7樓", "忠孝健康7樓", "站前11樓", "忠孝國際醫學3樓"],
-                    ["MP001", "針劑", "6050010", "商品A", "1", "PCS", "護理部", "12", "4", "6", "3", "5"],
-                    ["MP002", "針劑", "6050011", "商品B", "1", "PCS", "護理部", "0", "8", "10", "", "9"],
+                    [None, None, None, None, None, None, None, "站前4樓", "忠孝7樓", "忠孝健康7樓", "站前11樓", "忠孝國際醫學3樓", "忠孝預防醫學3樓"],
+                    ["MP001", "針劑", "6050010", "商品A", "1", "PCS", "護理部", "12", "4", "6", "3", "5", "7"],
+                    ["MP002", "針劑", "6050011", "商品B", "1", "PCS", "護理部", "0", "8", "10", "", "9", "11"],
                 ]
             }
         )
@@ -178,7 +181,7 @@ class FakeSheetsValuesServiceWithInvalidNumber:
             {
                 "values": [
                     ["料件編號 新", "採購分類", "凱惠料號", "品名", "盒入數", "庫存\n 單位", "隸屬部門", "2026/6/25"],
-                    [None, None, None, None, None, None, None, "站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓"],
+                    [None, None, None, None, None, None, None, "站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓", "忠孝預防醫學3樓"],
                     ["MP001", "針劑", "6050010", "商品A", "1", "PCS", "護理部", "不是數字"],
                 ]
             }
@@ -340,6 +343,123 @@ def test_google_oauth_connect_writes_token_and_reads_account(tmp_path: Path) -> 
     assert (tmp_path / "google_user_token.bin").exists()
 
 
+def test_google_oauth_combined_consent_includes_every_runtime_profile_scope() -> None:
+    assert set(GOOGLE_DRIVE_SCOPES).issubset(GOOGLE_OAUTH_SCOPES)
+    assert set(GOOGLE_SHEETS_SCOPES).issubset(GOOGLE_OAUTH_SCOPES)
+    assert set(GOOGLE_GMAIL_SCOPES).issubset(GOOGLE_OAUTH_SCOPES)
+
+
+def test_google_oauth_reconnect_replaces_stale_service_profile_tokens(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    credentials_path = tmp_path / "credentials.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+    config.google_drive.client_secret_path = str(credentials_path)
+    config.google_drive.token_storage = "plaintext_test"
+    config.app.state_dir = str(tmp_path)
+    for filename in (
+        "google_drive_user_token.bin",
+        "google_sheets_user_token.bin",
+        "google_gmail_user_token.bin",
+    ):
+        (tmp_path / filename).write_text('{"token":"stale-profile-token"}', encoding="utf-8")
+
+    result = GoogleOAuthService(
+        config,
+        flow_factory=FakeFlow,
+        credentials_cls=FakeCredentials,
+        request_factory=lambda: object,
+        build_func=fake_build,
+    ).connect()
+
+    assert result.ok is True
+    expected = '{"token":"fake"}'
+    assert (tmp_path / "google_user_token.bin").read_text(encoding="utf-8") == expected
+    assert (tmp_path / "google_drive_user_token.bin").read_text(encoding="utf-8") == expected
+    assert (tmp_path / "google_sheets_user_token.bin").read_text(encoding="utf-8") == expected
+    assert (tmp_path / "google_gmail_user_token.bin").read_text(encoding="utf-8") == expected
+
+
+def test_google_oauth_reconnect_overwrites_stale_windows_keyring_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    credentials_path = tmp_path / "credentials.json"
+    credentials_path.write_text("{}", encoding="utf-8")
+    config.google_drive.client_secret_path = str(credentials_path)
+    config.google_drive.token_storage = "keyring"
+    config.app.state_dir = str(tmp_path)
+    stored = {
+        ("POSReportBot Google OAuth", "google_user_token"): '{"token":"old-combined"}',
+        ("POSReportBot Google OAuth", "google_drive_user_token"): '{"token":"stale-drive"}',
+        ("POSReportBot Google OAuth", "google_sheets_user_token"): '{"token":"stale-sheets"}',
+        ("POSReportBot Google OAuth", "google_gmail_user_token"): '{"token":"stale-gmail"}',
+    }
+    fake_keyring = SimpleNamespace(
+        get_password=lambda service, user: stored.get((service, user)),
+        set_password=lambda service, user, value: stored.__setitem__((service, user), value),
+    )
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+
+    result = GoogleOAuthService(
+        config,
+        flow_factory=FakeFlow,
+        credentials_cls=FakeCredentials,
+        request_factory=lambda: object,
+        build_func=fake_build,
+    ).connect()
+
+    assert result.ok is True
+    assert {
+        stored[("POSReportBot Google OAuth", user)]
+        for user in (
+            "google_user_token",
+            "google_drive_user_token",
+            "google_sheets_user_token",
+            "google_gmail_user_token",
+        )
+    } == {'{"token":"fake"}'}
+
+
+def test_google_oauth_blank_client_secret_path_uses_installed_config_directory(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.work_dir = str(tmp_path / "POSReportBot")
+    config.google_drive.client_secret_path = ""
+    expected = tmp_path / "POSReportBot" / "config" / "client_secret.json"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("{}", encoding="utf-8")
+
+    service = GoogleOAuthService(config)
+
+    assert service.credentials_path == expected
+
+
+def test_google_oauth_client_secret_directory_resolves_standard_filename(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    secret_directory = tmp_path / "config"
+    expected = secret_directory / "client_secret.json"
+    secret_directory.mkdir()
+    expected.write_text("{}", encoding="utf-8")
+    config.google_drive.client_secret_path = str(secret_directory)
+
+    service = GoogleOAuthService(config)
+
+    assert service.credentials_path == expected
+
+
+def test_google_oauth_missing_client_secret_returns_setup_error_before_flow(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.work_dir = str(tmp_path / "POSReportBot")
+    config.google_drive.client_secret_path = "."
+
+    result = GoogleOAuthService(config, flow_factory=FakeFlow).connect()
+
+    assert result.ok is False
+    assert result.error_code == "GOOGLE_CREDENTIALS_JSON_NOT_FOUND"
+    assert "Permission denied: '.'" not in result.message
+    assert "client_secret.json" in result.message
+
+
 def test_google_oauth_credentials_uses_configured_service_scopes(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     config.app.state_dir = str(tmp_path)
@@ -482,6 +602,7 @@ def test_google_sheets_inventory_client_reads_r14_inventory(tmp_path: Path) -> N
     assert result.inventories["站前4樓"]["6050011"] == 0
     assert "6050011" not in result.inventories["站前11樓"]
     assert result.inventories["忠孝健康7樓"]["6050011"] == 10
+    assert result.inventories["忠孝預防醫學3樓"]["6050011"] == 11
     assert result.inventories["忠孝7樓"]["6050010"] == 4
     assert result.inventories["站前11樓"]["6050010"] == 3
 

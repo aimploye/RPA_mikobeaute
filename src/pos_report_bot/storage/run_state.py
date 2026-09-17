@@ -1,5 +1,8 @@
 from datetime import UTC, date, datetime
 from pathlib import Path
+import re
+import stat
+from time import sleep
 from typing import Literal
 from uuid import uuid4
 
@@ -11,6 +14,35 @@ from pos_report_bot.storage.runtime_paths import dated_runtime_dir
 
 
 RunOutputStatus = Literal["planned", "running", "file_saved", "uploaded", "completed", "skipped", "failed"]
+STATE_REPLACE_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
+
+
+def _clear_read_only_replace_target(path: Path) -> bool:
+    try:
+        if not path.is_file():
+            return False
+        mode = path.stat().st_mode
+        if mode & stat.S_IWRITE:
+            return False
+        path.chmod(mode | stat.S_IWRITE)
+    except OSError:
+        return False
+    return True
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    for delay_seconds in STATE_REPLACE_RETRY_DELAYS_SECONDS:
+        try:
+            tmp_path.replace(path)
+            return
+        except PermissionError:
+            if _clear_read_only_replace_target(path):
+                continue
+            sleep(delay_seconds)
+    tmp_path.replace(path)
 
 
 class RunStateOutput(BaseModel):
@@ -44,7 +76,10 @@ class RunStateSnapshot(BaseModel):
 
 class RunStateStore:
     def __init__(self, path: Path) -> None:
+        self.primary_path = path
         self.path = path
+        self.recovery_reason: str | None = None
+        self.recovery_cleanup_warning: str | None = None
         self._snapshot: RunStateSnapshot | None = None
 
     @classmethod
@@ -70,8 +105,28 @@ class RunStateStore:
             outputs={self.output_key(output): self._planned_output(output, now) for output in plan.outputs},
         )
         self._snapshot = snapshot
-        self._write(snapshot)
+        try:
+            self._write(snapshot)
+        except PermissionError:
+            # write_text_atomic owns this sibling temp file.  When Windows
+            # keeps the historical primary JSON open, the final replace is
+            # denied and the run moves to an execution-specific recovery
+            # file.  Do not leave the failed primary temp beside an older
+            # run: evidence collectors could otherwise mistake it for the
+            # active snapshot.
+            try:
+                self.primary_path.with_suffix(self.primary_path.suffix + ".tmp").unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                self.recovery_cleanup_warning = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+            recovery_path = self._execution_recovery_path(snapshot.execution_id)
+            write_text_atomic(recovery_path, snapshot.model_dump_json(indent=2))
+            self.path = recovery_path
+            self.recovery_reason = "LATEST_STATE_REPLACE_DENIED"
         return snapshot
+
+    def _execution_recovery_path(self, execution_id: str) -> Path:
+        safe_execution_id = re.sub(r"[^A-Za-z0-9_.-]", "_", execution_id)
+        return self.primary_path.with_name(f"run_state_recovery_{safe_execution_id}.json")
 
     def mark_task_started(self, output: PlannedOutput) -> None:
         self._update_output(
@@ -209,7 +264,4 @@ class RunStateStore:
         raise RuntimeError("RunStateStore has not been started.")
 
     def _write(self, snapshot: RunStateSnapshot) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(snapshot.model_dump_json(indent=2), encoding="utf-8")
-        tmp_path.replace(self.path)
+        write_text_atomic(self.path, snapshot.model_dump_json(indent=2))

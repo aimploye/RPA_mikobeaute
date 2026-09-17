@@ -200,9 +200,16 @@ class WindowsSaveAsHandler:
                             "請檢查 POS 是否卡在匯出進度視窗。"
                         ),
                     )
-                self._log_action(f"fallback:另存新檔鍵盤盲填:reason={exc}")
-                self._set_filename_by_blind_keyboard(str(target))
-                self._log_action(f"wait_result:另存新檔視窗:elapsed={int(monotonic() - dialog_started_at)}s:blind_keyboard")
+                self._log_action("skip:另存新檔鍵盤盲填:no_verified_dialog")
+                return SaveResult(
+                    status=SaveStatus.FAILED,
+                    output_path=target,
+                    error_code="SAVE_AS_DIALOG_NOT_FOUND",
+                    message=(
+                        f"等待另存新檔視窗超過 {self.wait_timeout_seconds} 秒；"
+                        "未取得可驗證的另存新檔視窗，因此未向目前前景視窗送出檔名或 Enter。"
+                    ),
+                )
             else:
                 self._log_action(f"wait_result:另存新檔視窗:elapsed={int(monotonic() - dialog_started_at)}s")
                 filename_started_at = monotonic()

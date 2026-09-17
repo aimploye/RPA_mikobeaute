@@ -55,3 +55,8 @@ Thumbs.db
 *.wbk
 *.swp
 .gstack/
+
+# Local handoff/release work products
+tmp/
+.scratch/
+C*logs/

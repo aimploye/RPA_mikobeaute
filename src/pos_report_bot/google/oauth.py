@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -13,12 +14,16 @@ from pos_report_bot.config.models import ProjectConfig
 
 GOOGLE_OAUTH_SCOPES = (
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 )
-GOOGLE_DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive.file",)
+GOOGLE_DRIVE_SCOPES = (
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.readonly",
+)
 GOOGLE_GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.send",)
 GOOGLE_SHEETS_SCOPES = ("https://www.googleapis.com/auth/spreadsheets.readonly",)
 GOOGLE_COMBINED_PROFILE = "combined"
@@ -68,7 +73,15 @@ class GoogleOAuthService:
 
     @property
     def credentials_path(self) -> Path:
-        return Path(self.config.google_drive.client_secret_path)
+        configured_path = self.config.google_drive.client_secret_path.strip()
+        if configured_path and configured_path != ".":
+            path = Path(configured_path).expanduser()
+            if path.is_dir():
+                return path / "client_secret.json"
+            return path
+
+        candidates = self._default_credentials_paths()
+        return next((path for path in candidates if path.is_file()), candidates[0])
 
     @property
     def token_path(self) -> Path:
@@ -76,11 +89,11 @@ class GoogleOAuthService:
 
     def connect(self) -> GoogleOAuthResult:
         credentials_path = self.credentials_path
-        if not credentials_path.exists():
+        if not credentials_path.is_file():
             return GoogleOAuthResult(
                 ok=False,
                 error_code="GOOGLE_CREDENTIALS_JSON_NOT_FOUND",
-                message=f"找不到 Google credentials JSON：{credentials_path}",
+                message=f"找不到 Google credentials JSON 檔案：{credentials_path}。請將檔案命名為 client_secret.json，或在設定中填入完整檔案路徑。",
             )
         try:
             flow_factory = self._flow_factory()
@@ -96,7 +109,11 @@ class GoogleOAuthService:
             )
         return GoogleOAuthResult(
             ok=True,
-            message=f"Google OAuth 已連線：{email or '帳號已授權'}",
+            message=(
+                f"Google OAuth 已連線並同步 Drive、Sheets、Gmail：{email or '帳號已授權'}"
+                if self.profile == GOOGLE_COMBINED_PROFILE
+                else f"Google OAuth 已連線：{email or '帳號已授權'}"
+            ),
             account_email=email,
             token_path=self._token_location_label(),
         )
@@ -152,7 +169,28 @@ class GoogleOAuthService:
         return str(email) if email else None
 
     def _write_token(self, credentials: Any) -> None:
-        self._write_token_text(credentials.to_json())
+        token_text = credentials.to_json()
+        self._write_token_text(token_text)
+        if self.profile == GOOGLE_COMBINED_PROFILE:
+            # The GUI exposes one Google reconnect action, while automation uses
+            # service-specific token profiles. Keep those exact runtime entries
+            # synchronized so an older keyring credential cannot shadow the
+            # newly authorized combined token.
+            runtime_services = [
+                GoogleOAuthService(self.config, scopes=scopes, profile=profile)
+                for profile, scopes in (
+                (GOOGLE_DRIVE_PROFILE, GOOGLE_DRIVE_SCOPES),
+                (GOOGLE_SHEETS_PROFILE, GOOGLE_SHEETS_SCOPES),
+                (GOOGLE_GMAIL_PROFILE, GOOGLE_GMAIL_SCOPES),
+                )
+            ]
+            for service in runtime_services:
+                service._write_token_text(token_text)
+            for service in (self, *runtime_services):
+                if service._read_token_text() != token_text:
+                    raise RuntimeError(
+                        f"Google {service.profile} token 寫入後讀回不一致；已停止，避免顯示已連線但執行期仍讀到舊 token。"
+                    )
 
     def _write_token_text(self, token_text: str) -> None:
         if self.config.google_drive.token_storage == "plaintext_test":
@@ -183,7 +221,7 @@ class GoogleOAuthService:
 
     def _write_token_to_keyring(self, token_text: str) -> bool:
         try:
-            import keyring  # type: ignore[import-not-found]
+            import keyring
 
             keyring.set_password(self.keyring_service, self._keyring_user(), token_text)
         except Exception:
@@ -226,6 +264,23 @@ class GoogleOAuthService:
             return f"keyring:{self.keyring_service}/{self._keyring_user()} 或 DPAPI:{self._token_paths_label()}"
         return f"keyring:{self.keyring_service}/{self._keyring_user()}"
 
+    def _default_credentials_paths(self) -> list[Path]:
+        candidates: list[Path] = []
+        work_dir = self.config.app.work_dir.strip()
+        if work_dir:
+            candidates.append(Path(work_dir) / "config" / "client_secret.json")
+
+        programdata = os.environ.get("PROGRAMDATA", "").strip()
+        if programdata:
+            candidates.append(Path(programdata) / "POSReportBot" / "config" / "client_secret.json")
+
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            candidates.append(Path(local_app_data) / "POSReportBot" / "config" / "client_secret.json")
+
+        candidates.append(Path.home() / ".pos_report_bot" / "config" / "client_secret.json")
+        return list(dict.fromkeys(candidates))
+
     def _keyring_user(self) -> str:
         if self.profile == GOOGLE_COMBINED_PROFILE:
             return self.legacy_keyring_user
@@ -255,28 +310,28 @@ class GoogleOAuthService:
     def _flow_factory(self) -> Any:
         if self.flow_factory is not None:
             return self.flow_factory
-        from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-not-found]
+        from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-untyped]
 
         return InstalledAppFlow
 
     def _credentials_cls(self) -> Any:
         if self.credentials_cls is not None:
             return self.credentials_cls
-        from google.oauth2.credentials import Credentials  # type: ignore[import-not-found]
+        from google.oauth2.credentials import Credentials
 
         return Credentials
 
     def _request_factory(self) -> Any:
         if self.request_factory is not None:
             return self.request_factory
-        from google.auth.transport.requests import Request  # type: ignore[import-not-found]
+        from google.auth.transport.requests import Request
 
         return Request
 
     def _build_func(self) -> Any:
         if self.build_func is not None:
             return self.build_func
-        from googleapiclient.discovery import build  # type: ignore[import-not-found]
+        from googleapiclient.discovery import build  # type: ignore[import-untyped]
 
         return build
 
@@ -288,8 +343,9 @@ def _is_invalid_scope_error(exc: Exception) -> bool:
 
 def _google_oauth_reauth_message(token_location: str) -> str:
     return (
-        "Google OAuth 授權範圍已失效或與目前程式需要的權限不一致，請到「Google Drive 設定」重新連接 Google Drive。"
-        f" 若重新連接後仍失敗，請移除舊 token 後再授權；目前 token 位置：{token_location}。"
+        "Google OAuth 授權範圍已失效或與目前程式需要的權限不一致，請到「Google Drive 設定」重新連接 Google Drive（按「連接 Google Drive」）。"
+        " 3.0.3 起此動作會同步覆寫 Drive、Sheets、Gmail 的執行期 token；不需要手動只刪 state 內的 .bin。"
+        f" 若仍失敗，請提供新的診斷檔；目前實際檢查位置：{token_location}。"
     )
 
 

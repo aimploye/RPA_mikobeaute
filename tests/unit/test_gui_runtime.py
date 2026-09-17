@@ -29,7 +29,7 @@ from pos_report_bot.gui.main_window import SettingsMainWindow  # noqa: E402
 from pos_report_bot.pos.save_as_handler import MockSaveAsHandler  # noqa: E402
 from pos_report_bot.pos.ui_probe import ControlProbeRecord, UiProbeReport  # noqa: E402
 from pos_report_bot.scheduler.windows_task_scheduler import SchedulerCommandResult  # noqa: E402
-from tests.unit.test_report_automation import FakePosControl  # noqa: E402
+from tests.unit.test_report_automation import FakePosControl, FakeRectPosControl  # noqa: E402
 from tests.unit.test_ui_probe import FakeControl  # noqa: E402
 
 
@@ -49,6 +49,27 @@ def _process_events_until(condition, *, timeout_seconds: float = 5.0) -> None:  
             return
         sleep(0.02)
     raise AssertionError("condition was not met before timeout")
+
+
+def test_automation_worker_converts_system_exit_to_failure_signal() -> None:
+    _app()
+
+    class ExitRunner:
+        @staticmethod
+        def run(*, on_progress):  # type: ignore[no-untyped-def]
+            del on_progress
+            raise SystemExit("simulated worker bootstrap exit")
+
+    worker = main_window.AutomationRunWorker(ExitRunner())  # type: ignore[arg-type]
+    finished = []
+    worker.finished.connect(finished.append)
+
+    worker.run()
+
+    assert len(finished) == 1
+    assert finished[0].ok is False
+    assert finished[0].error_code == "UNEXPECTED_AUTOMATION_ERROR"
+    assert "SystemExit" in finished[0].details
 
 
 def test_pyside_settings_window_can_be_created() -> None:
@@ -262,7 +283,27 @@ def test_pos_ini_page_persists_selected_profile(tmp_path: Path) -> None:
     assert window.last_action_result is not None
     assert window.last_action_result.ok is True
     assert reloaded.pos.startup_ini_selection_enabled is True
-    assert reloaded.pos.startup_ini_profile == r"c:\tkhspa\tkhspa-正式區.ini"
+    assert reloaded.pos.startup_ini_profile == r"c:\tkhspa\tkhspa-正式.ini"
+    window.close()
+
+
+def test_pos_ini_page_maps_legacy_production_profile_without_falling_back_to_test(tmp_path: Path) -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.pos.startup_ini_profile = r"c:\tkhspa\tkhspa-正式區.ini"
+    settings_path = tmp_path / "app.yaml"
+    window = SettingsMainWindow(config, settings_path=settings_path)
+
+    profile_combo = window.findChild(QComboBox, "pos_ini_profile_choice")
+    assert profile_combo is not None
+    assert profile_combo.currentData() == r"c:\tkhspa\tkhspa-正式.ini"
+
+    button = window.findChild(QPushButton, "pos_ini_儲存 POS 環境設定")
+    assert button is not None
+    button.click()
+    reloaded = load_project_config(settings_path)
+
+    assert reloaded.pos.startup_ini_profile == r"c:\tkhspa\tkhspa-正式.ini"
     window.close()
 
 
@@ -313,7 +354,10 @@ def test_email_and_schedule_settings_pages_save_typed_values(tmp_path: Path) -> 
     smtp_port.setValue(2525)
     recipients.setText("ops@example.com, admin@example.com")
     scheduler_enabled.setChecked(True)
-    saved_path = window.save_settings(tmp_path / "app.yaml")
+    save_button = window.findChild(QPushButton, "email_儲存設定")
+    assert save_button is not None
+    save_button.click()
+    saved_path = tmp_path / "app.yaml"
     reloaded = load_project_config(saved_path)
 
     assert reloaded.email.enabled is True
@@ -475,6 +519,32 @@ def test_report_settings_table_saves_editable_values(tmp_path: Path) -> None:
     window.close()
 
 
+def test_fixed_report_branch_modes_cannot_be_reintroduced_from_gui() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    reports = {report.id: report for report in config.reports}
+    reports["R05"].branch_mode = "single"
+    reports["R08"].branch_mode = "single"
+    window = SettingsMainWindow(config)
+
+    r05_mode = window.findChild(QComboBox, "report_R05_branch_mode")
+    r08_mode = window.findChild(QComboBox, "report_R08_branch_mode")
+    assert r05_mode is not None
+    assert r08_mode is not None
+    assert r05_mode.currentText() == "all"
+    assert r08_mode.currentText() == "multi_select"
+    assert r05_mode.isEnabled() is False
+    assert r08_mode.isEnabled() is False
+
+    r05_mode.setCurrentText("single")
+    r08_mode.setCurrentText("single")
+    window._sync_report_table_to_config()  # type: ignore[attr-defined]
+
+    assert reports["R05"].branch_mode == "all"
+    assert reports["R08"].branch_mode == "multi_select"
+    window.close()
+
+
 def test_report_settings_table_preserves_r13_full_menu_path(tmp_path: Path) -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
@@ -592,6 +662,42 @@ def test_google_drive_upload_test_parses_folder_url(monkeypatch, tmp_path: Path)
     assert result.ok is True
     assert uploaded["folder_id"] == "folder_from_url"
     assert uploaded["name"] == "google_drive_upload_test.txt"
+    window.close()
+
+
+def test_google_account_status_checks_runtime_drive_profile_instead_of_legacy_combined(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    config.app.state_dir = str(tmp_path)
+    window = SettingsMainWindow(config)
+    checked_profiles: list[str] = []
+
+    class FakeGoogleOAuthService:
+        def __init__(self, _config, *, scopes=None, profile="combined"):  # type: ignore[no-untyped-def]
+            del scopes
+            self.profile = profile
+
+        def status(self):  # type: ignore[no-untyped-def]
+            checked_profiles.append(self.profile)
+            if self.profile == "drive":
+                return SimpleNamespace(
+                    ok=False,
+                    error_code="GOOGLE_OAUTH_REAUTH_REQUIRED",
+                    message="stale Drive profile",
+                )
+            return SimpleNamespace(ok=True, error_code=None, message="ok")
+
+    monkeypatch.setattr(main_window, "GoogleOAuthService", FakeGoogleOAuthService)
+
+    result = window.test_google_account()
+
+    assert result.ok is False
+    assert result.error_code == "GOOGLE_OAUTH_REAUTH_REQUIRED"
+    assert "Drive" in result.message
+    assert checked_profiles == ["drive"]
     window.close()
 
 
@@ -899,6 +1005,30 @@ def test_manual_report_selection_defaults_w02_off_before_next_run_date(monkeypat
     window.close()
 
 
+def test_manual_report_selection_runs_explicitly_checked_r06_even_when_schedule_is_disabled() -> None:
+    _app()
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    for report in config.reports:
+        report.enabled = report.id in {"R01", "R05"}
+    window = SettingsMainWindow(config)
+
+    r06_selected = window.findChild(QCheckBox, "report_R06_run_selected")
+    assert r06_selected is not None
+    r06_selected.setChecked(True)
+
+    window._sync_gui_to_config()
+    selected_task_ids = window._selected_manual_task_ids()
+    plan = main_window.build_dry_run_plan(
+        window.config,
+        today=date(2026, 9, 2),
+        selected_task_ids=selected_task_ids,
+    )
+
+    assert selected_task_ids == {"R01", "R05", "R06"}
+    assert [output.task_id for output in plan.outputs] == ["R01", "R05"] + ["R06"] * 6
+    window.close()
+
+
 def test_report_page_enable_all_refreshes_drive_targets_and_persists(tmp_path: Path) -> None:
     _app()
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
@@ -936,6 +1066,14 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
     for report in config.reports:
         report.upload_enabled = False
     window = SettingsMainWindow(config)
+    excel_control = FakeRectPosControl("Excel", "MenuItem", rect=(600, 360, 700, 390))
+    export_control = FakeRectPosControl("匯出", "Button", rect=(550, 320, 620, 350))
+    report_toolbar = FakePosControl(
+        "ReportToolBar",
+        "Pane",
+        automation_id="reportToolBar",
+        children=[export_control],
+    )
     fake_window = FakePosControl(
         "SPA-POS",
         children=[
@@ -946,12 +1084,22 @@ def test_dashboard_execute_enabled_reports_runs_real_automation_path(
             FakePosControl("顯示銷售分店", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("匯出", "MenuItem"),
-            FakePosControl("Excel", "MenuItem"),
+            report_toolbar,
+            excel_control,
         ],
     )
     monkeypatch.setattr(main_window, "connect_pos_window", lambda **_kwargs: fake_window)
     monkeypatch.setattr(main_window, "WindowsSaveAsHandler", lambda **_kwargs: MockSaveAsHandler())
+    monkeypatch.setattr(
+        main_window.ReportWindowAutomator,
+        "_desktop_export_controls",
+        lambda _self: [excel_control],
+    )
+    monkeypatch.setattr(
+        main_window.ReportWindowAutomator,
+        "_wait_for_save_as_dialog_visible",
+        lambda _self, *, timeout_seconds: excel_control.clicked,
+    )
 
     only_r01 = window.findChild(QPushButton, "reports_只啟用 R01 測試")
     execute = window.findChild(QPushButton, "dashboard_立即執行選取任務")

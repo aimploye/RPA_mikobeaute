@@ -80,6 +80,17 @@ LEGACY_DRIVE_TARGET_FOLDER_IDS: dict[str, set[str]] = {
     "R03": {"1jawBMXQiu8FqMB4JeHW9xUum1wJZTpUC"},
 }
 
+# These modes are part of the fixed POS workflow rather than a deployment
+# preference.  Letting an old YAML or GUI edit change them can still produce a
+# valid-looking workbook for the wrong branch scope.
+FIXED_REPORT_BRANCH_MODES: dict[str, str] = {
+    "R04": "multi_select",
+    "R05": "all",
+    "R06": "each_branch",
+    "R07": "multi_select",
+    "R08": "multi_select",
+}
+
 
 def load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
@@ -171,6 +182,14 @@ def _merge_template_defaults(config: ProjectConfig, app_config_path: Path) -> Pr
         if _should_replace_legacy_r04_placeholder(report, default_report):
             _copy_report_defaults(report, default_report)
             continue
+        if _should_restore_builtin_report_execution_contract(report, default_report):
+            # Old installed configs can retain an early placeholder row even
+            # though the bundled template now contains a real implementation.
+            # Restore only the missing execution identity; user scheduling,
+            # date, output and upload choices remain authoritative.
+            report.handler = default_report.handler
+            report.report_menu_text = default_report.report_menu_text
+            report.menu_path = list(default_report.menu_path)
         if _should_update_report_output_filename(report, default_report):
             report.output_filename = default_report.output_filename
 
@@ -269,6 +288,17 @@ def _should_replace_legacy_r04_placeholder(report: ReportConfig, default_report:
         return False
     current_filename = report.output_filename.strip()
     return report.handler == "placeholder" or current_filename in LEGACY_REPORT_OUTPUT_FILENAMES.get("R04", set())
+
+
+def _should_restore_builtin_report_execution_contract(
+    report: ReportConfig,
+    default_report: ReportConfig,
+) -> bool:
+    default_handler = default_report.handler.strip()
+    if not default_handler or default_handler == "placeholder":
+        return False
+    current_handler = report.handler.strip()
+    return current_handler in {"", "placeholder"} or not report.report_menu_text.strip()
 
 
 def _copy_report_defaults(report: ReportConfig, default_report: ReportConfig) -> None:
@@ -414,6 +444,9 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
     check = list(report.options.check)
     uncheck = list(report.options.uncheck)
     other_conditions = list(report.options.other_conditions)
+    fixed_branch_mode = FIXED_REPORT_BRANCH_MODES.get(report.id)
+    if fixed_branch_mode is not None:
+        report.branch_mode = fixed_branch_mode  # type: ignore[assignment]
 
     if report.id in {"R02", "R05A", "R11", "R12"}:
         check = _replace_option(check, "顯示銷售分店", "顯示分店碼")
@@ -437,17 +470,28 @@ def _normalize_report_config(report: ReportConfig) -> ReportConfig:
         if report.id == "R11":
             other_conditions = _append_missing_options(other_conditions, ["二次篩選"])
     if report.id == "R05":
+        # R05's product reference and final course report are both an
+        # all-branches query.  Older installed configs may still carry the
+        # pre-merge "single" mode, which silently leaves the final course
+        # form on HQ and can produce a false NO_REPORT_DATA result.
         check = _replace_option(check, "顯示分店碼", "顯示銷售分店")
         check = _remove_options(check, {"顯示客代與電話", "顯示客代電話", "顯示退費"})
         check = _append_missing_options(check, ["顯示銷售分店"])
         uncheck = _append_missing_options(uncheck, ["不列明細"])
         other_conditions = _append_missing_options(other_conditions, ["二次篩選"])
     if report.id in {"R07", "R08"}:
+        # Appointment reports require all six visible branches.  A legacy
+        # "single" value means no branch action at all and therefore creates
+        # a plausible-looking but incomplete workbook.
         check = _remove_options(check, {"顯示分館"})
     if report.id in {"R09", "R10"}:
         check = _remove_options(check, {"顯示備註"})
         check = _append_missing_options(check, ["限區間有消費", "含0元結單"])
     if report.id == "R06":
+        # R06 is one workbook and one Drive destination per branch. Older
+        # installed configs persisted the appointment-style multi-select mode,
+        # which makes the single-select cM_BranchNo combobox fail after N001.
+        report.frequency = "daily"
         check = _replace_option(check, "清單顯示", "清單檢視")
         report.output_filename = report.output_filename.replace("{branch_code}", "{branch_name}")
 
@@ -525,7 +569,7 @@ def _make_r05_report_from_legacy(
             "drive_folder_id": (legacy_r05b or source).drive_folder_id,
             "upload_enabled": source.upload_enabled,
             "options": {
-                "check": ["顯示銷售分店"],
+                "check": ["顯示銷售分店", "顯示退費"],
                 "uncheck": ["不列明細"],
                 "other_conditions": ["二次篩選"],
             },

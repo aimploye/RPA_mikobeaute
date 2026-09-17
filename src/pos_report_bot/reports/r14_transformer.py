@@ -12,6 +12,7 @@ import xlrd  # type: ignore[import-untyped]
 from openpyxl import load_workbook  # type: ignore[import-untyped]
 from openpyxl.cell.cell import MergedCell  # type: ignore[import-untyped]
 from openpyxl.formula.translate import Translator  # type: ignore[import-untyped]
+from openpyxl.styles import PatternFill  # type: ignore[import-untyped]
 from openpyxl.utils import column_index_from_string, get_column_letter, range_boundaries  # type: ignore[import-untyped]
 from openpyxl.worksheet.worksheet import Worksheet  # type: ignore[import-untyped]
 
@@ -23,16 +24,32 @@ R14_SHEETS = (
     "忠孝國際醫學3樓",
     "忠孝7樓",
     "忠孝健康7樓",
+    "忠孝預防醫學3樓",
     "領用表",
 )
-R14_BRANCH_SHEETS = ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓")
-SUMMARY_BRANCH_ORDER = ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓")
+R14_BRANCH_SHEETS = (
+    "站前4樓",
+    "站前11樓",
+    "忠孝國際醫學3樓",
+    "忠孝7樓",
+    "忠孝健康7樓",
+    "忠孝預防醫學3樓",
+)
+SUMMARY_BRANCH_ORDER = ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓", "忠孝預防醫學3樓")
+LEGACY_SUMMARY_BRANCH_ORDER = ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓")
+R14_BASE_SHEETS = ("Summary", "站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓", "領用表")
+R14_BRANCH_TEMPLATE_SHEET = "忠孝健康7樓"
 R13_SUMMARY_MARKER = "商品數量合計"
 DATE_RE = re.compile(r"\d{4}/\d{2}/\d{2}")
 R14_OUTPUT_REPORT_DATE_RE = re.compile(r"(?P<year>\d{4})\s+demand planning-(?P<mmdd>\d{4})(?:_\d+)?\.xlsx$", re.IGNORECASE)
 SUMMARY_COLUMN_RANGE_RE = re.compile(r"(Summary!\$?)([A-Z]+)(:\$?)([A-Z]+)")
 R14_ORDER_DAYS = 21
 R14_SAFETY_STOCK_DAYS = 14
+SUMMARY_HEADER_TEXT_COLOR = "FF4A86E8"
+SUMMARY_HEADER_INVENTORY_FILL = "FFDBE5F1"
+SUMMARY_HEADER_ORDER_TITLE_FILL = "FFC04F15"
+SUMMARY_HEADER_ORDER_FILL = "FFFCE2D5"
+SUMMARY_HEADER_TURNOVER_TITLE_FILL = "FF205C98"
 
 
 @dataclass(frozen=True)
@@ -136,6 +153,7 @@ class R14WorkbookSnapshot:
     report_date: datetime
     report_month: str
     items: tuple[R14BranchItemUsage, ...]
+    missing_branches: tuple[str, ...] = ()
 
 
 class R14TransformError(RuntimeError):
@@ -143,6 +161,19 @@ class R14TransformError(RuntimeError):
         super().__init__(message)
         self.error_code = error_code
         self.message = message
+
+
+def validate_r14_template_file(template_path: Path) -> None:
+    if not template_path.is_file() or template_path.stat().st_size <= 0:
+        raise R14TransformError("R14_TEMPLATE_FILE_INVALID", f"R14 模板檔不存在或為空：{template_path}")
+    try:
+        workbook = load_workbook(template_path, read_only=True)
+    except Exception as exc:
+        raise R14TransformError("R14_TEMPLATE_WORKBOOK_INVALID", f"R14 模板檔無法讀取為 Excel workbook：{template_path}") from exc
+    try:
+        _validate_template(workbook.sheetnames)
+    finally:
+        workbook.close()
 
 
 def sync_r14_template_inventory(
@@ -154,8 +185,13 @@ def sync_r14_template_inventory(
 ) -> R14TemplateInventorySyncResult:
     workbook = load_workbook(template_path)
     _validate_template(workbook.sheetnames)
+    _ensure_r14_branch_sheets(workbook)
+    _ensure_summary_inventory_branch_column(workbook["Summary"])
+    _ensure_summary_operational_metric_columns(workbook["Summary"])
+    _ensure_summary_actual_branch_columns(workbook["Summary"])
     if inventory_date is not None:
         workbook["Summary"]["F2"] = _coerce_report_date(inventory_date)
+    _style_summary_header_layout(workbook["Summary"])
     added_summary_items, added_branch_items = _ensure_inventory_items(workbook, branch_inventory, item_names or {})
     inventory_updated, inventory_unmatched = _write_branch_inventory_values(workbook, branch_inventory)
     if inventory_updated <= 0:
@@ -180,15 +216,48 @@ def sync_r14_template_inventory(
     )
 
 
-def r14_template_has_actual_month_state(template_path: Path, month_label: str) -> bool:
+def r14_template_has_actual_month_state(
+    template_path: Path,
+    month_label: str,
+    *,
+    allow_legacy_missing_n006: bool = False,
+) -> bool:
+    return not r14_template_actual_month_state_issues(
+        template_path,
+        month_label,
+        allow_legacy_missing_n006=allow_legacy_missing_n006,
+    )
+
+
+def r14_template_actual_month_state_issues(
+    template_path: Path,
+    month_label: str,
+    *,
+    allow_legacy_missing_n006: bool = False,
+) -> tuple[str, ...]:
+    issues: list[str] = []
     try:
         workbook = load_workbook(template_path, data_only=False)
         _validate_template(workbook.sheetnames)
-    except Exception:
-        return False
-    if _find_summary_month_group(workbook["Summary"], month_label) is None:
-        return False
-    return all(_find_month_actual_column(workbook[sheet_name], month_label) is not None for sheet_name in R14_BRANCH_SHEETS)
+    except Exception as exc:
+        return (f"無法讀取 workbook：{type(exc).__name__}",)
+    has_n006 = "忠孝預防醫學3樓" in workbook.sheetnames
+    if not has_n006 and not allow_legacy_missing_n006:
+        issues.append("缺少分館頁籤：忠孝預防醫學3樓")
+    summary_group = _find_summary_month_group(workbook["Summary"], month_label)
+    if summary_group is None:
+        summary_group = _find_legacy_summary_month_group(workbook["Summary"], month_label)
+    if summary_group is None:
+        issues.append(f"Summary 缺少 {month_label} Actual 欄位群組")
+    missing_branch_actual = [
+        sheet_name
+        for sheet_name in R14_BRANCH_SHEETS
+        if sheet_name in workbook.sheetnames
+        and _find_month_actual_column(workbook[sheet_name], month_label) is None
+    ]
+    if missing_branch_actual:
+        issues.append(f"分館缺少 {month_label} Actual：{'、'.join(missing_branch_actual)}")
+    return tuple(issues)
 
 
 def sync_r14_template_actual_month_state(
@@ -202,9 +271,17 @@ def sync_r14_template_actual_month_state(
     source_workbook = load_workbook(source_path, data_only=False)
     _validate_template(template_workbook.sheetnames)
     _validate_template(source_workbook.sheetnames)
+    _ensure_r14_branch_sheets(template_workbook)
+    _ensure_summary_inventory_branch_column(template_workbook["Summary"])
+    _ensure_summary_operational_metric_columns(template_workbook["Summary"])
+    _ensure_summary_actual_branch_columns(template_workbook["Summary"])
+    _style_summary_header_layout(template_workbook["Summary"])
+    source_has_n006 = "忠孝預防醫學3樓" in source_workbook.sheetnames
 
     updated_columns = 0
     source_summary_group = _find_summary_month_group(source_workbook["Summary"], month_label)
+    if source_summary_group is None:
+        source_summary_group = _find_legacy_summary_month_group(source_workbook["Summary"], month_label)
     if source_summary_group is None:
         raise R14TransformError(
             "R14_TEMPLATE_MONTH_STATE_SOURCE_MISSING",
@@ -224,10 +301,20 @@ def sync_r14_template_actual_month_state(
                 target_summary_group[key],
             )
             updated_columns += 1
+        if not source_has_n006:
+            _set_all_item_values(template_workbook["Summary"], target_summary_group["忠孝預防醫學3樓"], 0)
+            updated_columns += 1
 
     for sheet_name in R14_BRANCH_SHEETS:
-        source_col = _find_month_actual_column(source_workbook[sheet_name], month_label)
-        if source_col is None:
+        if sheet_name == "忠孝預防醫學3樓" and not source_has_n006:
+            target_col = _find_month_actual_column(template_workbook[sheet_name], month_label)
+            if target_col is None:
+                target_col = _ensure_branch_month_column(template_workbook[sheet_name], month_label)
+            _set_all_item_values(template_workbook[sheet_name], target_col, 0)
+            updated_columns += 1
+            continue
+        branch_source_col = _find_month_actual_column(source_workbook[sheet_name], month_label)
+        if branch_source_col is None:
             raise R14TransformError(
                 "R14_TEMPLATE_MONTH_STATE_SOURCE_MISSING",
                 f"R14 前月狀態來源檔頁籤「{sheet_name}」找不到 {month_label} Actual 欄：{source_path}",
@@ -237,7 +324,9 @@ def sync_r14_template_actual_month_state(
             continue
         if target_col is None:
             target_col = _ensure_branch_month_column(template_workbook[sheet_name], month_label)
-        _copy_actual_values_by_item_code(source_workbook[sheet_name], source_col, template_workbook[sheet_name], target_col)
+        _copy_actual_values_by_item_code(
+            source_workbook[sheet_name], branch_source_col, template_workbook[sheet_name], target_col
+        )
         updated_columns += 1
 
     if updated_columns > 0:
@@ -266,8 +355,34 @@ def transform_r13_to_r14(
     branch_inventory_item_names: dict[str, str] | None = None,
     inventory_date: date | datetime | None = None,
     update_template_path: Path | None = None,
+    planning_baseline_available: bool = True,
 ) -> R14TransformResult:
     usage = parse_r13_usage_summary(raw_path)
+    return transform_r13_usage_to_r14(
+        usage,
+        template_path,
+        output_path,
+        expected_end_date=expected_end_date,
+        branch_inventory=branch_inventory,
+        branch_inventory_item_names=branch_inventory_item_names,
+        inventory_date=inventory_date,
+        update_template_path=update_template_path,
+        planning_baseline_available=planning_baseline_available,
+    )
+
+
+def transform_r13_usage_to_r14(
+    usage: R13UsageData,
+    template_path: Path,
+    output_path: Path,
+    *,
+    expected_end_date: date | None = None,
+    branch_inventory: dict[str, dict[str, float]] | None = None,
+    branch_inventory_item_names: dict[str, str] | None = None,
+    inventory_date: date | datetime | None = None,
+    update_template_path: Path | None = None,
+    planning_baseline_available: bool = True,
+) -> R14TransformResult:
     if expected_end_date is not None and usage.end_date.date() != expected_end_date:
         raise R14TransformError(
             "R14_SOURCE_DATE_MISMATCH",
@@ -275,8 +390,14 @@ def transform_r13_to_r14(
         )
     workbook = load_workbook(template_path)
     _validate_template(workbook.sheetnames)
+    _ensure_r14_branch_sheets(workbook)
 
     month_label = usage.report_month
+    summary_inventory_columns = _ensure_summary_inventory_branch_column(workbook["Summary"])
+    summary_operational_columns = _ensure_summary_operational_metric_columns(workbook["Summary"])
+    _ensure_summary_actual_branch_columns(workbook["Summary"])
+    if not planning_baseline_available:
+        _ensure_blank_actual_month_state(workbook, _previous_month_label(month_label))
     summary_group = _ensure_summary_month_group(workbook["Summary"], month_label)
     summary_columns = summary_group.columns
     branch_columns: dict[str, int] = {}
@@ -285,6 +406,7 @@ def transform_r13_to_r14(
 
     report_date = _coerce_report_date(inventory_date) if inventory_date is not None else _template_report_date(workbook["Summary"])
     workbook["Summary"]["F2"] = report_date
+    _style_summary_header_layout(workbook["Summary"])
 
     usage_sheet = workbook["領用表"]
     _replace_usage_month_rows(usage_sheet, usage)
@@ -311,10 +433,28 @@ def transform_r13_to_r14(
     _update_forecast_month_headers(workbook, month_label)
     _shift_branch_summary_formula_references(workbook, summary_group.inserted_at, summary_group.inserted_width)
     branch_planning = {
-        sheet_name: _refresh_branch_planning_columns(workbook[sheet_name], month_label)
+        sheet_name: _refresh_branch_planning_columns(
+            workbook[sheet_name],
+            month_label,
+            planning_baseline_available=planning_baseline_available,
+        )
         for sheet_name in R14_BRANCH_SHEETS
     }
-    _refresh_summary_planning_columns(workbook["Summary"], month_label, branch_planning)
+    _refresh_summary_planning_columns(
+        workbook["Summary"],
+        month_label,
+        branch_planning,
+        planning_baseline_available=planning_baseline_available,
+    )
+    _write_summary_inventory_formulas(workbook["Summary"], summary_inventory_columns, workbook)
+    _write_summary_operational_metric_formulas(
+        workbook["Summary"],
+        summary_inventory_columns,
+        summary_operational_columns,
+        branch_planning,
+        usage.end_date,
+        planning_baseline_available=planning_baseline_available,
+    )
     _apply_r14_view_state(workbook, usage.end_date)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -390,13 +530,22 @@ def parse_r13_usage_summary(raw_path: Path) -> R13UsageData:
     )
 
 
-def load_r14_workbook_snapshot(path: Path) -> R14WorkbookSnapshot:
+def load_r14_workbook_snapshot(
+    path: Path,
+    *,
+    allow_legacy_missing_n006: bool = False,
+) -> R14WorkbookSnapshot:
     workbook = load_workbook(path, data_only=False)
     _validate_template(workbook.sheetnames)
+    missing_branches = tuple(sheet_name for sheet_name in R14_BRANCH_SHEETS if sheet_name not in workbook.sheetnames)
+    if missing_branches and (
+        not allow_legacy_missing_n006 or missing_branches != ("忠孝預防醫學3樓",)
+    ):
+        raise R14TransformError("R14_TEMPLATE_SHEET_MISSING", f"R14 輸出檔缺少分館頁籤「忠孝預防醫學3樓」：{path}")
     report_date = _r14_report_date_from_filename(path.name) or _coerce_excel_datetime(workbook["Summary"]["F2"].value)
     report_month = report_date.strftime("%Y/%m")
     items: list[R14BranchItemUsage] = []
-    for sheet_name in R14_BRANCH_SHEETS:
+    for sheet_name in (sheet_name for sheet_name in R14_BRANCH_SHEETS if sheet_name in workbook.sheetnames):
         sheet = workbook[sheet_name]
         actual_col = _require_month_actual_column(sheet, report_month)
         for row_index in range(4, _last_item_row(sheet) + 1):
@@ -412,7 +561,13 @@ def load_r14_workbook_snapshot(path: Path) -> R14WorkbookSnapshot:
                     actual=_numeric_cell_value(sheet.cell(row_index, actual_col).value),
                 )
             )
-    return R14WorkbookSnapshot(path=path, report_date=report_date, report_month=report_month, items=tuple(items))
+    return R14WorkbookSnapshot(
+        path=path,
+        report_date=report_date,
+        report_month=report_month,
+        items=tuple(items),
+        missing_branches=missing_branches,
+    )
 
 
 def _r14_report_date_from_filename(filename: str) -> datetime | None:
@@ -485,9 +640,27 @@ def _cell_number(sheet: Any, row_index: int, col_index: int) -> float:
 
 
 def _validate_template(sheetnames: list[str]) -> None:
-    missing = [sheet_name for sheet_name in R14_SHEETS if sheet_name not in sheetnames]
+    missing = [sheet_name for sheet_name in R14_BASE_SHEETS if sheet_name not in sheetnames]
     if missing:
         raise R14TransformError("R14_TEMPLATE_SHEET_MISSING", f"R14 模板缺少頁籤：{', '.join(missing)}")
+
+
+def _ensure_r14_branch_sheets(workbook: Any) -> None:
+    if "忠孝預防醫學3樓" in workbook.sheetnames:
+        return
+    source = workbook[R14_BRANCH_TEMPLATE_SHEET]
+    target = workbook.copy_worksheet(source)
+    target.title = "忠孝預防醫學3樓"
+    source_name = _normalized_header_text(R14_BRANCH_TEMPLATE_SHEET)
+    target_name = "忠孝預防醫學3樓"
+    for row_index in range(1, min(target.max_row, 3) + 1):
+        for col_index in range(1, target.max_column + 1):
+            cell = target.cell(row_index, col_index)
+            if isinstance(cell.value, str) and source_name in _normalized_header_text(cell.value):
+                cell.value = cell.value.replace(R14_BRANCH_TEMPLATE_SHEET, target_name)
+    usage_index = workbook.sheetnames.index("領用表")
+    workbook._sheets.remove(target)
+    workbook._sheets.insert(usage_index, target)
 
 
 def _validate_month_supported(sheet: Worksheet, month_label: str) -> None:
@@ -521,6 +694,230 @@ def _ensure_branch_month_column(sheet: Worksheet, month_label: str) -> int:
     sheet.cell(3, target_col).value = "Actual"
     _clear_item_column_values(sheet, target_col)
     return target_col
+
+
+def _ensure_blank_actual_month_state(workbook: Any, month_label: str) -> None:
+    """Create only the columns needed for a degraded report, never guessed values."""
+    summary = workbook["Summary"]
+    target = _parse_month_label(month_label)
+    if target is None:
+        raise R14TransformError("R14_TEMPLATE_MONTH_NOT_FOUND", f"無法解析 R14 月份：{month_label}")
+
+    while _find_summary_month_group(summary, month_label) is None:
+        existing_months = _complete_summary_months_at_or_before(summary, target)
+        if not existing_months or existing_months[-1] >= target:
+            raise R14TransformError(
+                "R14_TEMPLATE_MONTH_NOT_FOUND",
+                f"R14 模板沒有可延伸至 {month_label} 的既有 Actual 欄位群組。",
+            )
+        _ensure_summary_month_group(summary, _next_month_label(existing_months[-1]))
+
+    for sheet_name in R14_BRANCH_SHEETS:
+        sheet = workbook[sheet_name]
+        while _find_month_actual_column(sheet, month_label) is None:
+            existing_months = _branch_months_at_or_before(sheet, target)
+            if not existing_months or existing_months[-1] >= target:
+                raise R14TransformError(
+                    "R14_TEMPLATE_MONTH_NOT_FOUND",
+                    f"R14 模板頁籤「{sheet_name}」沒有可延伸至 {month_label} 的 Actual 欄。",
+                )
+            _ensure_branch_month_column(sheet, _next_month_label(existing_months[-1]))
+
+
+def _complete_summary_months_at_or_before(sheet: Worksheet, target: tuple[int, int]) -> list[tuple[int, int]]:
+    months: set[tuple[int, int]] = set()
+    for col_index in range(1, sheet.max_column + 1):
+        if sheet.cell(3, col_index).value != "Actual":
+            continue
+        parsed = _parse_month_label(sheet.cell(2, col_index).value)
+        if parsed is None or parsed > target:
+            continue
+        label = f"{parsed[0]:04d}/{parsed[1]:02d}"
+        if _find_summary_month_group(sheet, label) is not None:
+            months.add(parsed)
+    return sorted(months)
+
+
+def _branch_months_at_or_before(sheet: Worksheet, target: tuple[int, int]) -> list[tuple[int, int]]:
+    months = {
+        parsed
+        for col_index in range(1, sheet.max_column + 1)
+        if sheet.cell(3, col_index).value == "Actual"
+        and (parsed := _parse_month_label(sheet.cell(2, col_index).value)) is not None
+        and parsed <= target
+    }
+    return sorted(months)
+
+
+def _next_month_label(month: tuple[int, int]) -> str:
+    year, month_number = month
+    if month_number == 12:
+        return f"{year + 1:04d}/01"
+    return f"{year:04d}/{month_number + 1:02d}"
+
+
+def _summary_branch_inventory_columns(sheet: Worksheet) -> dict[str, int]:
+    columns: dict[str, int] = {}
+    for offset, branch in enumerate(SUMMARY_BRANCH_ORDER):
+        col_index = 6 + offset
+        if _summary_inventory_header_matches(sheet.cell(3, col_index).value, branch):
+            columns[branch] = col_index
+            continue
+        break
+    return columns
+
+
+def _summary_inventory_header_matches(value: object, branch: str) -> bool:
+    normalized = _normalized_header_text(value)
+    return "庫存" in normalized and _normalized_header_text(branch) in normalized
+
+
+def _ensure_summary_inventory_branch_column(sheet: Worksheet) -> dict[str, int]:
+    columns = _summary_branch_inventory_columns(sheet)
+    if "忠孝預防醫學3樓" in columns:
+        return columns
+    expected_existing = SUMMARY_BRANCH_ORDER[: len(columns)]
+    if tuple(columns) != expected_existing:
+        raise R14TransformError(
+            "R14_SUMMARY_BRANCH_LAYOUT_INVALID",
+            "R14 Summary 左側分館庫存欄位順序不符合既有契約，拒絕插入新館欄位以避免公式錯位。",
+        )
+    target_col = 6 + len(columns)
+    source_col = target_col - 1
+    header_tail = _capture_header_tail(sheet, target_col)
+    sheet.insert_cols(target_col)
+    _restore_shifted_header_tail(sheet, header_tail, shift=1)
+    _unmerge_cells_in_columns(sheet, target_col, target_col, max_row=3)
+    _copy_column(sheet, source_col, target_col)
+    sheet.cell(2, target_col).value = None
+    sheet.cell(3, target_col).value = "忠孝預防醫學3樓\n庫存"
+    _clear_item_column_values(sheet, target_col)
+    return {**columns, "忠孝預防醫學3樓": target_col}
+
+
+def _ensure_summary_operational_metric_columns(sheet: Worksheet) -> dict[str, list[int]]:
+    inventory_end_col = 6 + len(SUMMARY_BRANCH_ORDER) - 1
+    order_start = inventory_end_col + 1
+    order_branches = SUMMARY_BRANCH_ORDER
+    order_matches = [
+        str(sheet.cell(3, order_start + offset).value or "").strip() == branch
+        for offset, branch in enumerate(order_branches)
+    ]
+    turnover_start = order_start + len(order_branches)
+    turnover_matches = [
+        str(sheet.cell(3, turnover_start + offset).value or "").strip() == branch
+        for offset, branch in enumerate(order_branches)
+    ]
+    if all(order_matches) and all(turnover_matches):
+        return {
+            "order": list(range(order_start, turnover_start)),
+            "turnover": list(range(turnover_start, turnover_start + len(order_branches))),
+        }
+    if any(order_matches) or any(turnover_matches):
+        raise R14TransformError(
+            "R14_SUMMARY_METRIC_LAYOUT_INVALID",
+            "R14 Summary 已存在不完整的下單數/週轉天數欄位，拒絕再次插入以避免破壞右側公式。",
+        )
+
+    width = len(order_branches) * 2
+    header_tail = _capture_header_tail(sheet, order_start)
+    sheet.insert_cols(order_start, amount=width)
+    _restore_shifted_header_tail(sheet, header_tail, shift=width)
+    _unmerge_cells_in_columns(sheet, order_start, order_start + width - 1, max_row=3)
+    style_source = order_start - 1
+    for col_index in range(order_start, order_start + width):
+        _copy_column(sheet, style_source, col_index)
+        _clear_item_column_values(sheet, col_index)
+    order_end = order_start + len(order_branches) - 1
+    turnover_start = order_end + 1
+    turnover_end = turnover_start + len(order_branches) - 1
+    sheet.merge_cells(start_row=2, start_column=order_start, end_row=2, end_column=order_end)
+    sheet.merge_cells(start_row=2, start_column=turnover_start, end_row=2, end_column=turnover_end)
+    sheet.cell(2, order_start).value = "下單數"
+    sheet.cell(2, turnover_start).value = "週轉天數"
+    for offset, branch in enumerate(order_branches):
+        sheet.cell(3, order_start + offset).value = branch
+        sheet.cell(3, turnover_start + offset).value = branch
+    return {
+        "order": list(range(order_start, order_end + 1)),
+        "turnover": list(range(turnover_start, turnover_end + 1)),
+    }
+
+
+def _style_summary_header_layout(sheet: Worksheet) -> None:
+    groups = (
+        (6, 11, SUMMARY_HEADER_INVENTORY_FILL, SUMMARY_HEADER_TEXT_COLOR, False),
+        (12, 17, SUMMARY_HEADER_ORDER_TITLE_FILL, "FFFFFFFF", True),
+        (18, 23, SUMMARY_HEADER_TURNOVER_TITLE_FILL, "FFFFFFFF", True),
+    )
+    for start_col, end_col, _fill_color, _font_color, _bold in groups:
+        _unmerge_summary_header_range(sheet, start_col, end_col)
+
+    sheet.cell(2, 6).number_format = 'yyyy/m/d"庫存"'
+    sheet.cell(2, 12).value = "下單數"
+    sheet.cell(2, 18).value = "週轉天數"
+    for start_col, end_col, fill_color, font_color, bold in groups:
+        for row_index in (2, 3):
+            row_fill = fill_color
+            if row_index == 3 and start_col == 12:
+                row_fill = SUMMARY_HEADER_ORDER_FILL
+            elif row_index == 3 and start_col == 18:
+                row_fill = SUMMARY_HEADER_INVENTORY_FILL
+            for col_index in range(start_col, end_col + 1):
+                cell = sheet.cell(row_index, col_index)
+                cell.fill = PatternFill(fill_type="solid", fgColor=row_fill)
+                font = copy(cell.font)
+                font.color = font_color if row_index == 2 else SUMMARY_HEADER_TEXT_COLOR
+                font.bold = bold if row_index == 2 else False
+                cell.font = font
+                alignment = copy(cell.alignment)
+                alignment.horizontal = "center"
+                alignment.vertical = "center"
+                alignment.wrap_text = True
+                cell.alignment = alignment
+
+    sheet.merge_cells(start_row=2, start_column=6, end_row=2, end_column=11)
+    sheet.merge_cells(start_row=2, start_column=12, end_row=2, end_column=17)
+    sheet.merge_cells(start_row=2, start_column=18, end_row=2, end_column=23)
+
+
+def _unmerge_summary_header_range(sheet: Worksheet, start_col: int, end_col: int) -> None:
+    ranges_to_remove = []
+    for merged_range in sheet.merged_cells.ranges:
+        min_col, min_row, max_col, max_row = range_boundaries(str(merged_range))
+        if min_row <= 2 <= max_row and min_col <= end_col and max_col >= start_col:
+            ranges_to_remove.append(merged_range)
+    for merged_range in ranges_to_remove:
+        sheet.unmerge_cells(str(merged_range))
+
+
+def _ensure_summary_actual_branch_columns(sheet: Worksheet) -> None:
+    legacy_groups: list[int] = []
+    for col_index in range(1, sheet.max_column + 1):
+        if _cell_month_value(sheet.cell(2, col_index).value) is None or sheet.cell(3, col_index).value != "Actual":
+            continue
+        if all(
+            str(sheet.cell(2, col_index + offset).value or "").strip() == branch
+            and sheet.cell(3, col_index + offset).value == "Actual"
+            for offset, branch in enumerate(LEGACY_SUMMARY_BRANCH_ORDER, start=1)
+        ):
+            next_col = col_index + 1 + len(LEGACY_SUMMARY_BRANCH_ORDER)
+            if not (
+                str(sheet.cell(2, next_col).value or "").strip() == "忠孝預防醫學3樓"
+                and sheet.cell(3, next_col).value == "Actual"
+            ):
+                legacy_groups.append(col_index)
+
+    for total_col in reversed(legacy_groups):
+        target_col = total_col + 1 + len(LEGACY_SUMMARY_BRANCH_ORDER)
+        header_tail = _capture_header_tail(sheet, target_col)
+        sheet.insert_cols(target_col)
+        _restore_shifted_header_tail(sheet, header_tail, shift=1)
+        _unmerge_cells_in_columns(sheet, target_col, target_col, max_row=3)
+        _copy_column(sheet, target_col - 1, target_col)
+        sheet.cell(2, target_col).value = "忠孝預防醫學3樓"
+        sheet.cell(3, target_col).value = "Actual"
+        _clear_item_column_values(sheet, target_col)
 
 
 def _ensure_summary_month_group(sheet: Worksheet, month_label: str) -> SummaryMonthGroup:
@@ -570,6 +967,23 @@ def _find_summary_month_group(sheet: Worksheet, month_label: str) -> dict[str, i
     for offset, branch in enumerate(SUMMARY_BRANCH_ORDER, start=1):
         col_index = total_col + offset
         if str(sheet.cell(2, col_index).value or "").strip() != branch or sheet.cell(3, col_index).value != "Actual":
+            return None
+        group[branch] = col_index
+    return group
+
+
+def _find_legacy_summary_month_group(sheet: Worksheet, month_label: str) -> dict[str, int] | None:
+    """Find a five-branch Actual group from a snapshot made before N006 existed."""
+    total_col = _find_month_actual_column(sheet, month_label)
+    if total_col is None:
+        return None
+    group = {"total": total_col}
+    for offset, branch in enumerate(LEGACY_SUMMARY_BRANCH_ORDER, start=1):
+        col_index = total_col + offset
+        if (
+            str(sheet.cell(2, col_index).value or "").strip() != branch
+            or sheet.cell(3, col_index).value != "Actual"
+        ):
             return None
         group[branch] = col_index
     return group
@@ -758,6 +1172,12 @@ def _copy_actual_values_by_item_code(
             continue
         _set_cell_value(target_sheet, target_row, target_col, source_sheet.cell(source_row, source_col).value)
         target_sheet.cell(target_row, target_col).number_format = "0"
+
+
+def _set_all_item_values(sheet: Worksheet, column_index: int, value: float) -> None:
+    for row_index in _item_code_rows(sheet).values():
+        _set_cell_value(sheet, row_index, column_index, value)
+        sheet.cell(row_index, column_index).number_format = "0"
 
 
 def _write_branch_inventory_values(
@@ -1189,7 +1609,12 @@ def _shift_summary_column_ranges(formula: str, *, inserted_at: int, inserted_wid
     return SUMMARY_COLUMN_RANGE_RE.sub(replace, formula)
 
 
-def _refresh_branch_planning_columns(sheet: Worksheet, month_label: str) -> BranchPlanningColumns:
+def _refresh_branch_planning_columns(
+    sheet: Worksheet,
+    month_label: str,
+    *,
+    planning_baseline_available: bool = True,
+) -> BranchPlanningColumns:
     actual_col = _require_month_actual_column(sheet, month_label)
     previous_month_label = _previous_month_label(month_label)
     previous_actual_col = _require_month_actual_column(sheet, previous_month_label)
@@ -1200,6 +1625,11 @@ def _refresh_branch_planning_columns(sheet: Worksheet, month_label: str) -> Bran
     stock_col = _require_branch_stock_column(sheet)
 
     for row_index in range(4, _last_item_row(sheet) + 1):
+        if not planning_baseline_available:
+            _set_cell_value(sheet, row_index, forecast_col, None)
+            _set_cell_value(sheet, row_index, order_col, None)
+            _set_cell_value(sheet, row_index, safety_col, None)
+            continue
         previous_actual_ref = f"{get_column_letter(previous_actual_col)}{row_index}"
         safety_ref = f"{get_column_letter(safety_col)}{row_index}"
         stock_ref = f"{get_column_letter(stock_col)}{row_index}"
@@ -1235,9 +1665,20 @@ def _refresh_summary_planning_columns(
     sheet: Worksheet,
     month_label: str,
     branch_planning: dict[str, BranchPlanningColumns],
+    *,
+    planning_baseline_available: bool = True,
 ) -> None:
     forecast_group = _ensure_summary_forecast_group(sheet, month_label)
     safety_group = _ensure_summary_safety_group(sheet)
+    if not planning_baseline_available:
+        for col_index in (
+            forecast_group.total_col,
+            *forecast_group.branch_cols.values(),
+            safety_group.total_col,
+            *safety_group.branch_cols.values(),
+        ):
+            _clear_item_column_values(sheet, col_index)
+        return
     for row_index in range(4, _last_item_row(sheet) + 1):
         _write_summary_metric_formulas(
             sheet,
@@ -1276,6 +1717,61 @@ def _write_summary_metric_formulas(
     last_col = get_column_letter(group.branch_cols[SUMMARY_BRANCH_ORDER[-1]])
     _set_cell_value(sheet, row_index, group.total_col, f"=SUM({first_col}{row_index}:{last_col}{row_index})")
     sheet.cell(row_index, group.total_col).number_format = "0"
+
+
+def _write_summary_inventory_formulas(sheet: Worksheet, inventory_columns: dict[str, int], workbook: Any) -> None:
+    for branch, summary_col in inventory_columns.items():
+        branch_sheet = workbook[branch]
+        stock_col = _require_branch_stock_column(branch_sheet)
+        stock_letter = get_column_letter(stock_col)
+        branch_ref = _quote_sheet_name(branch)
+        for row_index in range(4, _last_item_row(sheet) + 1):
+            _set_cell_value(
+                sheet,
+                row_index,
+                summary_col,
+                f"=SUMIF({branch_ref}!B:B,B{row_index},{branch_ref}!{stock_letter}:{stock_letter})",
+            )
+            sheet.cell(row_index, summary_col).number_format = "0"
+
+
+def _write_summary_operational_metric_formulas(
+    sheet: Worksheet,
+    inventory_columns: dict[str, int],
+    metric_columns: dict[str, list[int]],
+    branch_planning: dict[str, BranchPlanningColumns],
+    report_date: datetime,
+    *,
+    planning_baseline_available: bool = True,
+) -> None:
+    report_day = report_date.day
+    for offset, branch in enumerate(SUMMARY_BRANCH_ORDER):
+        branch_ref = _quote_sheet_name(branch)
+        order_col = get_column_letter(branch_planning[branch].order_col)
+        actual_col = get_column_letter(branch_planning[branch].actual_col)
+        inventory_col = get_column_letter(inventory_columns[branch])
+        for row_index in range(4, _last_item_row(sheet) + 1):
+            order_summary_col = metric_columns["order"][offset]
+            if planning_baseline_available:
+                _set_cell_value(
+                    sheet,
+                    row_index,
+                    order_summary_col,
+                    f"=SUMIF({branch_ref}!B:B,B{row_index},{branch_ref}!{order_col}:{order_col})",
+                )
+            else:
+                _set_cell_value(sheet, row_index, order_summary_col, None)
+            sheet.cell(row_index, order_summary_col).number_format = "0"
+
+            usage_sum = f"SUMIF({branch_ref}!B:B,B{row_index},{branch_ref}!{actual_col}:{actual_col})"
+            turnover_summary_col = metric_columns["turnover"][offset]
+            _set_cell_value(
+                sheet,
+                row_index,
+                turnover_summary_col,
+                f'=IFERROR(IF({usage_sum}=0,"",{inventory_col}{row_index}/({usage_sum}/{report_day})),"")',
+            )
+            sheet.cell(row_index, turnover_summary_col).number_format = "0.0"
 
 
 def _ensure_summary_forecast_group(sheet: Worksheet, month_label: str) -> SummaryMetricGroup:

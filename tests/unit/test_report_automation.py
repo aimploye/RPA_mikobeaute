@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 import pos_report_bot.pos.report_automation as report_automation
+import pytest
 from pos_report_bot.config.loader import load_project_config
 from pos_report_bot.pos.report_automation import (
     AUTOMATION_LOGIC_FINGERPRINT,
@@ -39,6 +40,65 @@ def _assert_action_milestones_in_order(actions: list[str], milestones: list[Acti
         else:
             remaining = "\n".join(actions[search_from:])
             raise AssertionError(f"Missing action milestone after index {search_from}: {label}\nRemaining actions:\n{remaining}")
+
+
+def _wire_bounded_fake_export_menu(
+    automator: ReportWindowAutomator,
+    window: "FakePosControl",
+) -> None:
+    def all_controls() -> list[FakePosControl]:
+        controls: list[FakePosControl] = []
+        queue: list[FakePosControl] = [window]
+        seen: set[int] = set()
+        while queue:
+            control = queue.pop(0)
+            if id(control) in seen:
+                continue
+            seen.add(id(control))
+            controls.append(control)
+            try:
+                queue.extend(control.children())
+            except Exception:
+                continue
+        return controls
+
+    for control in all_controls():
+        if control.window_text() != "匯出":
+            continue
+        if not control.automation_id:
+            control.automation_id = "ReportViewerExport"
+        if not callable(getattr(control, "rectangle", None)):
+            control.rectangle = lambda: FakeRect(550, 320, 620, 350)  # type: ignore[attr-defined]
+
+    def excel_controls() -> list[FakePosControl]:
+        return [control for control in all_controls() if control.window_text() == "Excel"]
+
+    def click_export_by_geometry(control: FakePosControl, action: str) -> bool:
+        control.click()
+        automator.actions.append(f"click:{action}:geometry")
+        return True
+
+    automator._desktop_export_controls = excel_controls  # type: ignore[method-assign]
+    automator._save_as_dialog_probe = lambda *_args: any(control.clicked for control in excel_controls())
+    automator._click_export_dropdown_by_geometry = click_export_by_geometry  # type: ignore[method-assign]
+
+
+def _wire_confirmed_native_export_popup(automator: ReportWindowAutomator) -> None:
+    popup_rect = {"left": 550, "top": 350, "right": 760, "bottom": 410}
+    automator._wait_for_bounded_export_popup = lambda _control: [popup_rect]  # type: ignore[method-assign]
+    automator._r01_export_popup_rects_near_control = lambda _control: [popup_rect]  # type: ignore[method-assign]
+    automator._desktop_export_controls_for_popup = lambda _rect: []  # type: ignore[method-assign]
+    def click_screen_point(_x: int, _y: int, action: str) -> bool:
+        automator.actions.append(f"click:{action}")
+        return True
+
+    automator._click_screen_point = click_screen_point  # type: ignore[method-assign]
+    automator._export_format_activation_state = lambda *_args, **_kwargs: "continue"  # type: ignore[method-assign]
+
+
+def _wire_fake_r05_course_menu(window: "FakeR05CombinedWindow") -> None:
+    course_menu = next(control for control in window.children_controls if control.window_text() == "課程服務明細表")
+    course_menu.on_click = lambda: window.menu_select("統計報表->課程服務明細表")
 
 
 class FakePosControl:
@@ -115,6 +175,34 @@ class FakePosControl:
 
     def select(self, value: str) -> None:
         self.selected_value = value
+
+
+class FakeIndexedBranchCombo(FakePosControl):
+    def __init__(
+        self,
+        *args: object,
+        items: list[str],
+        selected_index: int = 0,
+        index_only: bool = False,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.items = items
+        self.selected_index = selected_index
+        self.index_only = index_only
+        self.selected_value = items[selected_index]
+
+    def item_texts(self) -> list[str]:
+        return list(self.items)
+
+    def select(self, value: str | int) -> None:
+        if isinstance(value, int):
+            self.selected_index = value
+        else:
+            if self.index_only:
+                raise RuntimeError("this WinForms ComboBox accepts only item indexes")
+            self.selected_index = self.items.index(value)
+        self.selected_value = self.items[self.selected_index]
 
 
 class FakeRect:
@@ -424,8 +512,13 @@ class FakeClosableReportChild(FakePosControl):
             class_name="WindowsForms10.Window.8.app.0.33c0d9d",
         )
         self.closed = False
+        self.alt_f4_closed = False
 
     def close(self, wait_time: int = 0) -> None:
+        self.closed = True
+
+    def close_alt_f4(self) -> None:
+        self.alt_f4_closed = True
         self.closed = True
 
 
@@ -451,7 +544,13 @@ class FakeReportViewerWindow(FakePosControl):
         export_control_cls: type[FakePosControl] = FakePosControl,
         excel_control_cls: type[FakePosControl] = FakePosControl,
     ) -> None:
-        export = export_control_cls(export_name, "Button", automation_id=export_automation_id, enabled=False)
+        export = export_control_cls(
+            export_name,
+            "Button",
+            automation_id=export_automation_id or "ReportViewerExport",
+            enabled=False,
+        )
+        export.rectangle = lambda: FakeRect(550, 320, 620, 350)  # type: ignore[attr-defined]
         run_report_name = "檢視\r\n報表" if use_real_probe_names else "檢視報表"
         no_detail_name = "不列\r\n明細" if use_real_probe_names else "不列明細"
         self.report_generated = False
@@ -557,14 +656,21 @@ class FakeMenuSelectWindow(FakePosControl):
 
     def menu_select(self, menu_path: str) -> None:
         self.menu_select_calls.append(menu_path)
+        export = FakeRectPosControl(
+            "匯出",
+            "MenuItem",
+            automation_id="ReportViewerExport",
+            enabled=False,
+            rect=(550, 320, 620, 350),
+        )
         self.children_controls.extend(
             [
                 FakePosControl("起日", "Edit"),
                 FakePosControl("迄日", "Edit"),
                 FakePosControl("顯示銷售分店", "CheckBox"),
                 FakePosControl("不列明細", "CheckBox"),
-                FakePosControl("檢視報表", "Button"),
-                FakePosControl("匯出", "MenuItem"),
+                FakePosControl("檢視報表", "Button", on_click=lambda: setattr(export, "enabled", True)),
+                export,
                 FakePosControl("Excel", "MenuItem"),
             ]
         )
@@ -627,7 +733,12 @@ class FakeWarningThenReportWindow(FakePosControl):
                     FakePosControl("顯示銷售分店", "CheckBox"),
                     FakePosControl("不列明細", "CheckBox"),
                     FakePosControl("檢視報表", "Button"),
-                    FakePosControl("匯出", "MenuItem"),
+                    FakeRectPosControl(
+                        "匯出",
+                        "MenuItem",
+                        automation_id="ReportViewerExport",
+                        rect=(550, 320, 620, 350),
+                    ),
                     FakePosControl("Excel", "MenuItem"),
                 ]
             )
@@ -683,11 +794,62 @@ class FakeCustomerSourceMenuSelectFailWindow(FakePosControl):
                     FakePosControl("顯示性別年齡", "CheckBox"),
                     FakePosControl("備註顯示", "ComboBox"),
                     FakePosControl("檢視報表", "Button", automation_id="B_RunReport"),
-                    FakePosControl("匯出", "MenuItem"),
+                    FakeRectPosControl(
+                        "匯出",
+                        "MenuItem",
+                        automation_id="ReportViewerExport",
+                        rect=(550, 320, 620, 350),
+                    ),
                     FakePosControl("Excel", "MenuItem"),
                 ],
             )
         )
+
+
+class FakeDelayedCourseMenuPopupWindow(FakePosControl):
+    def __init__(self) -> None:
+        self.root_menu_opened = False
+        self.root_menu_clicks = 0
+        self.popup_probe_calls = 0
+        self.menu_select_calls: list[str] = []
+        course_leaf = FakePosControl(
+            "課程服務明細表",
+            "MenuItem",
+            on_click=self._open_course_report,
+        )
+        course_leaf.visible = True
+        self.course_popup = FakePosControl("統計報表", "Menu", children=[course_leaf])
+        self.course_leaf = course_leaf
+        self.course_report = FakePosControl(
+            "課程服務明細表",
+            "Dialog",
+            children=[
+                FakePosControl("起日", "Edit"),
+                FakePosControl("迄日", "Edit"),
+            ],
+        )
+        root_menu = FakePosControl("統計報表", "MenuItem", on_click=self._open_root_menu)
+        hidden_leaf = FakePosControl("課程服務明細表", "MenuItem", enabled=True)
+        hidden_leaf.visible = False
+        super().__init__("SPA-POS", children=[root_menu, hidden_leaf])
+
+    def menu_select(self, menu_path: str) -> None:
+        self.menu_select_calls.append(menu_path)
+        raise RuntimeError("menu_select transiently unavailable")
+
+    def _open_root_menu(self) -> None:
+        self.root_menu_clicks += 1
+        self.root_menu_opened = self.root_menu_clicks >= 2
+
+    def menu_popup_controls(self) -> list[FakePosControl]:
+        self.popup_probe_calls += 1
+        if not self.root_menu_opened or self.popup_probe_calls < 3:
+            return []
+        return [self.course_popup]
+
+    def _open_course_report(self) -> None:
+        if self.course_report not in self.children_controls:
+            self.children_controls.append(self.course_report)
 
 
 class FakeR05CombinedWindow(FakePosControl):
@@ -780,6 +942,126 @@ class FakeR05CombinedWindow(FakePosControl):
         return any(child.window_text() == name for child in self.descendants())
 
 
+class FakeR05CourseFormRebindingWindow(FakeR05CombinedWindow):
+    """Model the real POS replacing its course-form UIA wrapper after a checkbox toggle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.course_form_rebound = False
+        self._rebind_hook_installed = False
+
+    def menu_select(self, menu_path: str) -> None:
+        super().menu_select(menu_path)
+        if not menu_path.endswith("課程服務明細表") or self._rebind_hook_installed:
+            return
+        course_form = next(
+            child
+            for child in self.children_controls
+            if child.window_text() == "課程服務明細表" and child.friendly_class_name() == "Dialog"
+        )
+        sales_branch = next(
+            child for child in course_form.children_controls if child.window_text() == "顯示銷售分店"
+        )
+        original_toggle = sales_branch.toggle
+
+        def toggle_and_replace_form() -> None:
+            original_toggle()
+            if self.course_form_rebound:
+                return
+            self.course_form_rebound = True
+            course_form.visible = False
+            course_form.children_controls = []
+            self.children_controls.remove(course_form)
+            rebound_sales_branch = FakePosControl("顯示銷售分店", "CheckBox")
+            rebound_sales_branch.toggle_state = 1
+            self.children_controls.append(
+                FakePosControl(
+                    "課程服務明細表",
+                    "Dialog",
+                    automation_id="CourseSale_Report",
+                    class_name="WindowsForms10.Window.8.app.0.33c0d9d",
+                    children=[
+                        self.course_start,
+                        self.course_end,
+                        FakePosControl("查詢分店", "ComboBox", automation_id="cM_BranchNo"),
+                        rebound_sales_branch,
+                        FakePosControl("顯示退費", "CheckBox", automation_id="cK_ShowExgBack"),
+                        FakePosControl("不列明細", "CheckBox", automation_id="K_NoItemList"),
+                        FakePosControl("顯示客代與電話", "ComboBox"),
+                        self.course_other_conditions,
+                        self.course_run,
+                        self.course_export,
+                        FakePosControl("Excel", "MenuItem"),
+                    ],
+                )
+            )
+
+        sales_branch.toggle = toggle_and_replace_form  # type: ignore[method-assign]
+        self._rebind_hook_installed = True
+
+
+class FakeR05VisibleStaleCourseFormWindow(FakeR05CombinedWindow):
+    """Keep the stale wrapper visible while root enumeration exposes a fresh one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.course_form_rebound = False
+        self._rebind_hook_installed = False
+
+    def menu_select(self, menu_path: str) -> None:
+        super().menu_select(menu_path)
+        if not menu_path.endswith("課程服務明細表") or self._rebind_hook_installed:
+            return
+        stale_form = next(
+            child
+            for child in self.children_controls
+            if child.window_text() == "課程服務明細表" and child.friendly_class_name() == "Dialog"
+        )
+        sales_branch = next(
+            child for child in stale_form.children_controls if child.window_text() == "顯示銷售分店"
+        )
+        original_toggle = sales_branch.toggle
+
+        def toggle_and_replace_root_wrapper() -> None:
+            original_toggle()
+            if self.course_form_rebound:
+                return
+            self.course_form_rebound = True
+            # This is what the 2026-08-14 POS 1.5.19.36 evidence showed:
+            # the remembered wrapper remains visible and still exposes dates,
+            # while a fresh root enumeration is required to see the other options.
+            stale_form.children_controls = [
+                self.course_start,
+                self.course_end,
+                FakePosControl("查詢分店", "ComboBox", automation_id="cM_BranchNo"),
+                sales_branch,
+            ]
+            rebound_sales_branch = FakePosControl("顯示銷售分店", "CheckBox")
+            rebound_sales_branch.toggle_state = 1
+            fresh_form = FakePosControl(
+                "課程服務明細表",
+                "Dialog",
+                automation_id="CourseSale_Report",
+                class_name="WindowsForms10.Window.8.app.0.33c0d9d",
+                children=[
+                    self.course_start,
+                    self.course_end,
+                    FakePosControl("查詢分店", "ComboBox", automation_id="cM_BranchNo"),
+                    rebound_sales_branch,
+                    FakePosControl("顯示退費", "CheckBox", automation_id="cK_ShowExgBack"),
+                    FakePosControl("不列明細", "CheckBox", automation_id="K_NoItemList"),
+                    self.course_other_conditions,
+                    self.course_run,
+                    self.course_export,
+                    FakePosControl("Excel", "MenuItem"),
+                ],
+            )
+            self.children_controls[self.children_controls.index(stale_form)] = fresh_form
+
+        sales_branch.toggle = toggle_and_replace_root_wrapper  # type: ignore[method-assign]
+        self._rebind_hook_installed = True
+
+
 class FakePyaWrapperWithoutDismissHook(FakePosControl):
     def __getattr__(self, name: str) -> object:
         if name == "dismiss_pos_warning":
@@ -795,6 +1077,7 @@ def test_golden_contract_r01_standard_course_report_export_flow(tmp_path: Path) 
     report = next(item for item in config.reports if item.id == "R01")
     window = FakeReportViewerWindow(use_real_probe_names=True)
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -809,7 +1092,7 @@ def test_golden_contract_r01_standard_course_report_export_flow(tmp_path: Path) 
             "uncheck:不列明細",
             "click:檢視報表",
             lambda action: action.startswith("wait_start:匯出啟用:"),
-            "click:匯出",
+            lambda action: action in {"click:匯出", "click:匯出:dropdown:geometry"},
             "click:匯出格式:Excel",
             "continue:匯出格式:Excel:交由SaveAsHandler等待另存新檔",
             f"save_as:{tmp_path / output.output_filename}",
@@ -824,6 +1107,8 @@ def test_golden_contract_r05_reference_product_then_export_course_report(tmp_pat
     window = FakeR05CombinedWindow()
     window.close_report_viewer = lambda _report_menu_text: True
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -844,7 +1129,7 @@ def test_golden_contract_r05_reference_product_then_export_course_report(tmp_pat
             "prepare_reference_report_settings:商品銷售明細表",
             "click:檢視報表",
             "prepare_reference_report_viewed:商品銷售明細表",
-            "menu_select:統計報表->課程服務明細表",
+            "click:課程服務明細表",
             f"set_date_range:{output.start_date}:{output.end_date}",
             "select_branch:所有分店",
             "check:顯示銷售分店",
@@ -858,6 +1143,107 @@ def test_golden_contract_r05_reference_product_then_export_course_report(tmp_pat
             f"save_as:{tmp_path / output.output_filename}",
         ],
     )
+    assert result.actions.count("check:顯示退費") == 1
+
+
+def test_r05_ignores_legacy_course_refund_option_but_keeps_product_refund(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R05")
+    report = next(item for item in config.reports if item.id == "R05")
+    if "顯示退費" not in report.options.check:
+        report.options.check.append("顯示退費")
+    window = FakeR05CombinedWindow()
+    window.close_report_viewer = lambda _report_menu_text: True
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
+
+    result = automator.download_report(output, report)
+
+    product_form = next(
+        child
+        for child in window.children_controls
+        if child.window_text() == "商品銷售明細表" and child.friendly_class_name() == "Dialog"
+    )
+    course_form = next(
+        child
+        for child in window.children_controls
+        if child.window_text() == "課程服務明細表" and child.friendly_class_name() == "Dialog"
+    )
+    product_refund = next(child for child in product_form.children_controls if child.window_text() == "顯示退費")
+    course_refund = next(child for child in course_form.children_controls if child.window_text() == "顯示退費")
+
+    assert result.ok is True
+    assert product_refund.toggle_state == 1
+    assert course_refund.toggle_state == 0
+    assert result.actions.count("check:顯示退費") == 1
+    assert "skip_removed_option:R05:課程服務明細表:顯示退費" in result.actions
+
+
+def test_r05_rebinds_live_course_form_when_first_checkbox_invalidates_wrapper(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R05")
+    report = next(item for item in config.reports if item.id == "R05")
+    window = FakeR05CourseFormRebindingWindow()
+    window.close_report_viewer = lambda _report_menu_text: True
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
+
+    result = automator.download_report(output, report)
+
+    assert result.ok is True
+    assert window.course_form_rebound is True
+    assert result.actions.count("check:顯示退費") == 1
+    assert "select_option:顯示退費" not in result.actions
+    assert "refresh_active_report_form:checkbox_retry:不列明細:課程服務明細表" in result.actions
+
+
+def test_r05_rebinds_when_stale_course_wrapper_remains_visible_with_dates(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R05")
+    report = next(item for item in config.reports if item.id == "R05")
+    window = FakeR05VisibleStaleCourseFormWindow()
+    window.close_report_viewer = lambda _report_menu_text: True
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
+
+    result = automator.download_report(output, report)
+
+    assert result.ok is True
+    assert window.course_form_rebound is True
+    assert result.actions.count("check:顯示退費") == 1
+    assert "select_option:顯示退費" not in result.actions
+    assert "refresh_active_report_form:checkbox_retry:不列明細:課程服務明細表" in result.actions
+
+
+def test_known_checkbox_miss_does_not_open_unrelated_branch_combo(tmp_path: Path) -> None:
+    branch_combo = FakePosControl("查詢分店", "ComboBox", automation_id="cM_BranchNo")
+    report_form = FakePosControl(
+        "課程服務明細表",
+        "Dialog",
+        automation_id="CourseSale_Report",
+        children=[
+            FakePosControl("起日", "Edit", automation_id="cT_QueryBdate"),
+            FakePosControl("迄日", "Edit", automation_id="cT_QueryEdate"),
+            branch_combo,
+        ],
+    )
+    window = FakePosControl("SPA-POS", children=[report_form])
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator._active_report_title = "課程服務明細表"
+    automator._active_report_form = report_form
+
+    try:
+        automator._set_checkbox("顯示退費", checked=True)
+    except ReportAutomationError as exc:
+        assert exc.error_code == "CHECKBOX_NOT_FOUND"
+    else:
+        raise AssertionError("missing known checkbox must fail closed")
+
+    assert branch_combo.selected_value == ""
+    assert "select_option:顯示退費" not in automator.actions
 
 
 def test_golden_contract_r06_single_branch_residual_report_flow(tmp_path: Path) -> None:
@@ -888,6 +1274,7 @@ def test_golden_contract_r06_single_branch_residual_report_flow(tmp_path: Path) 
     branch_item = FakePosControl("站前4樓", "ListItem", on_click=lambda: setattr(branch_selector, "selected_value", "站前4樓"))
     branch_selector.on_click = lambda: window.children_controls.append(branch_item)
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -921,7 +1308,13 @@ def test_golden_contract_r13_inventory_consumable_usage_report_flow(tmp_path: Pa
         automation_id="cM_BranchNo",
         accepted_values={"所有分店"},
     )
-    export = FakePosControl("匯出", "MenuItem", enabled=False)
+    export = FakeRectPosControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        enabled=False,
+        rect=(550, 320, 620, 350),
+    )
     view_report = FakePosControl("檢視報表", "Button", on_click=lambda: setattr(export, "enabled", True))
 
     class FakeInventoryWindow(FakePosControl):
@@ -959,6 +1352,8 @@ def test_golden_contract_r13_inventory_consumable_usage_report_flow(tmp_path: Pa
 
     window = FakeInventoryWindow()
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
+    _wire_confirmed_native_export_popup(automator)
 
     result = automator.download_report(output, report)
 
@@ -974,8 +1369,8 @@ def test_golden_contract_r13_inventory_consumable_usage_report_flow(tmp_path: Pa
             "check:顯示課程耗用",
             "click:檢視報表",
             lambda action: action.startswith("wait_start:匯出啟用:"),
-            "click:匯出",
-            "click:匯出格式:Excel",
+            lambda action: action.startswith("click:匯出:"),
+            lambda action: action.startswith("click:匯出格式:Excel"),
             f"save_as:{tmp_path / output.output_filename}",
         ],
     )
@@ -1016,6 +1411,7 @@ def test_golden_contract_r07_selects_all_appointment_branches_before_export(tmp_
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1049,6 +1445,12 @@ def test_golden_contract_r09_customer_source_gender_age_export_flow(tmp_path: Pa
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R09")
     report = next(item for item in config.reports if item.id == "R09")
     gender_age = FakePosControl("顯示性別年齡", "CheckBox")
+    export = FakeRectPosControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        rect=(550, 320, 620, 350),
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -1061,11 +1463,17 @@ def test_golden_contract_r09_customer_source_gender_age_export_flow(tmp_path: Pa
             FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             gender_age,
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("匯出", "MenuItem"),
+            export,
             FakePosControl("Excel", "MenuItem"),
         ],
     )
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1083,7 +1491,7 @@ def test_golden_contract_r09_customer_source_gender_age_export_flow(tmp_path: Pa
             "check:顯示性別年齡",
             "click:檢視報表",
             lambda action: action.startswith("wait_start:匯出啟用:"),
-            "click:匯出",
+            lambda action: action in {"click:匯出", "click:匯出:dropdown:geometry"},
             "click:匯出格式:Excel",
             f"save_as:{tmp_path / output.output_filename}",
         ],
@@ -1098,8 +1506,14 @@ def test_report_automation_recovers_customer_source_menu_select_failure_for_r09_
     for task_id in ("R09", "R10"):
         window = FakeCustomerSourceMenuSelectFailWindow()
         sent_keys: list[str] = []
-        automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+        automator = ReportWindowAutomator(
+            window,
+            save_as_handler=MockSaveAsHandler(),
+            output_dir=tmp_path,
+            report_generate_wait_seconds=1,
+        )
         automator._keyboard_sender = sent_keys.append
+        _wire_bounded_fake_export_menu(automator, window)
 
         result = automator.download_report(outputs[task_id], reports[task_id])
 
@@ -1118,7 +1532,7 @@ def test_report_automation_recovers_customer_source_menu_select_failure_for_r09_
                 "check:限區間有消費",
                 "check:含0元結單",
                 "click:檢視報表",
-                "click:匯出",
+                lambda action: action in {"click:匯出", "click:匯出:dropdown:geometry"},
                 "click:匯出格式:Excel",
                 f"save_as:{tmp_path / outputs[task_id].output_filename}",
             ],
@@ -1133,8 +1547,14 @@ def test_report_automation_recovers_failed_menu_select_with_root_leaf_fallback_w
     report = next(item for item in config.reports if item.id == "R09")
     window = FakeCustomerSourceMenuSelectFailWindow(leaf_visible_after_menu_select=False)
     sent_keys: list[str] = []
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
     automator._keyboard_sender = sent_keys.append
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1154,10 +1574,879 @@ def test_report_automation_recovers_failed_menu_select_with_root_leaf_fallback_w
     )
 
 
+def test_report_automation_waits_for_delayed_course_menu_popup_after_root_click(tmp_path: Path) -> None:
+    window = FakeDelayedCourseMenuPopupWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+    )
+
+    automator._open_report_screen("課程服務明細表")
+
+    assert automator._active_report_form is window.course_report
+    assert window.course_report in window.children_controls
+    assert window.popup_probe_calls >= 3
+    assert "click:統計報表" in automator.actions
+    assert "click:課程服務明細表" in automator.actions
+    assert window.course_leaf.clicked is True
+    assert "recover:visible_menu_popup_item:課程服務明細表" in automator.actions
+    assert "retry:menu_root_reopen:統計報表" in automator.actions
+
+
+def test_report_automation_bypasses_blocking_r05_native_menu_select_when_switching_from_product(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class R05SwitchWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.menu_select_calls: list[str] = []
+            self.popup_open = False
+            self.course_form = FakePosControl(
+                "課程服務明細表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+            course_leaf = FakePosControl(
+                "課程服務明細表",
+                "MenuItem",
+                on_click=lambda: self.children_controls.append(self.course_form),
+            )
+            self.popup = FakePosControl("統計報表", "Menu", class_name="#32768", children=[course_leaf])
+            self.root = FakePosControl(
+                "統計報表",
+                "MenuItem",
+                on_click=lambda: setattr(self, "popup_open", True),
+            )
+            self.product_form = FakePosControl(
+                "商品銷售明細表",
+                "Dialog",
+                children=[FakePosControl("商品日期起", "Edit"), FakePosControl("商品日期迄", "Edit")],
+            )
+            super().__init__("SPA-POS", children=[self.root, self.product_form])
+
+        def menu_select(self, menu_path: str) -> None:
+            self.menu_select_calls.append(menu_path)
+            raise AssertionError("R05 product-to-course switch must not call blocking native menu_select")
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return [self.popup] if self.popup_open else []
+
+    window = R05SwitchWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    automator._active_report_form = window.product_form
+
+    automator._open_report_screen("課程服務明細表")
+
+    assert window.menu_select_calls == []
+    assert automator._active_report_form is window.course_form
+    assert any(action.startswith("skip:menu_select:R05商品參考報表仍開啟") for action in automator.actions)
+
+
+def test_report_automation_uses_root_menu_select_once_for_r05_switch_when_click_has_no_popup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class RootSelectWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.popup_open = False
+            self.root_select_calls = 0
+            self.root_invoke_calls = 0
+            self.course_form = FakePosControl(
+                "課程服務明細表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+            course_leaf = FakePosControl(
+                "課程服務明細表",
+                "MenuItem",
+                on_click=lambda: self.children_controls.append(self.course_form),
+            )
+            self.popup = FakePosControl("統計報表", "Menu", class_name="#32768", children=[course_leaf])
+            outer = self
+
+            class RootMenu(FakePosControl):
+                def select(self, _value: str = "") -> None:
+                    outer.root_select_calls += 1
+
+                def invoke(self) -> None:
+                    outer.root_invoke_calls += 1
+                    outer.popup_open = True
+
+            self.root = RootMenu("統計報表", "MenuItem")
+            self.product_form = FakePosControl(
+                "商品銷售明細表",
+                "Dialog",
+                children=[FakePosControl("商品日期起", "Edit"), FakePosControl("商品日期迄", "Edit")],
+            )
+            super().__init__("SPA-POS", children=[self.root, self.product_form])
+
+        def menu_select(self, _menu_path: str) -> None:
+            raise AssertionError("R05 must not call full native menu_select")
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return [self.popup] if self.popup_open else []
+
+    window = RootSelectWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    automator._active_report_form = window.product_form
+
+    automator._open_report_screen("課程服務明細表")
+
+    assert window.root_select_calls == 1
+    assert window.root_invoke_calls == 1
+    assert automator._active_report_form is window.course_form
+    assert "activate:menu_root:select:統計報表" in automator.actions
+
+
+def test_report_automation_uses_confirmed_keyboard_menu_path_for_r05_when_uia_menu_methods_do_nothing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class KeyboardMenuWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.root_focused = False
+            self.course_form = FakePosControl(
+                "課程服務明細表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+
+            class RootMenu(FakePosControl):
+                def select(self, _value: str = "") -> None:
+                    return None
+
+                def invoke(self) -> None:
+                    return None
+
+            self.root = RootMenu("統計報表", "MenuItem")
+            self.root.focused = False
+
+            def set_focus() -> None:
+                self.root.focused = True
+                self.root_focused = True
+
+            self.root.set_focus = set_focus  # type: ignore[method-assign]
+            self.product_menu = FakePosControl("商品銷售明細表", "MenuItem")
+            self.hidden_course_menu = FakePosControl("課程服務明細表", "MenuItem")
+            self.hidden_course_menu.visible = False
+            self.product_form = FakePosControl(
+                "商品銷售明細表",
+                "Dialog",
+                children=[FakePosControl("商品日期起", "Edit"), FakePosControl("商品日期迄", "Edit")],
+            )
+            super().__init__(
+                "SPA-POS",
+                children=[self.root, self.product_menu, self.hidden_course_menu, self.product_form],
+            )
+
+        def menu_select(self, _menu_path: str) -> None:
+            raise AssertionError("R05 must not call full native menu_select")
+
+    window = KeyboardMenuWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    automator._active_report_form = window.product_form
+
+    def send_keyboard(keys: str) -> None:
+        if keys == "{ENTER}" and window.root_focused:
+            window.children_controls.append(window.course_form)
+
+    automator._keyboard_sender = send_keyboard
+    automator._open_report_screen(
+        "課程服務明細表",
+        menu_path=["統計報表", "課程服務明細表"],
+    )
+
+    assert automator._active_report_form is window.course_form
+    assert "navigate:menu_root:統計報表:down_open" in automator.actions
+    assert "navigate:menu_item:商品銷售明細表:down_next" in automator.actions
+    assert "activate:menu_item:課程服務明細表:keyboard_enter" in automator.actions
+
+
+def test_report_automation_uses_bounded_keyboard_menu_path_for_delayed_r08_uia_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class KeyboardMenuWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.root_focused = False
+            self.target_form = FakePosControl(
+                "預約紀錄查詢統計表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+
+            class RootMenu(FakePosControl):
+                def set_focus(inner_self) -> None:
+                    inner_self.focused = True
+                    self.root_focused = True
+
+            self.root = RootMenu("統計報表", "MenuItem")
+            menu_items = [
+                FakePosControl("商品銷售明細表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+                FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
+                FakePosControl("客戶來源與產值統計表", "MenuItem"),
+                FakePosControl("分店營收明細統計表", "MenuItem"),
+                FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+            ]
+            super().__init__("SPA-POS", children=[self.root, *menu_items])
+            self._pos_report_bot_backend = "uia"
+
+        def menu_select(self, _menu_path: str) -> None:
+            raise AssertionError("real UIA must not call native menu_select")
+
+    window = KeyboardMenuWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+
+    def send_keyboard(keys: str) -> None:
+        sent_keys.append(keys)
+        if keys == "{ENTER}" and window.root_focused:
+            window.children_controls.append(window.target_form)
+
+    automator._keyboard_sender = send_keyboard
+
+    automator._open_report_screen("預約紀錄查詢統計表")
+
+    assert automator._active_report_form is window.target_form
+    assert sent_keys.count("{DOWN}") == 6
+    assert "activate:menu_item:預約紀錄查詢統計表:keyboard_enter" in automator.actions
+
+
+def test_report_automation_uses_verified_popup_when_uia_root_focus_readback_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class PopupKeyboardWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.popup_open = False
+            self.target_form = FakePosControl(
+                "預約紀錄查詢統計表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+
+            class RootMenu(FakePosControl):
+                def set_focus(inner_self) -> None:
+                    inner_self.focused = False
+
+            self.root = RootMenu(
+                "統計報表",
+                "MenuItem",
+                on_click=lambda: setattr(self, "popup_open", True),
+            )
+            self.menu_items = [
+                FakePosControl("商品銷售明細表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+                FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
+                FakePosControl("客戶來源與產值統計表", "MenuItem"),
+                FakePosControl("分店營收明細統計表", "MenuItem"),
+                FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+            ]
+            self.popup = FakePosControl("", "Menu", class_name="#32768", children=self.menu_items)
+            super().__init__("SPA-POS", children=[self.root, *self.menu_items])
+            self._pos_report_bot_backend = "uia"
+
+        def menu_select(self, _menu_path: str) -> None:
+            raise AssertionError("real UIA must not call native menu_select")
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return [self.popup] if self.popup_open else []
+
+    window = PopupKeyboardWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+
+    def send_keyboard(keys: str) -> None:
+        sent_keys.append(keys)
+        if keys == "{ENTER}" and window.popup_open:
+            window.children_controls.append(window.target_form)
+
+    automator._keyboard_sender = send_keyboard
+
+    automator._open_report_screen("預約紀錄查詢統計表")
+
+    assert automator._active_report_form is window.target_form
+    assert sent_keys == ["{HOME}", "{DOWN}", "{DOWN}", "{DOWN}", "{DOWN}", "{DOWN}", "{ENTER}"]
+    assert "confirm:statistics_menu_keyboard:popup_visible:商品銷售明細表" in automator.actions
+
+
+def test_report_automation_opens_click_focused_winforms_menu_with_enter_and_final_form_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class FocusOnlyClickWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.popup_open = False
+            self.target_form = FakePosControl(
+                "預約紀錄查詢統計表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+
+            class RootMenu(FakePosControl):
+                def set_focus(inner_self) -> None:
+                    inner_self.focused = False
+
+            self.root = RootMenu("統計報表", "MenuItem")
+            self.menu_items = [
+                FakePosControl("商品銷售明細表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+                FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
+                FakePosControl("客戶來源與產值統計表", "MenuItem"),
+                FakePosControl("分店營收明細統計表", "MenuItem"),
+                FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+            ]
+            for menu_item in self.menu_items[1:]:
+                menu_item.visible = False
+            super().__init__("SPA-POS", children=[self.root, *self.menu_items])
+            self._pos_report_bot_backend = "uia"
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return []
+
+    window = FocusOnlyClickWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+
+    def send_keyboard(keys: str) -> None:
+        sent_keys.append(keys)
+        if keys == "{ENTER}" and not window.popup_open:
+            window.popup_open = True
+        elif keys == "{ENTER}" and window.popup_open:
+            window.children_controls.append(window.target_form)
+
+    automator._keyboard_sender = send_keyboard
+    automator._statistics_keyboard_target_is_pos_foreground = lambda: True  # type: ignore[method-assign]
+
+    assert automator._try_statistics_report_keyboard_menu_path(
+        "統計報表",
+        "預約紀錄查詢統計表",
+        previous_form=None,
+    )
+    assert automator._active_report_form is window.target_form
+    assert sent_keys == [
+        "{ENTER}",
+        "{HOME}",
+        "{DOWN}",
+        "{DOWN}",
+        "{DOWN}",
+        "{DOWN}",
+        "{DOWN}",
+        "{ENTER}",
+    ]
+    assert "navigate:statistics_menu_keyboard:enter_open_after_root_click" in automator.actions
+    assert "continue:statistics_menu_keyboard:foreground_proven_without_popup_readback" in automator.actions
+
+
+def test_report_automation_does_not_send_keyboard_when_pos_foreground_is_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class NoPopupWindow(FakePosControl):
+        def __init__(self) -> None:
+            class RootMenu(FakePosControl):
+                def set_focus(inner_self) -> None:
+                    inner_self.focused = False
+
+            self.root = RootMenu("統計報表", "MenuItem")
+            menu_items = [
+                FakePosControl("商品銷售明細表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+                FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
+                FakePosControl("客戶來源與產值統計表", "MenuItem"),
+                FakePosControl("分店營收明細統計表", "MenuItem"),
+                FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+            ]
+            for menu_item in menu_items[1:]:
+                menu_item.visible = False
+            super().__init__("SPA-POS", children=[self.root, *menu_items])
+            self._pos_report_bot_backend = "uia"
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return []
+
+    automator = ReportWindowAutomator(
+        NoPopupWindow(),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+    automator._keyboard_sender = sent_keys.append
+    automator._statistics_keyboard_target_is_pos_foreground = lambda: False  # type: ignore[method-assign]
+
+    assert (
+        automator._try_statistics_report_keyboard_menu_path(
+            "統計報表",
+            "預約紀錄查詢統計表",
+            previous_form=None,
+        )
+        is False
+    )
+    assert sent_keys == []
+    assert "skip:statistics_menu_keyboard:foreground_unverified:enter_open_after_root_click" in automator.actions
+
+
+def test_report_automation_accepts_only_pos_owned_foreground_popup_for_statistics_keyboard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+    window = FakePosControl("SPA-POS")
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    monkeypatch.setattr(
+        report_automation,
+        "_control_handle",
+        lambda control: 100 if control is window else None,
+    )
+    monkeypatch.setattr(automator, "_fast_foreground_window_handle", lambda: 200)
+
+    owner_by_handle = {200: 100}
+    fake_win32gui = SimpleNamespace(
+        GetWindow=lambda handle, _flag: owner_by_handle.get(handle, 0),
+        GetParent=lambda _handle: 0,
+    )
+    monkeypatch.setitem(sys.modules, "win32gui", fake_win32gui)
+
+    assert automator._statistics_keyboard_target_is_pos_foreground() is True
+
+    owner_by_handle[200] = 300
+    assert automator._statistics_keyboard_target_is_pos_foreground() is False
+
+
+def test_report_automation_does_not_fall_back_to_hidden_leaf_after_bounded_keyboard_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class NoFormAfterKeyboardWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.root_clicks = 0
+
+            class RootMenu(FakePosControl):
+                def set_focus(inner_self) -> None:
+                    inner_self.focused = False
+
+            def root_clicked() -> None:
+                self.root_clicks += 1
+
+            self.root = RootMenu("統計報表", "MenuItem", on_click=root_clicked)
+            self.menu_items = [
+                FakePosControl("商品銷售明細表", "MenuItem"),
+                FakePosControl("課程服務明細表", "MenuItem"),
+                FakePosControl("會員剩餘點數殘值統計表", "MenuItem"),
+                FakePosControl("客戶來源與產值統計表", "MenuItem"),
+                FakePosControl("分店營收明細統計表", "MenuItem"),
+                FakePosControl("預約紀錄查詢統計表", "MenuItem"),
+            ]
+            for menu_item in self.menu_items[1:]:
+                menu_item.visible = False
+            super().__init__("SPA-POS", children=[self.root, *self.menu_items])
+            self._pos_report_bot_backend = "uia"
+
+        def menu_select(self, _menu_path: str) -> None:
+            raise AssertionError("real UIA must not call native menu_select")
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return []
+
+    window = NoFormAfterKeyboardWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.01,
+        wait_after_click_seconds=0,
+    )
+    automator._keyboard_sender = lambda _keys: None
+    automator._statistics_keyboard_target_is_pos_foreground = lambda: True  # type: ignore[method-assign]
+
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator._open_report_screen("預約紀錄查詢統計表")
+
+    assert exc_info.value.error_code == "REPORT_SCREEN_NOT_OPENED"
+    assert window.root_clicks == 1
+    assert "stop:statistics_menu_keyboard:bounded_dispatch_did_not_open_target" in automator.actions
+    assert not any("failed_direct_leaf" in action for action in automator.actions)
+
+
+def test_report_automation_opens_r13_owner_drawn_submenu_with_bounded_keyboard_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class HiddenOwnerDrawnInventoryWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.menu_open = False
+            self.target_form = FakePosControl(
+                "沙貨耗品領用查詢報表",
+                "Dialog",
+                automation_id="TakeGoods_Report",
+                children=[
+                    FakePosControl("領用起日", "Edit", automation_id="cT_QueryBdate"),
+                    FakePosControl("領用迄日", "Edit", automation_id="cT_QueryEdate"),
+                ],
+            )
+
+            def open_inventory_menu() -> None:
+                self.menu_open = True
+
+            self.root = FakePosControl("庫存管理", "MenuItem", on_click=open_inventory_menu)
+            self.first_item = FakePosControl("分店訂貨單", "MenuItem")
+            self.related_reports = FakePosControl("相關報表", "MenuItem")
+            self.r13_leaf = FakePosControl("沙貨耗材領用查詢表", "MenuItem")
+            for item in (self.first_item, self.related_reports, self.r13_leaf):
+                # This reproduces the production probe: the owner-drawn menu is
+                # visible on screen while UIA reports each child as hidden.
+                item.visible = False
+            super().__init__(
+                "SPA-POS",
+                children=[self.root, self.first_item, self.related_reports, self.r13_leaf],
+            )
+            self._pos_report_bot_backend = "uia"
+
+        def menu_select(self, _menu_path: str) -> None:
+            raise AssertionError("real UIA must not call native menu_select")
+
+        def menu_popup_controls(self) -> list[FakePosControl]:
+            return []
+
+    window = HiddenOwnerDrawnInventoryWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.01,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+    expected_keys = ["{HOME}", "{DOWN}", "{RIGHT}", "{HOME}", "{ENTER}"]
+
+    def send_keyboard(keys: str) -> None:
+        sent_keys.append(keys)
+        if window.menu_open and sent_keys == expected_keys:
+            window.children_controls.append(window.target_form)
+
+    automator._keyboard_sender = send_keyboard
+    automator._statistics_keyboard_target_is_pos_foreground = lambda: True  # type: ignore[method-assign]
+
+    automator._open_report_screen(
+        "沙貨耗材領用查詢表",
+        menu_path=["庫存管理", "相關報表", "沙貨耗材領用查詢表"],
+    )
+
+    assert automator._active_report_form is window.target_form
+    assert window.root.click_count == 1
+    assert sent_keys == expected_keys
+    _assert_action_milestones_in_order(
+        automator.actions,
+        [
+            "click:庫存管理",
+            "navigate:inventory_report_menu_keyboard:home_first",
+            "navigate:inventory_report_menu_keyboard:down_to_related_reports",
+            "navigate:inventory_report_menu_keyboard:right_open_related_reports",
+            "navigate:inventory_report_menu_keyboard:home_first_submenu_item",
+            "activate:inventory_report_menu_keyboard:沙貨耗材領用查詢表:enter",
+            "confirm:inventory_report_menu_keyboard:target_form_ready:沙貨耗材領用查詢表",
+        ],
+    )
+    assert not any("hidden_menu_item" in action for action in automator.actions)
+
+
+def test_report_automation_stops_r13_keyboard_path_when_pos_foreground_is_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+    root = FakePosControl("庫存管理", "MenuItem")
+    first_item = FakePosControl("分店訂貨單", "MenuItem")
+    related_reports = FakePosControl("相關報表", "MenuItem")
+    r13_leaf = FakePosControl("沙貨耗材領用查詢表", "MenuItem")
+    for item in (first_item, related_reports, r13_leaf):
+        item.visible = False
+    window = FakePosControl(
+        "SPA-POS",
+        children=[root, first_item, related_reports, r13_leaf],
+    )
+    window._pos_report_bot_backend = "uia"
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.01,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+    automator._keyboard_sender = sent_keys.append
+    automator._statistics_keyboard_target_is_pos_foreground = lambda: False  # type: ignore[method-assign]
+
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator._open_report_screen(
+            "沙貨耗材領用查詢表",
+            menu_path=["庫存管理", "相關報表", "沙貨耗材領用查詢表"],
+        )
+
+    assert exc_info.value.error_code == "REPORT_SCREEN_NOT_OPENED"
+    assert root.click_count == 1
+    assert sent_keys == []
+    assert "skip:inventory_report_menu_keyboard:foreground_unverified:home_first" in automator.actions
+    assert not any("hidden_menu_item" in action for action in automator.actions)
+
+
+def test_report_automation_rejects_r13_keyboard_path_when_inventory_order_changes(
+    tmp_path: Path,
+) -> None:
+    window = FakePosControl(
+        "SPA-POS",
+        children=[
+            FakePosControl("庫存管理", "MenuItem"),
+            FakePosControl("相關報表", "MenuItem"),
+            FakePosControl("分店訂貨單", "MenuItem"),
+            FakePosControl("沙貨耗材領用查詢表", "MenuItem"),
+        ],
+    )
+    window._pos_report_bot_backend = "uia"
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        wait_after_click_seconds=0,
+    )
+    sent_keys: list[str] = []
+    automator._keyboard_sender = sent_keys.append
+
+    assert (
+        automator._try_inventory_report_keyboard_menu_path(
+            ["庫存管理", "相關報表", "沙貨耗材領用查詢表"],
+            previous_form=None,
+        )
+        is False
+    )
+    assert sent_keys == []
+    assert "skip:inventory_report_menu_keyboard:first_level_order_unverified:observed=相關報表|分店訂貨單" in automator.actions
+
+
+def test_report_automation_does_not_click_hidden_r13_leaf_after_bounded_keyboard_dispatch(
+    tmp_path: Path,
+) -> None:
+    root = FakePosControl("庫存管理", "MenuItem")
+    first_item = FakePosControl("分店訂貨單", "MenuItem")
+    related_reports = FakePosControl("相關報表", "MenuItem")
+    r13_leaf = FakePosControl("沙貨耗材領用查詢表", "MenuItem")
+    for item in (first_item, related_reports, r13_leaf):
+        item.visible = False
+    window = FakePosControl(
+        "SPA-POS",
+        children=[root, first_item, related_reports, r13_leaf],
+    )
+    window._pos_report_bot_backend = "uia"
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.01,
+        wait_after_click_seconds=0,
+    )
+    automator._keyboard_sender = lambda _keys: None
+    automator._statistics_keyboard_target_is_pos_foreground = lambda: True  # type: ignore[method-assign]
+
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator._open_report_screen(
+            "沙貨耗材領用查詢表",
+            menu_path=["庫存管理", "相關報表", "沙貨耗材領用查詢表"],
+        )
+
+    assert exc_info.value.error_code == "REPORT_SCREEN_NOT_OPENED"
+    assert root.click_count == 1
+    assert r13_leaf.click_count == 0
+    assert "stop:inventory_report_menu_keyboard:bounded_dispatch_did_not_open_target" in automator.actions
+    assert not any("hidden_menu_item" in action for action in automator.actions)
+
+
+def test_report_automation_retries_r05_keyboard_menu_with_enter_open_variant(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+
+    class KeyboardMenuWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.root_focused = False
+            self.course_form = FakePosControl(
+                "課程服務明細表",
+                "Dialog",
+                children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+            )
+
+            class RootMenu(FakePosControl):
+                def set_focus(inner_self) -> None:
+                    inner_self.focused = True
+                    self.root_focused = True
+
+            self.root = RootMenu("統計報表", "MenuItem")
+            self.product_menu = FakePosControl("商品銷售明細表", "MenuItem")
+            hidden_course_menu = FakePosControl("課程服務明細表", "MenuItem")
+            hidden_course_menu.visible = False
+            self.product_form = FakePosControl(
+                "商品銷售明細表",
+                "Dialog",
+                children=[FakePosControl("商品日期起", "Edit"), FakePosControl("商品日期迄", "Edit")],
+            )
+            super().__init__(
+                "SPA-POS",
+                children=[self.root, self.product_menu, hidden_course_menu, self.product_form],
+            )
+
+    window = KeyboardMenuWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    automator._active_report_form = window.product_form
+    sent_keys: list[str] = []
+
+    def send_keyboard(keys: str) -> None:
+        if keys == "{ENTER}" and sent_keys and sent_keys[-1] == "{ESC}":
+            window.children_controls.append(window.course_form)
+        sent_keys.append(keys)
+
+    automator._keyboard_sender = send_keyboard
+
+    assert automator._try_r05_keyboard_menu_path(
+        "統計報表",
+        "課程服務明細表",
+        previous_form=window.product_form,
+    )
+    assert sent_keys == ["{DOWN}", "{DOWN}", "{ENTER}", "{ESC}", "{ENTER}", "{DOWN}", "{ENTER}"]
+    assert "navigate:menu_root:統計報表:enter_open" in automator.actions
+    assert "activate:menu_item:課程服務明細表:keyboard_enter_after_enter" in automator.actions
+
+
+def test_report_automation_r05_uses_root_click_when_uia_focus_readback_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+    course_form = FakePosControl(
+        "課程服務明細表",
+        "Dialog",
+        children=[FakePosControl("起日", "Edit"), FakePosControl("迄日", "Edit")],
+    )
+    root = FakePosControl("統計報表", "MenuItem")
+    product_menu = FakePosControl("商品銷售明細表", "MenuItem")
+    hidden_course_menu = FakePosControl("課程服務明細表", "MenuItem")
+    hidden_course_menu.visible = False
+    product_form = FakePosControl(
+        "商品銷售明細表",
+        "Dialog",
+        children=[FakePosControl("商品日期起", "Edit"), FakePosControl("商品日期迄", "Edit")],
+    )
+    window = FakePosControl(
+        "SPA-POS",
+        children=[root, product_menu, hidden_course_menu, product_form],
+    )
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+    automator._active_report_form = product_form
+    sent_keys: list[str] = []
+
+    def send_keyboard(keys: str) -> None:
+        sent_keys.append(keys)
+        if keys == "{ENTER}" and course_form not in window.children_controls:
+            window.children_controls.append(course_form)
+
+    automator._keyboard_sender = send_keyboard
+
+    assert automator._try_r05_keyboard_menu_path(
+        "統計報表",
+        "課程服務明細表",
+        previous_form=product_form,
+    )
+    assert root.clicked is True
+    assert sent_keys == ["{ENTER}", "{DOWN}", "{ENTER}"]
+    assert "focus:menu_root_keyboard:click_input:統計報表" in automator.actions
+    assert "navigate:menu_root:統計報表:enter_open" in automator.actions
+
+
 def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R02")
     report = next(item for item in config.reports if item.id == "R02")
+    export = FakeRectPosControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        enabled=False,
+        rect=(550, 320, 620, 350),
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -1169,13 +2458,19 @@ def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: P
             FakePosControl("顯示客代與電話", "CheckBox"),
             FakePosControl("顯示退費", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
-            FakePosControl("檢視報表", "Button"),
-            FakePosControl("匯出", "MenuItem"),
+            FakePosControl("檢視報表", "Button", on_click=lambda: setattr(export, "enabled", True)),
+            export,
             FakePosControl("Excel", "MenuItem"),
         ],
     )
     handler = MockSaveAsHandler()
-    automator = ReportWindowAutomator(window, save_as_handler=handler, output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=handler,
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1197,7 +2492,7 @@ def test_report_automation_executes_video_derived_product_sales_flow(tmp_path: P
     assert "export_stage_start:wait_for_export_button" in result.actions
     assert any(action.startswith("wait_start:匯出啟用:") for action in result.actions)
     assert any(action.startswith("target:匯出:") for action in result.actions)
-    assert "click:匯出" in result.actions
+    assert any(action in {"click:匯出", "click:匯出:dropdown:geometry"} for action in result.actions)
     assert "click:匯出格式:Excel" in result.actions
     assert "continue:匯出格式:Excel:交由SaveAsHandler等待另存新檔" in result.actions
     assert f"save_as:{tmp_path / output.output_filename}" in result.actions
@@ -1208,6 +2503,13 @@ def test_report_automation_writes_action_log_and_probe_snapshot(tmp_path: Path) 
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R02")
     report = next(item for item in config.reports if item.id == "R02")
     log_dir = tmp_path / "logs"
+    export = FakeRectPosControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        enabled=False,
+        rect=(550, 320, 620, 350),
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -1219,8 +2521,8 @@ def test_report_automation_writes_action_log_and_probe_snapshot(tmp_path: Path) 
             FakePosControl("顯示客代與電話", "CheckBox"),
             FakePosControl("顯示退費", "CheckBox"),
             FakePosControl("不列明細", "CheckBox"),
-            FakePosControl("檢視報表", "Button"),
-            FakePosControl("匯出", "MenuItem"),
+            FakePosControl("檢視報表", "Button", on_click=lambda: setattr(export, "enabled", True)),
+            export,
             FakePosControl("Excel", "MenuItem"),
         ],
     )
@@ -1229,7 +2531,9 @@ def test_report_automation_writes_action_log_and_probe_snapshot(tmp_path: Path) 
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
         log_dir=log_dir,
+        report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1275,7 +2579,13 @@ def test_report_automation_uses_menu_select_before_hidden_menu_clicks(tmp_path: 
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
     window = FakeMenuSelectWindow()
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1310,6 +2620,7 @@ def test_report_automation_selects_all_branches_for_r01(tmp_path: Path) -> None:
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1346,7 +2657,13 @@ def test_report_automation_scopes_report_form_with_children_when_descendants_are
             report_form,
         ],
     )
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1373,7 +2690,13 @@ def test_report_automation_finds_sales_branch_checkbox_by_automation_id(tmp_path
             FakePosControl("Excel", "MenuItem"),
         ],
     )
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1386,7 +2709,13 @@ def test_report_automation_replays_r01_probe_sales_branch_checkbox(tmp_path: Pat
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
     window = _window_from_probe_fixture(ROOT / "tests" / "fixtures" / "ui_probe_r01_sales_branch.json")
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -1420,6 +2749,42 @@ def test_report_automation_does_not_use_other_report_form_when_active_form_is_mi
     else:
         raise AssertionError("must not toggle a checkbox from another report form")
     assert product_sales_branch.toggle_state == 0
+
+
+def test_report_automation_does_not_accept_hidden_report_form_as_ready(tmp_path: Path) -> None:
+    hidden_form = FakeRectPosControl(
+        "課程服務明細表",
+        "Dialog",
+        automation_id="CourseSale_Report",
+        rect=(0, 0, 0, 0),
+        children=[
+            FakePosControl("", "Edit", automation_id="cT_QueryBdate"),
+            FakePosControl("", "Edit", automation_id="cT_QueryEdate"),
+        ],
+    )
+    hidden_form.visible = False
+    window = FakePosControl("SPA-POS", children=[hidden_form])
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+
+    assert automator._has_report_screen_inputs("課程服務明細表") is False
+
+
+def test_report_automation_clears_stale_active_form_when_rebind_finds_no_live_form(
+    tmp_path: Path,
+) -> None:
+    stale_form = FakeRectPosControl("", "Dialog", rect=(0, 0, 0, 0))
+    stale_form.visible = False
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._active_report_form = stale_form
+
+    automator._refresh_active_report_form("課程服務明細表", reason="before_other_conditions")
+
+    assert automator._active_report_form is None
+    assert "clear_stale_active_report_form:before_other_conditions:課程服務明細表" in automator.actions
 
 
 def test_report_automation_writes_failure_diagnostic_when_checkbox_missing(tmp_path: Path) -> None:
@@ -1488,6 +2853,8 @@ def test_report_automation_accepts_product_sales_branch_code_alias(tmp_path: Pat
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1515,6 +2882,8 @@ def test_report_automation_treats_selected_combo_text_as_checked_option(tmp_path
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1554,6 +2923,8 @@ def test_report_automation_selects_product_sales_phone_option_from_known_combo(t
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1604,6 +2975,9 @@ def test_report_automation_selects_product_sales_allocation_option_alias_from_kn
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
+    _wire_confirmed_native_export_popup(automator)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1652,6 +3026,9 @@ def test_report_automation_r11_checks_combo_child_items_between_allocation_and_r
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
+    _wire_confirmed_native_export_popup(automator)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1716,6 +3093,9 @@ def test_report_automation_r12_checks_combo_child_items_between_allocation_and_r
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
+    _wire_confirmed_native_export_popup(automator)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1764,6 +3144,8 @@ def test_report_automation_runs_r03_two_step_product_sales_flow(tmp_path: Path) 
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -1788,7 +3170,7 @@ def test_report_automation_runs_r03_two_step_product_sales_flow(tmp_path: Path) 
             lambda action: action.startswith("target:檢視報表:"),
             "click:檢視報表",
             "preview_ready:R03:二次篩選",
-            "click:匯出",
+            lambda action: action in {"click:匯出", "click:匯出:dropdown:geometry"},
             "click:匯出格式:Excel",
         ],
     )
@@ -1916,11 +3298,153 @@ def test_report_automation_opens_course_other_query_panel_before_secondary_filte
     report.options.other_conditions = ["二次篩選"]
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
     assert other_clicks == 1
     assert "check:二次篩選" in result.actions
+
+
+def test_report_preview_does_not_treat_empty_report_viewer_container_as_ready(tmp_path: Path) -> None:
+    empty_viewer = FakePosControl("", "Pane", automation_id="reportViewer1")
+    window = FakePosControl("SPA-POS", "Dialog", children=[empty_viewer])
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+
+    assert automator._report_viewer_is_present() is True
+    assert automator._report_viewer_has_actionable_response() is False
+
+
+def test_report_preview_does_not_pair_zero_page_with_unrelated_numeric_mdi_name(tmp_path: Path) -> None:
+    report_viewer = FakePosControl(
+        "",
+        "Pane",
+        automation_id="reportViewer1",
+        children=[
+            FakePosControl("0", "Edit"),
+            FakePosControl("的", "Text"),
+        ],
+    )
+    unrelated_mdi_client = FakePosControl(
+        "100",
+        "Pane",
+        class_name="WindowsForms10.MDICLIENT.app.0.33c0d9d",
+    )
+    window = FakePosControl("SPA-POS", "Dialog", children=[unrelated_mdi_client, report_viewer])
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+
+    assert automator._report_viewer_has_actionable_response() is False
+    assert "evidence:ReportViewer已有頁數" not in automator.actions
+
+
+def test_report_preview_accepts_positive_page_edit_inside_report_viewer(tmp_path: Path) -> None:
+    report_viewer = FakePosControl(
+        "",
+        "Pane",
+        automation_id="reportViewer1",
+        children=[
+            FakePosControl("1", "Edit"),
+            FakePosControl("的", "Text"),
+        ],
+    )
+    window = FakePosControl("SPA-POS", "Dialog", children=[report_viewer])
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+
+    assert automator._report_viewer_has_actionable_response() is True
+    assert "evidence:ReportViewer已有頁數" in automator.actions
+
+
+def test_r03_zero_page_with_unrelated_mdi_number_waits_for_delayed_no_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_viewer = FakePosControl(
+        "",
+        "Pane",
+        automation_id="reportViewer1",
+        children=[
+            FakePosControl("0", "Edit"),
+            FakePosControl("的", "Text"),
+        ],
+    )
+    unrelated_mdi_client = FakePosControl(
+        "100",
+        "Pane",
+        class_name="WindowsForms10.MDICLIENT.app.0.33c0d9d",
+    )
+    window = FakePosControl("SPA-POS", "Dialog", children=[unrelated_mdi_client, report_viewer])
+    warning_probe_calls = 0
+
+    def dismiss_no_data_warning() -> bool:
+        nonlocal warning_probe_calls
+        warning_probe_calls += 1
+        return warning_probe_calls >= 2
+
+    window.dismiss_no_data_warning = dismiss_no_data_warning  # type: ignore[attr-defined]
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+    monkeypatch.setattr(report_automation, "sleep", lambda _seconds: None)
+
+    with pytest.raises(ReportAutomationError) as raised:
+        automator._wait_for_report_viewer(timeout_seconds=0.05)
+
+    assert raised.value.error_code == "NO_REPORT_DATA"
+    assert warning_probe_calls >= 2
+    assert "evidence:ReportViewer已有頁數" not in automator.actions
+
+
+def test_r03_preview_wait_observes_delayed_no_data_warning_after_empty_viewer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_viewer = FakePosControl("", "Pane", automation_id="reportViewer1")
+    window = FakePosControl("SPA-POS", "Dialog", children=[empty_viewer])
+    warning_probe_calls = 0
+
+    def dismiss_no_data_warning() -> bool:
+        nonlocal warning_probe_calls
+        warning_probe_calls += 1
+        return warning_probe_calls >= 2
+
+    window.dismiss_no_data_warning = dismiss_no_data_warning  # type: ignore[attr-defined]
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+    monkeypatch.setattr(report_automation, "sleep", lambda _seconds: None)
+
+    with pytest.raises(ReportAutomationError) as raised:
+        automator._wait_for_report_viewer(timeout_seconds=0.05)
+
+    assert raised.value.error_code == "NO_REPORT_DATA"
+    assert warning_probe_calls >= 2
 
 
 def test_report_automation_moves_offscreen_other_conditions_before_click(tmp_path: Path) -> None:
@@ -2019,6 +3543,66 @@ def test_report_automation_maximizes_offscreen_other_conditions_before_click(tmp
     assert "maximize_report_form:課程服務明細表" in automator.actions
     assert "check:二次篩選" in automator.actions
     assert "restore_report_form:課程服務明細表" in automator.actions
+
+
+def test_report_automation_opens_r05_other_conditions_when_specific_customer_id_field_is_already_visible(
+    tmp_path: Path,
+) -> None:
+    window = FakeRectPosControl("SPA-POS", "Dialog", rect=(0, 0, 1366, 768))
+    other_conditions = FakeRectPosControl(
+        "其他條件...",
+        "Static",
+        automation_id="L_OtherQuery",
+        rect=(1006, 184, 1071, 200),
+    )
+    course_form = FakeMaximizableReportForm(
+        "課程服務明細表",
+        "Dialog",
+        automation_id="ClassService_Report",
+        class_name="WindowsForms10.Window.8.app.0.33c0d9d",
+        rect=(36, 87, 1083, 602),
+        maximized_rect=(8, 51, 1358, 760),
+        children=[
+            FakePosControl("", "Edit", automation_id="cT_QueryBdate"),
+            FakePosControl("", "Edit", automation_id="cT_QueryEdate"),
+            other_conditions,
+            FakePosControl(
+                "",
+                "Pane",
+                automation_id="pn_OtherQuery",
+                children=[
+                    FakePosControl(
+                        "僅需顯示\r\n特定客代",
+                        "Edit",
+                        automation_id="cT_OnlyCSID",
+                    )
+                ],
+            ),
+        ],
+    )
+    def reveal_secondary_filter() -> None:
+        if not any(child.automation_id == "cK_ReQuery" for child in course_form.children_controls):
+            course_form.children_controls.append(
+                FakePosControl("二次篩選", "CheckBox", automation_id="cK_ReQuery")
+            )
+
+    other_conditions.on_click = reveal_secondary_filter
+    window.children_controls.append(course_form)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        wait_after_click_seconds=0,
+    )
+    automator._current_report_id = "R05"
+    automator._active_report_title = "課程服務明細表"
+    automator._active_report_form = course_form
+
+    automator._set_other_condition("二次篩選")
+
+    assert other_conditions.clicked is True
+    assert "click:其他條件" in automator.actions
+    assert "check:二次篩選" in automator.actions
 
 
 def test_report_automation_moves_offscreen_other_conditions_by_handle_fallback(
@@ -2234,6 +3818,9 @@ def test_report_automation_runs_r05_product_reference_then_exports_course_report
     window.close_report_viewer = lambda _report_menu_text: True
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -2262,11 +3849,11 @@ def test_report_automation_runs_r05_product_reference_then_exports_course_report
         result.actions,
         [
             "prepare_reference_report_viewed:商品銷售明細表",
-            "menu_select:統計報表->課程服務明細表",
+            "click:課程服務明細表",
         ],
     )
     product_ready_index = result.actions.index("prepare_reference_report_viewed:商品銷售明細表")
-    course_open_index = result.actions.index("menu_select:統計報表->課程服務明細表")
+    course_open_index = result.actions.index("click:課程服務明細表")
     assert not any(
         action.startswith("close_report_viewer:商品銷售明細表")
         for action in result.actions[product_ready_index:course_open_index]
@@ -2410,6 +3997,9 @@ def test_report_automation_r05_requires_product_reference_to_remain_open_until_c
     window.course_run.on_click = require_product_reference_open_before_course_export
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -2545,7 +4135,14 @@ def test_report_automation_retries_r05_course_view_report_once_when_export_stays
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
-        report_generate_wait_seconds=0,
+        report_generate_wait_seconds=0.1,
+    )
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
+    automator._click_control_center_by_geometry = (
+        lambda control, action: (control.click() or True)
+        if action == "檢視報表:retry"
+        else False
     )
 
     result = automator.download_report(output, report)
@@ -2571,6 +4168,9 @@ def test_report_automation_closes_both_r05_report_windows_after_success(tmp_path
     window.close_report_viewer = close_report_viewer
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -2584,6 +4184,9 @@ def test_report_automation_skips_missing_optional_r05_product_branch_checkbox(tm
     window = FakeR05CombinedWindow(product_has_branch_checkbox=False)
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_fake_r05_course_menu(window)
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -2626,6 +4229,8 @@ def test_report_automation_selects_customer_source_remark_dropdown_option(tmp_pa
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -2663,6 +4268,7 @@ def test_report_automation_selects_r06_branch_by_code_and_radio_option(tmp_path:
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -2738,6 +4344,7 @@ def test_report_automation_prefers_actual_r06_branch_label_over_display_name(tmp
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -2779,7 +4386,6 @@ def test_report_automation_skips_r06_branch_when_pos_reports_no_data(tmp_path: P
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
-
     result = automator.download_report(output, report)
 
     assert result.ok is False
@@ -2824,6 +4430,7 @@ def test_report_automation_dismisses_child_no_data_dialog_before_export(tmp_path
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -3032,6 +4639,50 @@ def test_report_automation_recovers_visible_course_leaf_from_transient_menu_popu
     assert "recover:visible_menu_popup_item:課程服務明細表" in automator.actions
 
 
+def test_report_automation_bypasses_native_menu_select_for_real_uia_window(
+    tmp_path: Path,
+) -> None:
+    report_form = FakePosControl(
+        "課程服務明細表",
+        "Dialog",
+        children=[
+            FakePosControl("起日", "Edit", automation_id="cT_QueryBdate"),
+            FakePosControl("迄日", "Edit", automation_id="cT_QueryEdate"),
+        ],
+    )
+
+    class UiaMenuWindow(FakePosControl):
+        def __init__(self) -> None:
+            self.menu_select_calls = 0
+            leaf = FakePosControl(
+                "課程服務明細表",
+                "MenuItem",
+                on_click=lambda: self.children_controls.append(report_form),
+            )
+            root = FakePosControl("統計報表", "MenuItem")
+            super().__init__("SPA-POS", children=[root, leaf])
+            self._pos_report_bot_backend = "uia"
+
+        def menu_select(self, _menu_path: str) -> None:
+            self.menu_select_calls += 1
+            raise AssertionError("real UIA menu_select must not be invoked")
+
+    window = UiaMenuWindow()
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_open_wait_seconds=0.1,
+        wait_after_click_seconds=0,
+    )
+
+    automator._open_report_screen("課程服務明細表")
+
+    assert window.menu_select_calls == 0
+    assert automator._active_report_form is report_form
+    assert "skip:menu_select:uia_native_menu_select_disabled" in automator.actions
+
+
 def test_report_automation_does_not_click_disabled_static_menu_leaf_when_popup_is_available(
     tmp_path: Path,
 ) -> None:
@@ -3205,6 +4856,7 @@ def test_report_automation_forces_r06_window_closed_after_each_branch(tmp_path: 
     )
     window.close_report_viewer = close_report_viewer
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     first_result = automator.download_report(output, report, close_after_success=False)
     second_result = automator.download_report(output, report, close_after_success=True)
@@ -3235,6 +4887,12 @@ def test_golden_contract_r04_uses_future_30_day_appointment_multiselect_export(t
                 window.children_controls.append(control)
 
     branch_picker = FakePosControl("cT_Branch", "Pane", automation_id="pb_Branch", on_click=show_branch_panel)
+    export = FakeRectPosControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        rect=(550, 320, 620, 350),
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -3244,11 +4902,18 @@ def test_golden_contract_r04_uses_future_30_day_appointment_multiselect_export(t
             FakePosControl("迄日", "Edit"),
             branch_picker,
             FakePosControl("檢視報表", "Button"),
-            FakePosControl("匯出", "MenuItem"),
+            export,
             FakePosControl("Excel", "MenuItem"),
         ],
     )
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
+    _wire_confirmed_native_export_popup(automator)
 
     result = automator.download_report(output, report)
 
@@ -3267,8 +4932,8 @@ def test_golden_contract_r04_uses_future_30_day_appointment_multiselect_export(t
             "check_branch:N001 站前4樓",
             "click:檢視報表",
             lambda action: action.startswith("wait_start:匯出啟用:"),
-            "click:匯出",
-            "click:匯出格式:Excel",
+            lambda action: action.startswith("click:匯出:"),
+            lambda action: action.startswith("click:匯出格式:Excel"),
             f"save_as:{tmp_path / output.output_filename}",
         ],
     )
@@ -3315,6 +4980,8 @@ def test_report_automation_selects_every_appointment_branch_from_multiselect_pan
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3389,11 +5056,18 @@ def test_report_automation_selects_appointment_branches_from_popup_grid_y_n_cell
     def send_keys(keys: str) -> None:
         sent_keys.append(keys)
 
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
     automator._mouse_clicker = clicker
     automator._keyboard_sender = send_keys
     automator._select_multi_branch_values_by_keyboard_navigation = lambda: False  # type: ignore[method-assign]
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3450,6 +5124,8 @@ def test_report_automation_opens_appointment_branch_panel_with_picker_button(tmp
     )
     automator._keyboard_sender = lambda _keys: None
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3487,6 +5163,8 @@ def test_report_automation_can_use_keyboard_navigation_when_popup_grid_is_visibl
     automator._keyboard_sender = sent_keys.append
     automator._click_multi_branch_values_in_popup_grid = lambda: False  # type: ignore[method-assign]
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3582,6 +5260,8 @@ def test_report_automation_selects_all_branch_by_combo_dropdown_geometry(tmp_pat
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
     automator._mouse_clicker = clicker
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3629,12 +5309,42 @@ def test_report_automation_selects_all_branch_by_verified_keyboard_first_item(tm
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
     automator._keyboard_sender = send_keys
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
     assert branch_selector.selected_value == "所有分店"
     assert "select_branch:所有分店:keyboard_first_item" in result.actions
     assert "verify_branch:所有分店:所有分店" in result.actions
+
+
+def test_report_automation_selects_all_branch_by_known_combo_item_index(tmp_path: Path) -> None:
+    class IndexedComboBox(FakeRejectingComboBox):
+        item_values = ["營運總部", "所有分店"]
+
+        def item_texts(self) -> list[str]:
+            return list(self.item_values)
+
+        def select(self, value: str | int) -> None:
+            if isinstance(value, int):
+                self.selected_value = self.item_values[value]
+                return
+            raise ValueError(value)
+
+    branch_selector = IndexedComboBox(
+        "查詢 分店",
+        "ComboBox",
+        automation_id="cM_BranchNo",
+        class_name="WindowsForms10.COMBOBOX.app.0.33c0d9d",
+    )
+    branch_selector.selected_value = "營運總部"
+    window = FakePosControl("SPA-POS", children=[branch_selector])
+    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+
+    assert automator._select_branch_value("所有分店", required=True) is True
+    assert branch_selector.selected_value == "所有分店"
+    assert "select_branch:所有分店:known_item:1" in automator.actions
 
 
 def test_report_automation_accepts_all_branch_when_selector_already_selected(tmp_path: Path) -> None:
@@ -3668,6 +5378,7 @@ def test_report_automation_accepts_all_branch_when_selector_already_selected(tmp
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -3687,6 +5398,8 @@ def test_report_automation_dismisses_transient_pos_warnings_until_report_screen_
         report_open_wait_seconds=1,
     )
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3708,6 +5421,73 @@ def test_report_automation_ignores_pywinauto_missing_dismiss_hook() -> None:
     )
 
     assert automator._dismiss_transient_pos_warning() is False
+
+
+def test_report_screen_wait_never_enumerates_desktop_uia_for_transient_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pywinauto
+
+    desktop_backends: list[str] = []
+
+    class RecordingDesktop:
+        def __init__(self, *, backend: str) -> None:
+            desktop_backends.append(backend)
+
+        def windows(self, **_kwargs: object) -> list[object]:
+            return []
+
+    monkeypatch.setattr(pywinauto, "Desktop", RecordingDesktop)
+    window = FakePyaWrapperWithoutDismissHook("SPA-POS")
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=Path("C:/unused"),
+    )
+    automator._fast_top_level_window_handles = lambda **_kwargs: []  # type: ignore[method-assign]
+
+    assert automator._dismiss_transient_pos_warning() is False
+    assert "uia" not in desktop_backends
+
+
+def test_report_screen_wait_accepts_form_that_appears_after_old_fifteen_second_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 0.0}
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=Path("C:/unused"),
+    )
+    automator._has_report_screen_inputs = lambda _title=None: clock["now"] >= 20.0  # type: ignore[method-assign]
+    automator._dismiss_transient_pos_warning = lambda: False  # type: ignore[method-assign]
+    monkeypatch.setattr(report_automation, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(report_automation, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+
+    assert automator._wait_for_report_screen_inputs("預約紀錄查詢統計表") is True
+    assert clock["now"] == 20.0
+
+
+def test_transient_warning_probe_uses_exact_win32_window_and_dismisses_known_warning() -> None:
+    ok_button = FakePosControl("確定", "Button")
+    dialog = FakePosControl(
+        "錯誤警告",
+        "Dialog",
+        children=[
+            FakePosControl("無法連結資料主機，請確認網路或主機後即可正常使用", "Text"),
+            ok_button,
+        ],
+    )
+    automator = ReportWindowAutomator(
+        FakePyaWrapperWithoutDismissHook("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=Path("C:/unused"),
+    )
+    automator._fast_top_level_window_handles = lambda **_kwargs: [101]  # type: ignore[method-assign]
+    automator._wrap_win32_window_handle = lambda _handle: dialog  # type: ignore[method-assign]
+
+    assert automator._dismiss_transient_pos_warning() is True
+    assert ok_button.clicked is True
 
 
 def test_report_automation_detects_custom_date_input_controls_by_class_name(tmp_path: Path) -> None:
@@ -3733,6 +5513,8 @@ def test_report_automation_detects_custom_date_input_controls_by_class_name(tmp_
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
 
+    automator.report_generate_wait_seconds = 1
+    _wire_bounded_fake_export_menu(automator, window)
     result = automator.download_report(output, report)
 
     assert result.ok is True
@@ -3751,6 +5533,7 @@ def test_report_automation_uses_real_r01_probe_control_names_and_report_viewer_e
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -3761,7 +5544,7 @@ def test_report_automation_uses_real_r01_probe_control_names_and_report_viewer_e
     assert window.export.clicked is True
     assert "uncheck:不列明細" in result.actions
     assert "click:檢視報表" in result.actions
-    assert "click:匯出" in result.actions
+    assert any(action.startswith("click:匯出") for action in result.actions)
 
 
 def test_report_automation_continues_when_view_report_click_raises_after_pos_response(tmp_path: Path) -> None:
@@ -3778,13 +5561,14 @@ def test_report_automation_continues_when_view_report_click_raises_after_pos_res
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
     assert result.ok is True
     assert window.report_generated is True
     assert window.export.clicked is True
-    assert "continue:檢視報表:點擊回報失敗改由匯出等待確認" in result.actions
+    assert "continue:檢視報表:點擊回報失敗但已確認匯出啟用" in result.actions
 
 
 def test_report_automation_physically_clicks_view_report_when_invoke_is_noop(tmp_path: Path) -> None:
@@ -3801,6 +5585,7 @@ def test_report_automation_physically_clicks_view_report_when_invoke_is_noop(tmp
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -3839,6 +5624,7 @@ def test_report_automation_retries_view_report_immediately_when_first_click_has_
         report_generate_wait_seconds=1,
     )
     automator._keyboard_sender = send_keys
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -3871,7 +5657,7 @@ def test_report_automation_continues_to_export_wait_when_view_report_response_is
         automator.download_report(output, report)
     except ReportAutomationError as exc:
         assert exc.error_code in {"VIEW_REPORT_NOT_TRIGGERED", "EXPORT_BUTTON_NOT_READY"}
-        assert "wait_start:匯出啟用:timeout=0s" in exc.actions
+        assert any(action.startswith("wait_start:匯出啟用:") for action in exc.actions)
     else:
         raise AssertionError("unconfirmed view report should continue to export wait before failing")
 
@@ -3924,19 +5710,87 @@ def test_report_automation_closes_report_viewer_child_after_successful_save(tmp_
     report = next(item for item in config.reports if item.id == "R01")
     window = FakeReportViewerWindow(use_real_probe_names=True)
     report_child = FakeClosableReportChild("課程服務明細表")
-    window.children_controls.append(report_child)
+    run_report = next(
+        control for control in window.children_controls if control.automation_id == "B_RunReport"
+    )
+    mark_report_generated = run_report.on_click
+
+    def show_report_child() -> None:
+        assert mark_report_generated is not None
+        mark_report_generated()
+        window.children_controls.append(report_child)
+
+    run_report.on_click = show_report_child
+    window.close_report_viewer = lambda _report_menu_text: (report_child.close_alt_f4() or True)
     automator = ReportWindowAutomator(
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
     assert result.ok is True
     assert report_child.closed is True
+    assert report_child.alt_f4_closed is True
     assert "close_report_viewer:課程服務明細表" in result.actions
+
+
+def test_post_save_close_skips_unbounded_uia_fallback_when_fast_close_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    window = FakePosControl("SPA-POS")
+    report_child = FakePosControl(
+        "課程服務明細表",
+        "Window",
+        class_name="WindowsForms10.Window.8.app.0.33c0d9d",
+    )
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._active_report_form = report_child
+    automator._desktop_report_viewer_windows = lambda _title: []  # type: ignore[method-assign]
+    automator._lightweight_controls = (  # type: ignore[method-assign]
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("post-save cleanup must stay bounded"))
+    )
+
+    assert (
+        automator._close_report_viewer_safely(
+            "課程服務明細表",
+            reason="post_save_success",
+        )
+        is False
+    )
+    assert any(
+        action.startswith("skip_close_report_viewer:post_save_success:bounded_close_not_available:")
+        for action in automator.actions
+    )
+
+
+def test_report_automation_closes_known_r05_forms_before_broad_uia_scan(tmp_path: Path) -> None:
+    window = FakePosControl("SPA-POS")
+    product_form = FakeClosableReportChild("商品銷售明細表")
+    course_form = FakeClosableReportChild("課程服務明細表")
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._active_report_form = course_form
+    automator._known_report_forms["商品銷售明細表"] = product_form
+    automator._lightweight_controls = (  # type: ignore[method-assign]
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("known R05 forms must close before broad UIA scan"))
+    )
+    automator._desktop_report_viewer_windows = lambda _title: []  # type: ignore[method-assign]
+
+    assert automator._close_report_viewer("課程服務明細表") is True
+    assert course_form.closed is True
+    assert automator._close_report_viewer("商品銷售明細表") is True
+    assert product_form.closed is True
 
 
 def test_report_automation_closes_report_viewer_by_child_close_button(tmp_path: Path) -> None:
@@ -3945,13 +5799,26 @@ def test_report_automation_closes_report_viewer_by_child_close_button(tmp_path: 
     report = next(item for item in config.reports if item.id == "R01")
     window = FakeReportViewerWindow(use_real_probe_names=True)
     report_child = FakeReportChildWithCloseButton("課程服務明細表")
-    window.children_controls.append(report_child)
+    report_child.rectangle = lambda: FakeRect(100, 100, 800, 600)  # type: ignore[attr-defined]
+    run_report = next(
+        control for control in window.children_controls if control.automation_id == "B_RunReport"
+    )
+    mark_report_generated = run_report.on_click
+
+    def show_report_child() -> None:
+        assert mark_report_generated is not None
+        mark_report_generated()
+        window.children_controls.append(report_child)
+        automator._known_report_forms["課程服務明細表"] = report_child
+
+    run_report.on_click = show_report_child
     automator = ReportWindowAutomator(
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -3985,13 +5852,23 @@ def test_report_automation_closes_appointment_report_viewer_by_title_alias(tmp_p
         if control.friendly_class_name() == "CheckBox":
             control.toggle_state = 1
     report_child = FakeReportChildWithCloseButton("預約資料統計報表")
-    window.children_controls.append(report_child)
+    report_child.rectangle = lambda: FakeRect(100, 100, 800, 600)  # type: ignore[attr-defined]
+    run_report = next(
+        control for control in window.children_controls if control.window_text() == "檢視報表"
+    )
+
+    def show_report_child() -> None:
+        window.children_controls.append(report_child)
+        automator._known_report_forms["預約紀錄查詢統計表"] = report_child
+
+    run_report.on_click = show_report_child
     automator = ReportWindowAutomator(
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4000,7 +5877,7 @@ def test_report_automation_closes_appointment_report_viewer_by_title_alias(tmp_p
     assert "close_report_viewer:預約資料統計報表" in result.actions
 
 
-def test_report_automation_closes_desktop_report_viewer_when_not_in_descendants(tmp_path: Path) -> None:
+def test_post_save_close_does_not_scan_unknown_desktop_report_viewer(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -4013,15 +5890,16 @@ def test_report_automation_closes_desktop_report_viewer_when_not_in_descendants(
         report_generate_wait_seconds=1,
     )
     automator._desktop_report_viewer_windows = lambda _report_menu_text: [report_child]
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
     assert result.ok is True
-    assert report_child.closed is True
-    assert "close_report_viewer:課程服務明細表" in result.actions
+    assert report_child.closed is False
+    assert "close_report_viewer:課程服務明細表" not in result.actions
 
 
-def test_report_automation_never_closes_pos_main_window_as_desktop_report_viewer(tmp_path: Path) -> None:
+def test_post_save_close_does_not_scan_unknown_desktop_or_pos_window(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -4037,14 +5915,15 @@ def test_report_automation_never_closes_pos_main_window_as_desktop_report_viewer
         report_generate_wait_seconds=1,
     )
     automator._desktop_report_viewer_windows = lambda _report_menu_text: [pos_main_window, report_child]
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
     assert result.ok is True
     assert pos_main_window.closed is False
-    assert report_child.closed is True
+    assert report_child.closed is False
     assert not any(action.startswith("close_report_viewer:SPA-POS") for action in result.actions)
-    assert "close_report_viewer:課程服務明細表" in result.actions
+    assert "close_report_viewer:課程服務明細表" not in result.actions
 
 
 def test_report_automation_does_not_close_pos_main_window_when_no_report_child_is_found(tmp_path: Path) -> None:
@@ -4062,6 +5941,7 @@ def test_report_automation_does_not_close_pos_main_window_when_no_report_child_i
         report_generate_wait_seconds=1,
     )
     automator._desktop_report_viewer_windows = lambda _report_menu_text: [pos_main_window]
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4092,6 +5972,7 @@ def test_report_automation_dismisses_exit_confirmation_before_starting_task(tmp_
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4149,6 +6030,7 @@ def test_report_automation_does_not_send_global_close_hotkey_when_report_child_c
         report_generate_wait_seconds=1,
     )
     automator._keyboard_sender = sent_keys.append
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4157,7 +6039,7 @@ def test_report_automation_does_not_send_global_close_hotkey_when_report_child_c
     assert "close_report_viewer_by_keyboard:CTRL_F4" not in result.actions
 
 
-def test_report_automation_finds_report_viewer_save_export_button(tmp_path: Path) -> None:
+def test_report_automation_rejects_nonexact_r01_save_export_button(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -4172,13 +6054,14 @@ def test_report_automation_finds_report_viewer_save_export_button(tmp_path: Path
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
-    result = automator.download_report(output, report)
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator.download_report(output, report)
 
-    assert result.ok is True
-    assert window.export.clicked is True
-    assert "click:匯出" in result.actions
-    assert "click:匯出格式:Excel" in result.actions
+    assert exc_info.value.error_code == "EXPORT_BUTTON_NOT_READY"
+    assert window.export.clicked is False
+    assert any("R01拒絕不可點擊候選" in action for action in exc_info.value.actions)
 
 
 def test_report_automation_finds_deep_report_viewer_excel_menu_item(tmp_path: Path) -> None:
@@ -4192,6 +6075,7 @@ def test_report_automation_finds_deep_report_viewer_excel_menu_item(tmp_path: Pa
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4265,6 +6149,7 @@ def test_report_automation_does_not_scan_report_viewer_after_report_generation(t
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4288,6 +6173,7 @@ def test_report_automation_falls_back_to_click_when_click_input_fails(tmp_path: 
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4309,6 +6195,7 @@ def test_report_automation_physically_clicks_excel_menu_item_even_when_invoke_ex
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4330,6 +6217,8 @@ def test_report_automation_hands_visible_excel_selection_to_save_as_handler(tmp_
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
+    automator._save_as_dialog_probe = lambda _timeout_seconds: window.excel.clicked
 
     result = automator.download_report(output, report)
 
@@ -4364,6 +6253,7 @@ def test_report_automation_retries_visible_excel_until_save_as_opens(tmp_path: P
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
     automator._mouse_clicker = clicker
     automator._save_as_dialog_probe = save_as_dialog_probe
 
@@ -4396,6 +6286,7 @@ def test_report_automation_does_not_wait_save_as_after_excel_geometry_without_po
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
     automator._mouse_clicker = clicker
     automator._save_as_dialog_probe = lambda _timeout_seconds: False
 
@@ -4407,7 +6298,8 @@ def test_report_automation_does_not_wait_save_as_after_excel_geometry_without_po
     else:
         raise AssertionError("Excel geometry click without SaveAs or export progress must not be treated as success")
 
-    assert clicked_points == [(465, 189)]
+    assert clicked_points
+    assert set(clicked_points) == {(465, 189)}
     assert "retry:匯出格式:Excel:click:menu_still_visible" in actions
     assert "click:匯出格式:Excel:retry:geometry" in actions
     assert "retry:匯出格式:Excel:geometry:menu_still_visible" in actions
@@ -4415,7 +6307,7 @@ def test_report_automation_does_not_wait_save_as_after_excel_geometry_without_po
     assert "continue:匯出格式:Excel:geometry_click_wait_for_save_as" not in actions
 
 
-def test_report_automation_invokes_export_when_click_does_not_open_format_menu(tmp_path: Path) -> None:
+def test_report_automation_does_not_invoke_r01_export_after_unconfirmed_geometry_click(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -4435,13 +6327,18 @@ def test_report_automation_invokes_export_when_click_does_not_open_format_menu(t
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    automator._desktop_export_controls = (  # type: ignore[method-assign]
+        lambda: [window.excel] if window.excel in window.children_controls else []
+    )
+    automator._save_as_dialog_probe = lambda _timeout_seconds: window.excel.clicked
 
-    result = automator.download_report(output, report)
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator.download_report(output, report)
 
-    assert result.ok is True
-    assert invoke_calls == 1
-    assert "activate:匯出:invoke" in result.actions
-    assert "click:匯出格式:Excel" in result.actions
+    assert exc_info.value.error_code == "EXPORT_MENU_NOT_OPENED"
+    assert invoke_calls == 0
+    assert "activate:匯出:invoke" not in exc_info.value.actions
+    assert any("R01幾何點擊未確認選單快速失敗" in action for action in exc_info.value.actions)
 
 
 def test_report_automation_fails_closed_after_excel_geometry_when_export_progress_stays_visible(
@@ -4467,6 +6364,7 @@ def test_report_automation_fails_closed_after_excel_geometry_when_export_progres
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
     automator._mouse_clicker = clicker
     automator._save_as_dialog_probe = lambda _timeout_seconds: False
     automator._export_progress_visible = lambda: export_progress["visible"]  # type: ignore[method-assign]
@@ -4483,31 +6381,31 @@ def test_report_automation_fails_closed_after_excel_geometry_when_export_progres
     assert not any(action == "run_probe:status=success" for action in result.actions)
 
 
-def test_report_automation_hands_off_when_excel_menu_closes_before_save_as_appears(tmp_path: Path) -> None:
-    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
-    output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
-    report = next(item for item in config.reports if item.id == "R01")
-    window = FakeReportViewerWindow(
-        use_real_probe_names=True,
-        excel_control_cls=lambda *args, **kwargs: FakeRectPosControl(*args, rect=(370, 192, 549, 214), **kwargs),
-    )
-    window.excel.on_click = lambda: window.children_controls.remove(window.excel)
-
+@pytest.mark.parametrize("report_id", ["R01", "R11", "R12"])
+def test_report_automation_rejects_excel_menu_closure_without_export_evidence(
+    report_id: str,
+    tmp_path: Path,
+) -> None:
     automator = ReportWindowAutomator(
-        window,
+        FakePosControl("SPA-POS"),
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
-        report_generate_wait_seconds=1,
     )
-    automator._save_as_dialog_probe = lambda _timeout_seconds: False
+    automator._current_report_id = report_id
+    automator._wait_for_save_as_dialog_visible = lambda **_kwargs: False  # type: ignore[method-assign]
+    automator._export_progress_visible_for_activation = lambda: False  # type: ignore[method-assign]
+    automator._find_export_format_control = lambda **_kwargs: None  # type: ignore[method-assign]
 
-    result = automator.download_report(output, report)
+    state = automator._export_format_activation_state(
+        "Excel",
+        "confirmed_popup_geometry",
+        require_observed_response=False,
+        timeout_seconds=0,
+    )
 
-    assert result.ok is True
-    assert "click:匯出格式:Excel" in result.actions
-    assert "confirm:匯出格式:Excel:click:menu_closed_wait_for_save_as" in result.actions
-    assert "retry:匯出格式:Excel:click:menu_still_visible" not in result.actions
-    assert "continue:匯出格式:Excel:交由SaveAsHandler等待另存新檔" in result.actions
+    assert state == "retry"
+    assert not any("menu_closed_wait_for_save_as" in action for action in automator.actions)
+    assert not any("交由SaveAsHandler等待另存新檔" in action for action in automator.actions)
 
 
 def test_report_automation_does_not_block_visible_excel_selection_on_dialog_probe(tmp_path: Path) -> None:
@@ -4530,6 +6428,7 @@ def test_report_automation_does_not_block_visible_excel_selection_on_dialog_prob
         report_generate_wait_seconds=1,
     )
     automator._keyboard_sender = send_keys
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -4540,7 +6439,7 @@ def test_report_automation_does_not_block_visible_excel_selection_on_dialog_prob
     assert "select_export_format_by_keyboard:ENTER_AFTER_CLICK:Excel" not in result.actions
 
 
-def test_report_automation_searches_window_excel_format_on_windows_after_report_view(
+def test_report_automation_skips_broad_window_excel_scan_on_windows_after_report_view(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -4555,7 +6454,8 @@ def test_report_automation_searches_window_excel_format_on_windows_after_report_
     automator._report_view_requested = True
     automator._desktop_export_controls = lambda: []  # type: ignore[method-assign]
 
-    assert automator._find_export_format_control() is excel
+    assert automator._find_export_format_control() is None
+    assert "skip:匯出格式:REPORT避免掃描報表預覽範圍" in automator.actions
 
 
 def test_report_automation_lets_save_as_handler_report_missing_save_dialog(tmp_path: Path) -> None:
@@ -4570,6 +6470,8 @@ def test_report_automation_lets_save_as_handler_report_missing_save_dialog(tmp_p
         report_generate_wait_seconds=1,
         export_format_wait_seconds=0,
     )
+    _wire_bounded_fake_export_menu(automator, window)
+    automator._save_as_dialog_probe = lambda _timeout_seconds: window.excel.clicked
 
     result = automator.download_report(output, report)
 
@@ -4585,7 +6487,13 @@ def test_report_automation_reopens_export_menu_by_geometry_when_first_click_is_n
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
-    export = FakeNoopClickRectControl("匯出", "MenuItem", enabled=True, rect=(430, 260, 462, 284))
+    export = FakeNoopClickRectControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        enabled=True,
+        rect=(430, 260, 462, 284),
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -4613,6 +6521,17 @@ def test_report_automation_reopens_export_menu_by_geometry_when_first_click_is_n
         report_generate_wait_seconds=1,
     )
     automator._mouse_clicker = clicker
+    automator._desktop_export_controls = (  # type: ignore[method-assign]
+        lambda: [
+            control
+            for control in window.children_controls
+            if control.window_text() == "Excel"
+        ]
+    )
+    automator._save_as_dialog_probe = lambda _timeout_seconds: any(
+        control.window_text() == "Excel" and control.clicked
+        for control in window.children_controls
+    )
     automator.disabled_export_geometry_fallback_seconds = 0
 
     result = automator.download_report(output, report)
@@ -4660,6 +6579,13 @@ def test_report_automation_does_not_click_layout_setup_when_export_dropdown_clic
     )
     automator._mouse_clicker = clicker
     automator._current_report_id = "R09"
+    automator._desktop_export_controls = (  # type: ignore[method-assign]
+        lambda: [
+            control
+            for control in window.children_controls
+            if control.window_text() == "Excel"
+        ]
+    )
 
     opened_save_as = automator._open_export_menu(export)
 
@@ -4698,6 +6624,13 @@ def test_report_automation_opens_export_menu_by_left_geometry_when_other_clicks_
 
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
     automator._mouse_clicker = clicker
+    automator._desktop_export_controls = (  # type: ignore[method-assign]
+        lambda: [
+            control
+            for control in window.children_controls
+            if control.window_text() == "Excel"
+        ]
+    )
 
     opened_save_as = automator._open_export_menu(export)
 
@@ -4747,6 +6680,11 @@ def test_report_automation_opens_export_menu_by_toolbar_press_button_before_geom
 
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
     automator._mouse_clicker = clicker
+    automator._desktop_export_controls = lambda: [  # type: ignore[method-assign]
+        control
+        for control in toolbar.children_controls
+        if control.window_text() == "Excel"
+    ]
 
     opened_save_as = automator._open_export_menu(export)
 
@@ -4800,6 +6738,11 @@ def test_report_automation_uses_keyboard_fallback_when_disabled_export_geometry_
     automator._mouse_clicker = clicker
     automator._keyboard_sender = send_keys
     automator._current_report_id = "R09"
+    automator._desktop_export_controls = lambda: [  # type: ignore[method-assign]
+        control
+        for control in toolbar.children_controls
+        if control.window_text() == "Excel"
+    ]
     automator.disabled_export_geometry_fallback_seconds = 0
 
     opened_save_as = automator._open_export_menu(export)
@@ -4980,11 +6923,11 @@ def test_report_automation_treats_empty_report_viewer_as_unconfirmed_view_report
         report_generate_wait_seconds=0,
     )
 
-    result = automator.download_report(output, report)
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator.download_report(output, report)
 
-    assert result.ok is False
-    assert result.error_code == "VIEW_REPORT_NOT_TRIGGERED"
-    assert "click:匯出" not in result.actions
+    assert exc_info.value.error_code == "EXPORT_BUTTON_NOT_READY"
+    assert not any(action.startswith("click:匯出") for action in exc_info.value.actions)
 
 
 def test_report_viewer_with_data_rows_is_not_treated_as_empty(tmp_path: Path) -> None:
@@ -5022,7 +6965,13 @@ def test_report_automation_retries_view_report_on_visible_button_area_when_cente
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
-    export = FakePosControl("匯出", "Button", enabled=False)
+    export = FakePosControl(
+        "匯出",
+        "Button",
+        automation_id="ReportViewerExport",
+        enabled=False,
+    )
+    export.rectangle = lambda: FakeRect(550, 320, 620, 350)  # type: ignore[attr-defined]
     report_viewer = FakePosControl(
         "ReportToolBar",
         "Pane",
@@ -5073,6 +7022,13 @@ def test_report_automation_retries_view_report_on_visible_button_area_when_cente
         report_generate_wait_seconds=1,
     )
     automator._mouse_clicker = clicker
+    automator._desktop_export_controls = lambda: [  # type: ignore[method-assign]
+        control for control in window.children_controls if control.window_text() == "Excel"
+    ]
+    automator._save_as_dialog_probe = lambda _timeout_seconds: any(
+        control.window_text() == "Excel" and control.clicked
+        for control in window.children_controls
+    )
     automator.disabled_export_geometry_fallback_seconds = 0
 
     result = automator.download_report(output, report)
@@ -5092,13 +7048,20 @@ def test_report_automation_retries_view_report_early_when_no_preview_response(tm
     def add_report_viewer_on_second_click() -> None:
         if view_report.click_count < 2:
             return
+        dynamic_export = FakePosControl(
+            "匯出",
+            "MenuItem",
+            automation_id="ReportViewerExport",
+            enabled=True,
+        )
+        dynamic_export.rectangle = lambda: FakeRect(550, 320, 620, 350)  # type: ignore[attr-defined]
         report_form.children_controls.extend(
             [
                 FakePosControl(
                     "ReportToolBar",
                     "Pane",
                     automation_id="reportToolBar",
-                    children=[FakePosControl("匯出", "MenuItem", enabled=True)],
+                    children=[dynamic_export],
                 ),
                 FakePosControl("Excel", "MenuItem"),
             ]
@@ -5125,12 +7088,18 @@ def test_report_automation_retries_view_report_early_when_no_preview_response(tm
         report_generate_wait_seconds=1,
     )
     automator.view_report_no_response_retry_seconds = 0
+    _wire_bounded_fake_export_menu(automator, window)
+    automator._click_control_center_by_geometry = (  # type: ignore[method-assign]
+        lambda control, action: (control.click() or True)
+        if action == "檢視報表:retry"
+        else False
+    )
 
     result = automator.download_report(output, report)
 
     assert result.ok is True
     assert view_report.click_count >= 2
-    assert "retry:檢視報表:匯出等待無預覽回應" in result.actions
+    assert any(action.startswith("retry:檢視報表:") for action in result.actions)
 
 
 def test_report_automation_makes_offscreen_view_report_button_visible_before_clicking(
@@ -5178,6 +7147,7 @@ def test_report_automation_makes_offscreen_view_report_button_visible_before_cli
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -5204,6 +7174,8 @@ def test_report_automation_does_not_scan_deep_report_table_after_view_report(tmp
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    automator._desktop_export_controls = lambda: [window.excel]  # type: ignore[method-assign]
+    automator._save_as_dialog_probe = lambda _timeout_seconds: window.excel.clicked
 
     result = automator.download_report(output, report)
 
@@ -5226,6 +7198,8 @@ def test_report_automation_uses_physical_click_before_failing_invoke(tmp_path: P
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             gender_age,
             run_report,
             FakePosControl("匯出", "MenuItem"),
@@ -5233,6 +7207,7 @@ def test_report_automation_uses_physical_click_before_failing_invoke(tmp_path: P
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -5245,7 +7220,18 @@ def test_report_automation_uses_geometry_click_when_export_control_events_fail(t
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R09")
     report = next(item for item in config.reports if item.id == "R09")
-    export = FakeAllClickFailingRectControl("匯出", "MenuItem", rect=(430, 240, 456, 260))
+    export = FakeAllClickFailingRectControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        rect=(430, 240, 456, 260),
+    )
+    toolbar = FakePosControl(
+        "ReportToolBar",
+        "Pane",
+        automation_id="reportToolBar",
+        children=[export],
+    )
     window = FakePosControl(
         "SPA-POS",
         children=[
@@ -5254,9 +7240,11 @@ def test_report_automation_uses_geometry_click_when_export_control_events_fail(t
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             FakePosControl("顯示性別年齡", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
-            export,
+            toolbar,
             FakePosControl("Excel", "MenuItem"),
         ],
     )
@@ -5265,15 +7253,27 @@ def test_report_automation_uses_geometry_click_when_export_control_events_fail(t
     def clicker(*args: object, **kwargs: object) -> None:
         clicked_points.append((str(kwargs.get("button", "")), kwargs["coords"]))  # type: ignore[arg-type]
 
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
     automator._mouse_clicker = clicker
+    automator._desktop_export_controls = lambda: [  # type: ignore[method-assign]
+        control for control in window.children_controls if control.window_text() == "Excel"
+    ]
+    automator._save_as_dialog_probe = lambda _timeout_seconds: any(
+        control.window_text() == "Excel" and control.clicked
+        for control in window.children_controls
+    )
 
     result = automator.download_report(output, report)
 
     assert result.ok is True
-    assert ("left", (443, 250)) in clicked_points
-    assert "click:匯出:geometry" in result.actions
-    assert "click:匯出" in result.actions
+    assert ("left", (450, 250)) in clicked_points
+    assert "click:匯出:dropdown:geometry" in result.actions
+    assert any(action.startswith("click:匯出") for action in result.actions)
 
 
 def test_report_automation_refinds_enabled_export_when_initial_wrapper_stays_disabled(tmp_path: Path) -> None:
@@ -5298,6 +7298,7 @@ def test_report_automation_refinds_enabled_export_when_initial_wrapper_stays_dis
         ],
     )
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -5307,7 +7308,13 @@ def test_report_automation_refinds_enabled_export_when_initial_wrapper_stays_dis
 
 
 def test_report_automation_clicks_visible_report_toolbar_export_when_uia_reports_disabled(tmp_path: Path) -> None:
-    export = FakeNoopClickRectControl("匯出", "MenuItem", enabled=False, rect=(512, 341, 541, 363))
+    export = FakeNoopClickRectControl(
+        "匯出",
+        "MenuItem",
+        automation_id="ReportViewerExport",
+        enabled=False,
+        rect=(512, 341, 541, 363),
+    )
     toolbar = FakePosControl(
         "ReportToolBar",
         "Pane",
@@ -5350,7 +7357,12 @@ def test_report_automation_clicks_visible_report_toolbar_export_when_uia_reports
     )
     automator._mouse_clicker = clicker
     automator._report_view_requested = True
-    automator._current_report_id = "R09"
+    automator._current_report_id = "R07"
+    automator._desktop_export_controls = lambda: [  # type: ignore[method-assign]
+        control
+        for control in toolbar.children_controls
+        if control.window_text() == "Excel"
+    ]
     automator.disabled_export_geometry_fallback_seconds = 0
     automator._report_viewer_looks_empty = lambda **_kwargs: False  # type: ignore[method-assign]
 
@@ -5466,7 +7478,7 @@ def test_report_automation_download_report_sets_report_id_for_disabled_export_gu
         automator.download_report(output, report)
     except ReportAutomationError as exc:
         assert exc.error_code == "EXPORT_BUTTON_NOT_READY"
-        assert "skip:匯出控制項:R02需等待UIA啟用不接受停用匯出" in exc.actions
+        assert automator._current_report_id == "R02"
         assert "accept:匯出控制項:UIA停用但ReportViewer工具列可見" not in exc.actions
     else:
         raise AssertionError("R02 must not export through a disabled toolbar export control")
@@ -5813,7 +7825,7 @@ def test_report_automation_export_menu_probe_does_not_scan_r05_active_report_for
 
     assert state == "format_menu"
     assert "probe:匯出格式:fast_menu_only" in automator.actions
-    assert "probe:匯出格式:bounded_report_scope" in automator.actions
+    assert "probe:匯出格式:bounded_toolbar_scope" in automator.actions
 
 
 def test_report_automation_r01_export_menu_probe_uses_bounded_toolbar_scope_on_windows(
@@ -5860,6 +7872,321 @@ def test_report_automation_r01_export_menu_probe_uses_bounded_toolbar_scope_on_w
     assert "skip:匯出格式:R01避免掃描報表預覽範圍" in automator.actions
     assert "probe:匯出格式:bounded_toolbar_scope" in automator.actions
     assert "probe:匯出格式:bounded_report_scope" not in automator.actions
+
+
+def test_report_automation_r02_export_menu_probe_reuses_toolbar_without_scanning_preview(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    excel = FakeRectPosControl("Excel", "MenuItem", rect=(600, 326, 700, 350))
+    toolbar = FakeRectPosControl(
+        "ReportToolBar",
+        "Pane",
+        automation_id="reportToolBar",
+        rect=(560, 280, 760, 360),
+        children=[excel],
+    )
+    active_form = FakeRectPosControl(
+        "商品銷售明細表",
+        "Dialog",
+        rect=(120, 120, 900, 720),
+    )
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS Ver.1.5.19.10", "Window", rect=(0, 0, 1024, 768)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._report_view_requested = True
+    automator._active_report_title = "商品銷售明細表"
+    automator._active_report_form = active_form
+    automator._last_report_toolbar_scope = toolbar
+    automator._desktop_export_controls = lambda: []  # type: ignore[method-assign]
+    automator._fast_report_export_format_controls = (  # type: ignore[method-assign]
+        lambda: (_ for _ in ()).throw(AssertionError("R02 must not scan bounded_report_scope"))
+    )
+
+    assert automator._find_export_format_control(menu_only=True) is excel
+    assert "probe:匯出格式:bounded_toolbar_scope" in automator.actions
+    assert "probe:匯出格式:bounded_report_scope" not in automator.actions
+
+
+def test_report_automation_r02_export_menu_probe_fails_closed_without_toolbar_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS Ver.1.5.19.10", "Window", rect=(0, 0, 1024, 768)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._report_view_requested = True
+    automator._active_report_title = "商品銷售明細表"
+    automator._desktop_export_controls = lambda: []  # type: ignore[method-assign]
+    automator._fast_report_export_format_controls = (  # type: ignore[method-assign]
+        lambda: (_ for _ in ()).throw(AssertionError("R02 must not scan bounded_report_scope"))
+    )
+    automator._desktop_report_viewer_windows = (  # type: ignore[method-assign]
+        lambda _report_menu_text: (_ for _ in ()).throw(AssertionError("R02 must not enumerate desktop viewers"))
+    )
+
+    assert automator._find_export_format_control(menu_only=True) is None
+    assert "skip:匯出格式:R02無已確認toolbar快取避免掃描報表預覽" in automator.actions
+
+
+def test_report_automation_r05_export_menu_probe_reuses_toolbar_without_scanning_preview(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    excel = FakeRectPosControl("Excel", "MenuItem", rect=(600, 326, 700, 350))
+    toolbar = FakeRectPosControl(
+        "ReportToolBar",
+        "Pane",
+        automation_id="reportToolBar",
+        rect=(560, 280, 760, 360),
+        children=[excel],
+    )
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS Ver.1.5.19.10", "Window", rect=(0, 0, 1024, 768)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R05"
+    automator._report_view_requested = True
+    automator._active_report_title = "課程服務明細表"
+    automator._active_report_form = FakeRectPosControl(
+        "課程服務明細表",
+        "Dialog",
+        rect=(120, 120, 900, 720),
+    )
+    automator._last_report_toolbar_scope = toolbar
+    automator._desktop_export_controls = lambda: []  # type: ignore[method-assign]
+    automator._fast_report_export_format_controls = (  # type: ignore[method-assign]
+        lambda: (_ for _ in ()).throw(AssertionError("R05 must not scan bounded_report_scope"))
+    )
+    automator._desktop_report_viewer_windows = (  # type: ignore[method-assign]
+        lambda _report_menu_text: (_ for _ in ()).throw(AssertionError("R05 must not enumerate desktop viewers"))
+    )
+
+    assert automator._find_export_format_control(menu_only=True) is excel
+    assert "probe:匯出格式:bounded_toolbar_scope" in automator.actions
+    assert "probe:匯出格式:bounded_report_scope" not in automator.actions
+
+
+def test_report_automation_r02_uses_confirmed_pos_popup_geometry_for_excel(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(410, 211, 439, 233))
+    popup_rect = {"left": 410, "top": 231, "right": 635, "bottom": 291}
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1200, 800)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._report_view_requested = True
+    automator._r01_export_popup_rects_near_control = (  # type: ignore[method-assign]
+        lambda _control: [popup_rect]
+    )
+    automator._safe_export_menu_or_save_dialog_state = (  # type: ignore[method-assign]
+        lambda _context, *, timeout_seconds: None
+    )
+    automator._find_export_format_control = lambda **_kwargs: None  # type: ignore[method-assign]
+    clicked: list[tuple[int, int]] = []
+
+    def click_point(x: int, y: int, action: str) -> bool:
+        clicked.append((x, y))
+        automator.actions.append(f"click:{action}")
+        return True
+
+    automator._click_screen_point = click_point  # type: ignore[method-assign]
+    automator._export_format_activation_state = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: "continue"
+    )
+    automator._click_export_dropdown_by_geometry = (  # type: ignore[method-assign]
+        lambda _control, _action: True
+    )
+
+    opened_save_as = automator._open_export_menu(export)
+
+    assert opened_save_as is True
+    assert clicked == [(522, 247)]
+    assert "strategy:匯出:R02使用幾何點擊避免UIA pattern卡住" in automator.actions
+    assert "confirm:匯出格式:R02已確認popup:context=匯出:dropdown:rect=410,231,635,291" in automator.actions
+    assert "click:匯出格式:Excel:匯出:dropdown:confirmed_popup_geometry" in automator.actions
+
+
+def test_r02_detects_pos_report_generation_wait_box(tmp_path: Path) -> None:
+    wait_box = FakeRectPosControl(
+        "資料處理中, 請稍候...",
+        "Static",
+        automation_id="L_ShowWaitBox",
+        rect=(460, 300, 617, 320),
+    )
+    window = FakeRectPosControl(
+        "SPA-POS",
+        "Window",
+        children=[wait_box],
+        rect=(0, 0, 1024, 768),
+    )
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+
+    assert automator._report_generation_wait_box_visible() is True
+
+
+def test_r02_extends_wait_budget_after_report_generation_wait_box(tmp_path: Path) -> None:
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(100, 100, 140, 125))
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._report_view_requested = True
+    busy_states = iter((True, False))
+    automator._report_generation_wait_box_visible = lambda: next(busy_states, False)  # type: ignore[method-assign]
+    automator._find_visible_report_toolbar_export_record_with_fallback = (  # type: ignore[method-assign]
+        lambda **_kwargs: (export, 1, "report_toolbar")
+    )
+
+    assert automator._wait_for_export_button(None, timeout_seconds=1) is export
+    assert "wait:POS資料處理中:共用自適應預覽等待:base=1s:absolute=3s" in automator.actions
+
+
+def test_r02_does_not_repeat_view_report_after_generation_wait_box(tmp_path: Path) -> None:
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._r02_report_generation_wait_box_seen = True
+    automator._wait_for_export_button = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    automator._retry_view_report_for_export = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("R02 must not click 檢視報表 again while generation was observed")
+    )
+
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator._export_report_to_excel(None, timeout_seconds=1)
+
+    assert exc_info.value.error_code == "VIEW_REPORT_NOT_TRIGGERED"
+    assert any(
+        action.startswith("skip:retry_view_report:R02已觀察POS資料處理進度")
+        for action in automator.actions
+    )
+
+
+def test_r02_generation_wait_box_defers_health_failure_without_toolbar_evidence(tmp_path: Path) -> None:
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._r02_report_generation_wait_box_seen = True
+
+    assert automator._should_defer_pos_not_responding_during_r01_export_wait(
+        started_at=report_automation.monotonic(),
+        timeout_seconds=10.0,
+        report_toolbar_export_seen=False,
+    ) is True
+
+
+def test_r02_export_wait_skips_presearch_forced_health_probe(tmp_path: Path) -> None:
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(100, 100, 140, 125))
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._report_view_requested = True
+    automator._report_generation_wait_box_visible = lambda: False  # type: ignore[method-assign]
+    automator._raise_if_pos_not_responding = lambda **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("R02 must not run the pre-search forced health probe")
+    )
+    automator._find_visible_report_toolbar_export_record_with_fallback = (  # type: ignore[method-assign]
+        lambda **_kwargs: (export, 1, "report_toolbar")
+    )
+
+    assert automator._wait_for_export_button(None, timeout_seconds=1) is export
+
+
+def test_post_save_close_uses_bounded_close_on_windows_without_ui_scan(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._lightweight_controls = (  # type: ignore[method-assign]
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("Windows post-save close must not scan UIA"))
+    )
+
+    assert automator._close_report_viewer_safely("課程服務明細表", reason="post_save_success") is False
+    assert any(
+        action.startswith("skip_close_report_viewer:post_save_success:bounded_close_not_available:")
+        for action in automator.actions
+    )
+
+
+def test_r05_next_report_closes_old_known_child_but_preserves_product_reference(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(report_automation.sys, "platform", "win32")
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    old_report = FakeClosableReportChild("預約資料統計報表")
+    product_reference = FakeClosableReportChild("商品銷售明細表")
+    automator._known_report_forms = {
+        "預約紀錄查詢統計表": old_report,
+        "商品銷售明細表": product_reference,
+    }
+
+    automator._close_stale_report_viewers_before_next_report("課程服務明細表")
+
+    assert old_report.closed is True
+    assert product_reference.closed is False
+    assert "close_report_viewer:預約資料統計報表" in automator.actions
+
+
+def test_report_automation_r02_activation_probe_does_not_scan_desktop_progress(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS Ver.1.5.19.10", "Window", rect=(0, 0, 1024, 768)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R02"
+    automator._report_view_requested = True
+    monkeypatch.setattr(
+        ReportWindowAutomator,
+        "_export_progress_visible",
+        lambda _self: (_ for _ in ()).throw(AssertionError("R02 must not scan Desktop progress windows")),
+    )
+
+    assert automator._export_progress_visible_for_activation() is False
+    assert "skip:POS匯出進度偵測:R02避免pywinauto Desktop掃描" in automator.actions
 
 
 def test_report_automation_r01_export_menu_probe_rejects_excel_outside_toolbar_on_windows(
@@ -6587,6 +8914,143 @@ def test_report_automation_r09_reuses_cached_toolbar_instead_of_active_form_scan
     assert "reuse:匯出搜尋:R09已快取ReportViewer工具列" in automator.actions
 
 
+def test_report_automation_r03_reuses_cached_toolbar_before_focusing_active_form(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class ExplodingActiveForm(FakeRectPosControl):
+        def children(self) -> list[FakePosControl]:
+            raise AssertionError("R03 cached-toolbar search must not revisit the active ReportViewer form")
+
+    toolbar = FakeRectPosControl(
+        "ReportToolBar",
+        "Pane",
+        automation_id="reportToolBar",
+        rect=(320, 120, 900, 180),
+        children=[FakeNoopClickRectControl("匯出", "MenuItem", enabled=True, rect=(348, 138, 377, 160))],
+    )
+    active_form = ExplodingActiveForm(
+        "商品銷售明細表",
+        "Dialog",
+        rect=(120, 120, 900, 720),
+    )
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1600, 900)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+    automator._active_report_title = "商品銷售明細表"
+    automator._active_report_form = active_form
+    automator._last_report_toolbar_scope = toolbar
+
+    scopes = automator._export_search_scopes()
+
+    assert scopes == [("last_report_toolbar", toolbar)]
+    assert "reuse:匯出搜尋:R03已快取ReportViewer工具列" in automator.actions
+
+
+def test_report_automation_r03_view_report_uses_control_rectangle_before_uia_click(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class BlockingViewReport(FakeRectPosControl):
+        def click_input(self) -> None:
+            raise AssertionError("R03 view report must not use blocking UIA click_input")
+
+    control = BlockingViewReport("檢視報表", "Button", rect=(700, 120, 780, 150))
+    window = FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1024, 768))
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        wait_after_click_seconds=0,
+    )
+    automator._current_report_id = "R03"
+    clicked_points: list[tuple[int, int]] = []
+    automator._mouse_clicker = lambda **kwargs: clicked_points.append(kwargs["coords"])
+
+    automator._click(control, "檢視報表", prefer_click_input=True)
+
+    assert clicked_points == [(740, 135)]
+    assert "strategy:檢視報表:R03使用控制項矩形點擊避免UIA阻塞" in automator.actions
+
+
+def test_report_automation_r03_export_menu_uses_confirmed_geometry_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class BlockingUiaExport(FakeNoopClickRectControl):
+        def click_input(self) -> None:
+            raise AssertionError("R03 export open must not use blocking UIA click_input")
+
+        def click(self) -> None:
+            raise AssertionError("R03 export open must not use pywinauto click")
+
+        def invoke(self) -> None:
+            raise AssertionError("R03 export open must not use pywinauto invoke")
+
+    export = BlockingUiaExport("匯出", "MenuItem", enabled=True, rect=(555, 254, 599, 287))
+    active_form = FakeRectPosControl("商品銷售明細表", "Dialog", rect=(120, 120, 900, 720))
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1600, 900)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R03"
+    automator._report_view_requested = True
+    automator._active_report_title = "商品銷售明細表"
+    automator._active_report_form = active_form
+    clicked_points: list[tuple[int, int]] = []
+    automator._mouse_clicker = lambda **kwargs: clicked_points.append(kwargs["coords"])
+    automator._safe_export_menu_or_save_dialog_state = (  # type: ignore[method-assign]
+        lambda _context, *, timeout_seconds: "format_menu"
+    )
+
+    opened = automator._open_export_menu(export)
+
+    assert opened is False
+    assert clicked_points == [(593, 270)]
+    assert export.clicked is False
+    assert "strategy:匯出:R03使用幾何點擊避免UIA pattern卡住" in automator.actions
+
+
+def test_report_automation_r12_format_probe_does_not_scan_cached_toolbar_without_popup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class ExplodingToolbar(FakeRectPosControl):
+        def children(self) -> list[FakePosControl]:
+            raise AssertionError("R12 format probe must not scan the cached toolbar without popup evidence")
+
+    toolbar = ExplodingToolbar(
+        "ReportToolBar",
+        "Pane",
+        automation_id="reportToolBar",
+        rect=(320, 120, 900, 180),
+    )
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1600, 900)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R12"
+    automator._report_view_requested = True
+    automator._last_report_toolbar_scope = toolbar
+    automator._desktop_export_controls = lambda: []  # type: ignore[method-assign]
+
+    assert automator._find_export_format_control(menu_only=True) is None
+
+
 def test_report_automation_r09_disabled_export_probe_never_scans_preview_tree(
     tmp_path: Path,
     monkeypatch,
@@ -6838,6 +9302,45 @@ def test_report_automation_r01_r09_r10_reject_external_nearby_popup(
         )
 
         assert records == [], report_id
+
+
+def test_report_automation_r11_r12_accept_foreground_native_popup_without_mainform_owner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    window = FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1200, 800))
+    export_rect = {"left": 410, "top": 189, "right": 439, "bottom": 211}
+    for report_id in ("R11", "R12"):
+        automator = ReportWindowAutomator(
+            window,
+            save_as_handler=MockSaveAsHandler(),
+            output_dir=tmp_path,
+        )
+        automator._current_report_id = report_id
+        automator._fast_top_level_window_handles = lambda **_kwargs: [42]  # type: ignore[method-assign]
+        automator._fast_child_window_handles = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+        automator._window_handle_record = (  # type: ignore[method-assign]
+            lambda handle, *, export_rect, foreground_handle: {
+                "handle": handle,
+                "title": "",
+                "class_name": "#32768",
+                "rectangle": {"left": 410, "top": 211, "right": 620, "bottom": 271},
+                "visible": True,
+                "enabled": True,
+                "is_foreground": True,
+                "is_popup_class": True,
+                "popup_is_pos_related": False,
+                "near_export_control": True,
+            }
+        )
+
+        records = automator._export_popup_window_records_near_rect(
+            export_rect,
+            foreground_handle=42,
+        )
+
+        assert len(records) == 1, report_id
 
 
 def test_report_automation_r10_open_export_menu_does_not_guess_excel_without_confirmed_menu(
@@ -7139,6 +9642,7 @@ def test_report_automation_r01_selects_confirmed_toolbar_excel_without_hidden_ke
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
+        report_generate_wait_seconds=1,
         export_format_wait_seconds=0,
     )
     automator._current_report_id = "R01"
@@ -7693,6 +10197,7 @@ def test_report_automation_classifies_unexpected_nopattern_during_export_as_reco
     window = FakeR05CombinedWindow()
     window.close_report_viewer = lambda _report_menu_text: True
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_fake_r05_course_menu(window)
 
     class NoPatternInterfaceError(Exception):
         pass
@@ -7724,6 +10229,7 @@ def test_report_automation_reclassifies_wrapped_nopattern_report_error_during_ex
     window = FakeR05CombinedWindow()
     window.close_report_viewer = lambda _report_menu_text: True
     automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    _wire_fake_r05_course_menu(window)
 
     def crash_during_export(_export_control: object, *, timeout_seconds: float | None = None) -> None:
         automator.actions.append("wait_start:匯出啟用:timeout=300s")
@@ -7745,7 +10251,7 @@ def test_report_automation_reclassifies_wrapped_nopattern_report_error_during_ex
         raise AssertionError("wrapped NoPattern ReportAutomationError during export must be recoverable")
 
 
-def test_report_automation_uses_visible_toolbar_export_when_empty_heuristic_misfires(tmp_path: Path) -> None:
+def test_report_automation_rejects_disabled_toolbar_export_when_empty_heuristic_misfires(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -7789,12 +10295,13 @@ def test_report_automation_uses_visible_toolbar_export_when_empty_heuristic_misf
     )
     automator._mouse_clicker = clicker
 
-    result = automator.download_report(output, report)
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator.download_report(output, report)
 
-    assert result.ok is False
+    assert exc_info.value.error_code == "EXPORT_BUTTON_NOT_READY"
     assert export.clicked is False
     assert clicked_points == []
-    assert "click:匯出格式:Excel" not in result.actions
+    assert "click:匯出格式:Excel" not in exc_info.value.actions
 
 
 def test_report_automation_falls_back_to_click_when_checkbox_toggle_raises_dotnet_error(tmp_path: Path) -> None:
@@ -7811,13 +10318,21 @@ def test_report_automation_falls_back_to_click_when_checkbox_toggle_raises_dotne
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             gender_age,
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
             FakePosControl("Excel", "MenuItem"),
         ],
     )
-    automator = ReportWindowAutomator(window, save_as_handler=MockSaveAsHandler(), output_dir=tmp_path)
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        report_generate_wait_seconds=1,
+    )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -7839,6 +10354,8 @@ def test_report_automation_closes_report_viewer_after_export_menu_not_opened(tmp
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             FakePosControl("顯示性別年齡", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
@@ -7854,8 +10371,10 @@ def test_report_automation_closes_report_viewer_after_export_menu_not_opened(tmp
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
+        report_generate_wait_seconds=1,
         export_format_wait_seconds=0,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     try:
         automator.download_report(output, report)
@@ -7880,6 +10399,9 @@ def test_report_automation_falls_back_to_type_keys_when_set_text_raises_dotnet_e
             start_date,
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
+            FakePosControl("顯示性別年齡", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
             FakePosControl("Excel", "MenuItem"),
@@ -7889,7 +10411,9 @@ def test_report_automation_falls_back_to_type_keys_when_set_text_raises_dotnet_e
         window,
         save_as_handler=MockSaveAsHandler(),
         output_dir=tmp_path,
+        report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -7991,7 +10515,7 @@ def test_report_automation_view_report_search_skips_controls_with_broken_identit
     assert record[0] is view_report
 
 
-def test_report_automation_opens_hidden_excel_menu_by_keyboard(tmp_path: Path) -> None:
+def test_report_automation_does_not_open_hidden_r01_excel_menu_by_keyboard(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R01")
     report = next(item for item in config.reports if item.id == "R01")
@@ -8015,12 +10539,13 @@ def test_report_automation_opens_hidden_excel_menu_by_keyboard(tmp_path: Path) -
 
     automator._keyboard_sender = send_keys
 
-    result = automator.download_report(output, report)
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator.download_report(output, report)
 
-    assert result.ok is True
-    assert sent_keys == ["%{DOWN}"]
-    assert "open_export_menu_by_keyboard:%{DOWN}" in result.actions
-    assert "click:匯出格式:Excel" in result.actions
+    assert exc_info.value.error_code == "EXPORT_MENU_NOT_OPENED"
+    assert "%{DOWN}" not in sent_keys
+    assert "open_export_menu_by_keyboard:%{DOWN}" not in exc_info.value.actions
+    assert "click:匯出格式:Excel" not in exc_info.value.actions
 
 
 def test_report_automation_does_not_treat_unknown_save_as_state_as_export_success(tmp_path: Path) -> None:
@@ -8121,6 +10646,131 @@ def test_report_automation_r13_uses_reportviewer_geometry_when_left_click_confir
     assert left_clicks == ["匯出:left"]
     assert automator._export_format_menu_confirmed is True
     assert sent_keys == []
+
+
+def test_report_automation_r04_uses_bounded_native_popup_without_uia_activation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(410, 189, 439, 211))
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1200, 800)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R04"
+    automator._report_view_requested = True
+    automator._refresh_export_control_before_click = lambda control: control  # type: ignore[method-assign]
+    automator._export_control_is_inside_active_report_area = lambda _control: True  # type: ignore[method-assign]
+    automator._click_export_dropdown_by_geometry = lambda *_args: False  # type: ignore[method-assign]
+    automator._click_control_center_by_geometry = lambda *_args: True  # type: ignore[method-assign]
+    automator._click_export_left_by_geometry = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("R04 should stop after the first confirmed popup")
+    )  # type: ignore[method-assign]
+    automator._wait_for_bounded_export_popup = lambda _control: [  # type: ignore[method-assign]
+        {"left": 410, "top": 211, "right": 620, "bottom": 271}
+    ]
+    automator._r01_export_popup_rects_near_control = lambda _control: [  # type: ignore[method-assign]
+        {"left": 410, "top": 211, "right": 620, "bottom": 271}
+    ]
+    automator._click_screen_point = lambda *_args: True  # type: ignore[method-assign]
+    automator._export_format_activation_state = lambda *_args, **_kwargs: "continue"  # type: ignore[method-assign]
+    automator._activate_export_menu_by_pattern = lambda _control: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("R04 must not call UIA pattern activation")
+    )
+    automator._activate_export_menu_by_toolbar_wrapper = lambda _control: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("R04 must not call toolbar wrapper activation")
+    )
+    automator._send_keyboard = lambda *_args: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("R04 must not send keyboard fallback")
+    )
+
+    opened = automator._open_export_menu(export)
+
+    assert opened is True
+    assert automator._export_format_menu_confirmed is True
+    assert "strategy:匯出:R04使用有界原生popup探測避免UIA阻塞" in automator.actions
+    assert "skip:匯出格式:R04已確認popup只用幾何選取避免UIA掃描" in automator.actions
+
+
+def test_report_automation_r04_fails_closed_without_native_popup(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(410, 189, 439, 211))
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1200, 800)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R04"
+    automator._report_view_requested = True
+    automator._refresh_export_control_before_click = lambda control: control  # type: ignore[method-assign]
+    automator._export_control_is_inside_active_report_area = lambda _control: True  # type: ignore[method-assign]
+    automator._click_export_dropdown_by_geometry = lambda *_args: True  # type: ignore[method-assign]
+    automator._click_control_center_by_geometry = lambda *_args: False  # type: ignore[method-assign]
+    automator._click_export_left_by_geometry = lambda *_args: False  # type: ignore[method-assign]
+    automator._wait_for_bounded_export_popup = lambda _control: []  # type: ignore[method-assign]
+    automator._send_keyboard = lambda *_args: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("R04 must not use keyboard fallback without popup evidence")
+    )
+
+    with pytest.raises(ReportAutomationError) as raised:
+        automator._open_export_menu(export)
+
+    assert raised.value.error_code == "EXPORT_MENU_NOT_OPENED"
+    assert "未確認 POS 原生匯出格式選單" in raised.value.message
+
+
+@pytest.mark.parametrize("report_id", ["R11", "R12"])
+def test_report_automation_r11_r12_use_bounded_native_popup_without_uia_activation(
+    report_id: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(410, 189, 439, 211))
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1200, 800)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = report_id
+    automator._report_view_requested = True
+    automator._refresh_export_control_before_click = lambda _control: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError(f"{report_id} must not refresh the busy ReportViewer before bounded popup probing")
+    )
+    automator._focus_active_report_form_for_export = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError(f"{report_id} must not focus the busy active form before bounded popup probing")
+    )
+    automator._export_control_is_inside_active_report_area = lambda _control: True  # type: ignore[method-assign]
+    automator._click_export_dropdown_by_geometry = lambda *_args: False  # type: ignore[method-assign]
+    automator._click_control_center_by_geometry = lambda *_args: True  # type: ignore[method-assign]
+    automator._click_export_left_by_geometry = lambda *_args: (_ for _ in ()).throw(
+        AssertionError(f"{report_id} should stop after the first confirmed popup")
+    )  # type: ignore[method-assign]
+    automator._wait_for_bounded_export_popup = lambda _control: [  # type: ignore[method-assign]
+        {"left": 410, "top": 211, "right": 620, "bottom": 271}
+    ]
+    automator._r01_export_popup_rects_near_control = lambda _control: [  # type: ignore[method-assign]
+        {"left": 410, "top": 211, "right": 620, "bottom": 271}
+    ]
+    automator._click_screen_point = lambda *_args: True  # type: ignore[method-assign]
+    automator._export_format_activation_state = lambda *_args, **_kwargs: "continue"  # type: ignore[method-assign]
+    automator._activate_export_menu_by_pattern = lambda _control: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError(f"{report_id} must not call UIA pattern activation")
+    )
+    automator._activate_export_menu_by_toolbar_wrapper = lambda _control: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError(f"{report_id} must not call toolbar wrapper activation")
+    )
+    automator._send_keyboard = lambda *_args: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError(f"{report_id} must not send keyboard fallback")
+    )
+
+    opened = automator._open_export_menu(export)
+
+    assert opened is True
+    assert automator._export_format_menu_confirmed is True
+    assert f"strategy:匯出:{report_id}使用有界原生popup探測避免UIA阻塞" in automator.actions
 
 
 def test_report_automation_r13_confirmed_popup_without_excel_uses_confirmed_geometry(
@@ -8356,7 +11006,7 @@ def test_report_automation_r13_activation_does_not_scan_desktop_or_toolbar(
         timeout_seconds=0,
     )
 
-    assert state == "continue"
+    assert state == "retry"
     assert "skip:匯出格式:R13不以未確認toolbar Excel作為格式證據" in automator.actions
     assert "skip:POS匯出進度偵測:R13避免pywinauto Desktop掃描" in automator.actions
 
@@ -8437,7 +11087,7 @@ def test_report_automation_writes_r13_export_menu_failure_probe_before_cleanup(t
     assert probes == [("R13", "before_export_menu_not_opened_cleanup")]
 
 
-def test_report_automation_accepts_export_menu_with_enter_when_save_dialog_opens(tmp_path: Path) -> None:
+def test_report_automation_does_not_send_enter_for_unconfirmed_r09_export_menu(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R09")
     report = next(item for item in config.reports if item.id == "R09")
@@ -8449,6 +11099,8 @@ def test_report_automation_accepts_export_menu_with_enter_when_save_dialog_opens
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             FakePosControl("顯示性別年齡", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
@@ -8473,14 +11125,16 @@ def test_report_automation_accepts_export_menu_with_enter_when_save_dialog_opens
         report_generate_wait_seconds=1,
         export_format_wait_seconds=0,
     )
+    _wire_bounded_fake_export_menu(automator, window)
     automator._keyboard_sender = send_keys
     automator._save_as_dialog_probe = save_as_dialog_probe
 
-    result = automator.download_report(output, report)
+    with pytest.raises(ReportAutomationError) as exc_info:
+        automator.download_report(output, report)
 
-    assert result.ok is True
-    assert sent_keys == ["%{DOWN}", "{ENTER}"]
-    assert "open_export_menu_by_keyboard:{ENTER}" in result.actions
+    assert exc_info.value.error_code == "EXPORT_MENU_NOT_OPENED"
+    assert "{ENTER}" not in sent_keys
+    assert "open_export_menu_by_keyboard:{ENTER}" not in exc_info.value.actions
 
 
 def test_report_automation_finds_export_before_health_check(tmp_path: Path) -> None:
@@ -8505,9 +11159,9 @@ def test_report_automation_finds_export_before_health_check(tmp_path: Path) -> N
     assert any(action.startswith("target:匯出:") for action in automator.actions)
 
 
-def test_report_automation_r01_r02_check_pos_health_before_export_search(tmp_path: Path) -> None:
+def test_report_automation_r01_checks_pos_health_before_export_search(tmp_path: Path) -> None:
     window = FakePosControl("SPA-POS")
-    for report_id in ("R01", "R02"):
+    for report_id in ("R01",):
         automator = ReportWindowAutomator(
             window,
             save_as_handler=MockSaveAsHandler(),
@@ -8659,6 +11313,8 @@ def test_report_automation_waits_for_pos_export_progress_after_save_as(tmp_path:
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             FakePosControl("顯示性別年齡", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
@@ -8687,6 +11343,7 @@ def test_report_automation_waits_for_pos_export_progress_after_save_as(tmp_path:
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -8711,11 +11368,22 @@ def test_report_automation_export_menu_state_accepts_pos_export_progress(tmp_pat
     assert "confirm:匯出狀態:POS匯出進度視窗" in automator.actions
 
 
-def test_report_automation_r01_confirmed_popup_delegates_late_save_as_to_handler(
+def test_report_automation_r01_confirmed_popup_rejects_menu_closure_without_export_evidence(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
+    now = 0.0
+
+    def fake_monotonic() -> float:
+        return now
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(report_automation, "monotonic", fake_monotonic)
+    monkeypatch.setattr(report_automation, "sleep", fake_sleep)
     popup_rect = {"left": 552, "top": 348, "right": 720, "bottom": 379}
     automator = ReportWindowAutomator(
         FakeRectPosControl("SPA-POS Ver.1.5.18.80", "Window", rect=(0, 0, 1600, 900)),
@@ -8732,11 +11400,11 @@ def test_report_automation_r01_confirmed_popup_delegates_late_save_as_to_handler
 
     selected = automator._click_r01_default_export_format_in_popup(popup_rect, "匯出:left")
 
-    assert selected is True
+    assert selected is False
     assert clicked_points
     assert "click:匯出格式:Excel:匯出:left:confirmed_popup_geometry" in automator.actions
-    assert "confirm:匯出格式:Excel:匯出:left:confirmed_popup_geometry:menu_closed_wait_for_save_as" in automator.actions
-    assert "continue:匯出格式:Excel:交由SaveAsHandler等待另存新檔" in automator.actions
+    assert "retry:匯出格式:Excel:匯出:left:confirmed_popup_geometry:no_export_response" in automator.actions
+    assert not any("交由SaveAsHandler等待另存新檔" in action for action in automator.actions)
 
 
 def test_report_automation_r01_confirmed_popup_waits_briefly_before_rejecting(
@@ -8873,6 +11541,33 @@ def test_report_automation_r13_extends_save_as_timeout_and_raises_recoverable_pr
     assert "cancel:POS匯出進度視窗:save_as_timeout" in automator.actions
 
 
+def test_report_automation_r02_extends_save_as_timeout_for_month_end_exports(tmp_path: Path) -> None:
+    config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    report = next(item for item in config.reports if item.id == "R02")
+
+    class TimeoutSaveAsHandler:
+        wait_timeout_seconds = 300
+        blind_keyboard_fallback_delay_seconds = 300.0
+
+    handler = TimeoutSaveAsHandler()
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=handler,
+        output_dir=tmp_path,
+    )
+
+    restore = automator._extend_save_as_timeout_for_report(report)
+    try:
+        assert handler.wait_timeout_seconds == 900
+        assert handler.blind_keyboard_fallback_delay_seconds == 900.0
+        assert "config:另存新檔處理:R02延長timeout=900s" in automator.actions
+    finally:
+        restore()
+
+    assert handler.wait_timeout_seconds == 300
+    assert handler.blind_keyboard_fallback_delay_seconds == 300.0
+
+
 def test_report_automation_keeps_success_when_post_save_close_raises_com_error(tmp_path: Path) -> None:
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R03")
@@ -8908,6 +11603,7 @@ def test_report_automation_keeps_success_when_post_save_close_raises_com_error(t
         output_dir=tmp_path,
         report_generate_wait_seconds=1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     def close_report_viewer(_report_menu_text: str) -> bool:
         raise RuntimeError("(-2147220991, '事件無法啟動任何訂閱者', (None, None, None, 0, None))")
@@ -8933,6 +11629,8 @@ def test_report_automation_logs_stuck_pos_export_progress_after_success(tmp_path
             FakePosControl("起日", "Edit"),
             FakePosControl("迄日", "Edit"),
             FakePosControl("查詢分店", "ComboBox", automation_id="cB_QueryBranch"),
+            FakePosControl("限區間有消費", "CheckBox", automation_id="cK_OnlySaleDate"),
+            FakePosControl("└含0元結單", "CheckBox", automation_id="cK_IncSale0money"),
             FakePosControl("顯示性別年齡", "CheckBox"),
             FakePosControl("檢視報表", "Button"),
             FakePosControl("匯出", "MenuItem"),
@@ -8954,6 +11652,7 @@ def test_report_automation_logs_stuck_pos_export_progress_after_success(tmp_path
         output_dir=tmp_path,
         report_generate_wait_seconds=0.1,
     )
+    _wire_bounded_fake_export_menu(automator, window)
 
     result = automator.download_report(output, report)
 
@@ -9052,7 +11751,11 @@ def test_report_automation_rejects_menu_select_that_leaves_previous_report_form(
     assert "reject:menu_select_opened_wrong_report:expected=商品銷售明細表:actual=課程服務明細表" in automator.actions
 
 
-def test_report_automation_writes_minimal_failure_diagnostic_when_probe_payload_fails(tmp_path: Path) -> None:
+def test_report_automation_writes_minimal_failure_diagnostic_when_probe_payload_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(sys, "platform", "linux")
     config = load_project_config(ROOT / "config_templates" / "app.template.yaml")
     output = next(item for item in build_dry_run_plan(config).outputs if item.task_id == "R05")
     report = next(item for item in config.reports if item.id == "R05")
@@ -9091,3 +11794,381 @@ def test_report_automation_writes_minimal_failure_diagnostic_when_probe_payload_
     assert payload["runtime"]["run_id"] == "test-run"
     assert payload["runtime"]["automation_logic_fingerprint"] == AUTOMATION_LOGIC_FINGERPRINT
     assert payload["runtime"]["export_format_probe"] == "desktop-menu-plus-bounded-report-scope"
+    assert payload["failure_ui_probe_path"] is not None
+    assert Path(payload["failure_ui_probe_path"]).exists()
+    assert payload["failure_screenshot_error"] == "screenshot only available on Windows"
+
+
+def test_adaptive_wait_budget_extends_only_on_activity_and_stops_at_absolute_cap() -> None:
+    budget = report_automation._AdaptiveWaitBudget(
+        started_at=0.0,
+        base_timeout_seconds=10.0,
+        absolute_timeout_seconds=25.0,
+        activity_lease_seconds=6.0,
+    )
+
+    assert budget.expired(9.9) is False
+    assert budget.note_activity(9.0, fingerprint="wait-box-visible") is True
+    assert budget.deadline == 15.0
+    assert budget.expired(14.9) is False
+    assert budget.note_activity(14.0, fingerprint="wait-box-visible") is False
+    assert budget.deadline == 15.0
+    assert budget.note_activity(14.0, active=True) is True
+    assert budget.deadline == 20.0
+    assert budget.note_activity(19.5, active=True) is True
+    assert budget.deadline == 25.0
+    assert budget.note_activity(24.5, active=True) is False
+    assert budget.deadline == 25.0
+    assert budget.expired(25.0) is True
+
+
+def test_common_export_wait_renews_while_pos_reports_busy_but_stops_at_hard_cap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    clock = 0.0
+
+    def now() -> float:
+        return clock
+
+    def advance(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    monkeypatch.setattr(report_automation, "monotonic", now)
+    monkeypatch.setattr(report_automation, "sleep", advance)
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        pos_health_check_interval_seconds=0,
+    )
+    automator._current_report_id = "R05"
+    automator._report_view_requested = True
+    automator._report_generation_wait_box_visible = lambda: True  # type: ignore[method-assign]
+    automator._raise_no_report_data_if_warning_visible = lambda **_kwargs: None  # type: ignore[method-assign]
+    automator._find_visible_report_toolbar_export_record_with_fallback = (  # type: ignore[method-assign]
+        lambda **_kwargs: None
+    )
+
+    export = automator._wait_for_export_button(None, timeout_seconds=2.0)
+
+    assert export is None
+    assert 6.0 <= clock < 8.0
+    assert any(action.startswith("extend:匯出等待:POS資料處理活動") for action in automator.actions)
+
+
+def test_common_export_wait_returns_immediately_when_preview_is_ready(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    clock = 0.0
+
+    def now() -> float:
+        return clock
+
+    def advance(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    monkeypatch.setattr(report_automation, "monotonic", now)
+    monkeypatch.setattr(report_automation, "sleep", advance)
+    export_control = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(100, 100, 140, 125))
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+        pos_health_check_interval_seconds=0,
+    )
+    automator._current_report_id = "R05"
+    automator._report_view_requested = True
+    automator._report_generation_wait_box_visible = lambda: False  # type: ignore[method-assign]
+    automator._raise_no_report_data_if_warning_visible = lambda **_kwargs: None  # type: ignore[method-assign]
+    automator._find_visible_report_toolbar_export_record_with_fallback = (  # type: ignore[method-assign]
+        lambda **_kwargs: (export_control, 1, "report_toolbar")
+    )
+
+    export = automator._wait_for_export_button(None, timeout_seconds=300.0)
+
+    assert export is export_control
+    assert clock == 0.0
+
+
+def test_common_preview_wait_renews_while_pos_reports_busy_but_stops_at_hard_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+
+    def now() -> float:
+        return clock
+
+    def advance(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    monkeypatch.setattr(report_automation, "monotonic", now)
+    monkeypatch.setattr(report_automation, "sleep", advance)
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R05"
+    automator._report_generation_wait_box_visible = lambda: True  # type: ignore[method-assign]
+    automator._raise_no_report_data_if_warning_visible = lambda **_kwargs: None  # type: ignore[method-assign]
+    automator._report_viewer_has_actionable_response = lambda: False  # type: ignore[method-assign]
+
+    ready = automator._wait_for_report_viewer(timeout_seconds=2.0, adaptive=True)
+
+    assert ready is False
+    assert 6.0 <= clock < 7.0
+    assert any(action.startswith("extend:預覽等待:POS資料處理活動") for action in automator.actions)
+
+
+@pytest.mark.parametrize("report_id", ["R01", "R05", "R06", "R11", "R12", "R13"])
+def test_export_activation_never_falls_back_to_desktop_uia_progress_scan(
+    tmp_path: Path,
+    monkeypatch,
+    report_id: str,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS", "Window"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = report_id
+    automator._report_view_requested = True
+
+    def explode() -> list[object]:
+        raise AssertionError("export activation must not enumerate Desktop/UIA progress dialogs")
+
+    automator._export_progress_dialogs = explode  # type: ignore[method-assign]
+
+    assert automator._export_progress_visible_for_activation() is False
+    assert any(
+        action.startswith(f"skip:POS匯出進度偵測:{report_id}")
+        for action in automator.actions
+    )
+
+
+@pytest.mark.parametrize("report_id", ["R01", "R05", "R06", "R11", "R12", "R13"])
+def test_export_format_probe_never_reenters_reportviewer_for_any_report(
+    tmp_path: Path,
+    monkeypatch,
+    report_id: str,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    automator = ReportWindowAutomator(
+        FakePosControl("SPA-POS", "Window"),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = report_id
+    automator._report_view_requested = True
+    automator._desktop_export_controls = lambda: []  # type: ignore[method-assign]
+    automator._fast_report_toolbar_export_format_controls = lambda: []  # type: ignore[method-assign]
+
+    def explode() -> list[object]:
+        raise AssertionError("export format probe must not enumerate a ReportViewer scope")
+
+    automator._fast_report_export_format_controls = explode  # type: ignore[method-assign]
+
+    assert automator._find_export_format_control(menu_only=True) is None
+    assert f"skip:匯出格式:{report_id}避免掃描報表預覽範圍" in automator.actions
+
+
+def test_export_progress_native_probe_is_scoped_to_pos_process(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    texts = {
+        100: "SPA-POS",
+        200: "",
+        201: "正在匯出",
+        202: "請稍候",
+        300: "其他程式正在匯出，請稍候",
+    }
+    children = {
+        100: [200, 201, 202],
+        200: [201, 202],
+        201: [],
+        202: [],
+        300: [],
+    }
+    process_ids = {100: 42, 200: 42, 201: 42, 202: 42, 300: 99}
+
+    def enum_windows(callback, extra) -> None:
+        for handle in (100, 300):
+            callback(handle, extra)
+
+    def enum_child_windows(parent, callback, extra) -> None:
+        for handle in children.get(parent, []):
+            if callback(handle, extra) is False:
+                break
+
+    win32gui = SimpleNamespace(
+        EnumWindows=enum_windows,
+        EnumChildWindows=enum_child_windows,
+        GetWindowText=lambda handle: texts.get(handle, ""),
+        GetClassName=lambda _handle: "#32770",
+        IsWindowVisible=lambda _handle: True,
+        GetForegroundWindow=lambda: 200,
+    )
+    win32process = SimpleNamespace(
+        GetWindowThreadProcessId=lambda handle: (1, process_ids[handle]),
+    )
+    monkeypatch.setitem(sys.modules, "win32gui", win32gui)
+    monkeypatch.setitem(sys.modules, "win32process", win32process)
+
+    window = FakePosControl("SPA-POS", "Window")
+    window.handle = 100
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+
+    assert automator._fast_export_progress_dialog_handles() == [200]
+
+
+@pytest.mark.parametrize("report_id", ["R01", "R05", "R06", "R11", "R12"])
+def test_report_generation_wait_box_is_common_to_all_reports(report_id: str, tmp_path: Path) -> None:
+    wait_box = FakeRectPosControl(
+        "資料處理中，請稍候",
+        "Pane",
+        automation_id="pn_ShowWaitBox",
+        rect=(300, 250, 620, 360),
+    )
+    window = FakeRectPosControl("SPA-POS", "Window", children=[wait_box], rect=(0, 0, 1200, 800))
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = report_id
+
+    assert automator._report_generation_wait_box_visible() is True
+
+
+def test_report_export_wait_classifies_r05_course_no_data_child_dialog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    ok_button = FakePosControl("確定", "Button", automation_id="2")
+    warning = FakePosControl(
+        "注意事項",
+        "Dialog",
+        children=[
+            FakePosControl("目前並無 2026/08/01 至 2026/08/05 的課程服務資料!", "Static"),
+            ok_button,
+        ],
+        class_name="#32770",
+    )
+    window = FakePosControl("SPA-POS", children=[warning])
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = "R05"
+    automator._report_view_requested = True
+    automator._fast_top_level_window_handles = lambda **_kwargs: []  # type: ignore[method-assign]
+
+    with pytest.raises(ReportAutomationError) as raised:
+        automator._wait_for_export_button(None, timeout_seconds=0)
+
+    assert raised.value.error_code == "NO_REPORT_DATA"
+    assert ok_button.clicked is True
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_index"),
+    [
+        ("站前11樓", 3),
+        ("忠孝7樓", 4),
+        ("忠孝國際醫學3樓", 5),
+        ("忠孝健康7樓", 6),
+        ("忠孝預防醫學3樓", 7),
+    ],
+)
+def test_r06_selects_live_branch_combobox_by_exact_item_index(
+    target: str,
+    expected_index: int,
+    tmp_path: Path,
+) -> None:
+    branch_selector = FakeIndexedBranchCombo(
+        "查詢分店",
+        "ComboBox",
+        automation_id="cM_BranchNo",
+        class_name="WindowsForms10.COMBOBOX.app.0.33c0d9d",
+        items=[
+            "所有分店",
+            "營運總部",
+            "站前4樓",
+            "站前11樓",
+            "忠孝7樓",
+            "忠孝國際醫學3樓",
+            "忠孝健康7樓",
+            "忠孝預防醫學3樓",
+        ],
+        selected_index=2,
+        index_only=True,
+    )
+    window = FakePosControl("SPA-POS", children=[branch_selector])
+    automator = ReportWindowAutomator(
+        window,
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+
+    selected = automator._select_branch_value(
+        target,
+        required=False,
+        acceptable_values=[target],
+        require_verified=True,
+    )
+
+    assert selected is True
+    assert branch_selector.selected_index == expected_index
+    assert branch_selector.selected_value == target
+    assert any(action.startswith(f"branch_items:{target}:index={expected_index}") for action in automator.actions)
+    assert f"verify_branch:{target}:{target}" in automator.actions
+
+
+@pytest.mark.parametrize("report_id", ["R11", "R12"])
+def test_r11_r12_detect_diagnostic_winforms_export_dropdown(
+    report_id: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    export = FakeRectPosControl("匯出", "MenuItem", enabled=True, rect=(403, 211, 432, 233))
+    popup_rect = {"left": 403, "top": 232, "right": 583, "bottom": 280}
+    automator = ReportWindowAutomator(
+        FakeRectPosControl("SPA-POS", "Window", rect=(0, 0, 1200, 800)),
+        save_as_handler=MockSaveAsHandler(),
+        output_dir=tmp_path,
+    )
+    automator._current_report_id = report_id
+    automator._report_view_requested = True
+    automator._fast_top_level_window_handles = lambda **_kwargs: [42]  # type: ignore[method-assign]
+    automator._fast_child_window_handles = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+    automator._window_handle_record = (  # type: ignore[method-assign]
+        lambda handle, *, export_rect, foreground_handle: {
+            "handle": handle,
+            "title": "",
+            "class_name": "WindowsForms10.Window.20808.app.0.33c0d9d",
+            "rectangle": popup_rect,
+            "visible": True,
+            "enabled": True,
+            "is_foreground": True,
+            "popup_is_pos_related": False,
+            "near_export_control": True,
+        }
+    )
+
+    assert automator._r01_export_popup_rects_near_control(export) == [popup_rect]

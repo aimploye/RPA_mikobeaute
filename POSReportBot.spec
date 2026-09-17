@@ -19,6 +19,12 @@ EXCLUDED_DATA_FILE_SUFFIXES = (
     ".wbk",
 )
 EXCLUDED_DATA_FILE_NAMES = {"Thumbs.db", "desktop.ini"}
+EXCLUDED_BUILD_HOST_BINARY_NAMES = {
+    "libcrypto-3-x64.dll",
+    "libssl-3-x64.dll",
+    "ucrtbase.dll",
+    "icuuc.dll",
+}
 
 
 def _should_collect_data_file(path):
@@ -47,6 +53,15 @@ def collect_data_dir(source, destination):
     return data_files
 
 
+def should_exclude_build_host_binary(destination_name):
+    name = Path(destination_name).name.lower()
+    return (
+        name in EXCLUDED_BUILD_HOST_BINARY_NAMES
+        or name.startswith("api-ms-win-")
+        or (name.startswith("icudt") and name.endswith(".dll"))
+    )
+
+
 a = Analysis(
     ["src/pos_report_bot/__main__.py"],
     pathex=["src"],
@@ -72,6 +87,10 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+a.binaries = [
+    entry for entry in a.binaries
+    if not should_exclude_build_host_binary(entry[0])
+]
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

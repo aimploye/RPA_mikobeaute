@@ -30,9 +30,9 @@ class PosSettings(StrictBaseModel):
     backend: Literal["auto", "uia", "win32"] = "auto"
     startup_wait_seconds: int = 20
     startup_ini_selection_enabled: bool = True
-    startup_ini_profile: str = "c:\\tkhspa\\tkhspa-測試區.ini"
+    startup_ini_profile: str = "c:\\tkhspa\\tkhspa -測試.ini"
     run_as_admin: bool = False
-    close_after_run: bool = False
+    close_after_run: bool = True
 
 
 class LoginSettings(StrictBaseModel):
@@ -143,6 +143,9 @@ class PosRecoverySettings(StrictBaseModel):
 class R14TransformSettings(StrictBaseModel):
     template_path: str = ""
     template_search_dir: str = ""
+    template_drive_folder_id_or_url: str = ""
+    template_drive_filename_glob: str = "診所stock status - * demand planning-*.xlsx"
+    template_drive_fallback_to_local: bool = False
     raw_search_dir: str = ""
     raw_filename_glob: str = "診所stock status - * demand planning-*-rawdata.xls"
     output_extension: str = ".xlsx"
@@ -164,6 +167,7 @@ class R14InventorySourceSettings(StrictBaseModel):
             "忠孝7樓": "I",
             "忠孝國際醫學3樓": "J",
             "忠孝健康7樓": "K",
+            "忠孝預防醫學3樓": "L",
         }
     )
     apply_weekday: Literal[

@@ -10,7 +10,6 @@ import pytest
 from pos_report_bot.app import cli
 from pos_report_bot.pos.save_as_handler import (
     DesktopWindowProbeRecord,
-    MockSaveAsHandler,
     SaveAsDialogTimeoutError,
 )
 from pos_report_bot.scheduler.windows_task_scheduler import SchedulerCommandResult
@@ -25,7 +24,20 @@ def test_version_cli_outputs_current_version(capsys) -> None:  # type: ignore[no
         cli.main(["--version"])
 
     assert exc_info.value.code == 0
-    assert capsys.readouterr().out.strip() == "pos_report_bot 2.1.2"
+    assert capsys.readouterr().out.strip() == "pos_report_bot 3.0.9"
+
+
+def test_gui_runtime_self_test_short_circuits_config_loading(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_self_test_gui_runtime", lambda: calls.append("qt") or 0)
+    monkeypatch.setattr(
+        cli,
+        "load_project_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not load config")),
+    )
+
+    assert cli.main(["--self-test-gui-runtime"]) == 0
+    assert calls == ["qt"]
 
 
 def test_install_scheduler_cli_retries_elevated_and_requests_diagnostic_dir(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -202,48 +214,102 @@ def test_default_config_path_can_resolve_pyinstaller_bundle(
     assert cli.default_config_path() == bundled_config
 
 
-def test_run_task_cli_executes_single_pos_report_with_real_automation_path(
-    monkeypatch, capsys, tmp_path: Path
-) -> None:
-    window = FakePosControl(
-        "SPA-POS",
-        "Window",
-        children=[
-            FakePosControl("統計報表", "MenuItem"),
-            FakePosControl("課程服務明細表", "MenuItem"),
-            FakePosControl("起日", "Edit"),
-            FakePosControl("迄日", "Edit"),
-            FakePosControl("顯示銷售分店", "CheckBox"),
-            FakePosControl("不列明細", "CheckBox"),
-            FakePosControl("檢視報表", "Button"),
-            FakePosControl("匯出", "MenuItem"),
-            FakePosControl("Excel", "MenuItem"),
-        ],
-    )
+def test_run_task_cli_routes_pos_report_through_full_runner(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    captured = {}
 
-    monkeypatch.setattr(cli, "connect_pos_window", lambda **_kwargs: window)
-    monkeypatch.setattr(cli, "WindowsSaveAsHandler", lambda **_kwargs: MockSaveAsHandler())
+    class FakeSummary:
+        ok = True
+        completed = 1
+        skipped = 0
+        total = 1
+        message = "downloaded and uploaded"
+        error_code = None
+        details = None
+        failures = ()
+
+    class FakeRunner:
+        def __init__(
+            self,
+            config,
+            *,
+            settings_path: Path,
+            app_version: str,
+            run_source: str,
+            run_date: date,
+            selected_task_ids: set[str],
+        ) -> None:  # type: ignore[no-untyped-def]
+            captured["enabled_report_ids"] = [report.id for report in config.reports if report.enabled]
+            captured["settings_path"] = settings_path
+            captured["run_source"] = run_source
+            captured["run_date"] = run_date
+            captured["selected_task_ids"] = selected_task_ids
+
+        def run(self) -> FakeSummary:
+            captured["ran"] = True
+            return FakeSummary()
+
+    monkeypatch.setattr(cli, "AutomationRunner", FakeRunner)
+    monkeypatch.setattr(
+        cli,
+        "connect_pos_window",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must use AutomationRunner")),
+    )
 
     config_path = ROOT / "config_templates" / "app.template.yaml"
-    config_text = config_path.read_text(encoding="utf-8").replace(
-        r"C:\\ProgramData\\POSReportBot\\downloads",
-        str(tmp_path),
+    exit_code = cli.main(
+        ["--run-task", "R01", "--config", str(config_path), "--today", "2026-08-01"]
     )
-    runtime_config = tmp_path / "app.yaml"
-    runtime_config.write_text(config_text, encoding="utf-8")
-    for companion in ("reports.template.yaml", "branches.template.yaml", "drive_targets.template.yaml"):
-        companion_text = (ROOT / "config_templates" / companion).read_text(encoding="utf-8")
-        (tmp_path / companion).write_text(companion_text, encoding="utf-8")
-
-    exit_code = cli.main(["--run-task", "R01", "--config", str(runtime_config), "--today", "2026-05-13"])
     payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
+    assert captured["ran"] is True
+    assert captured["enabled_report_ids"] == ["R01"]
+    assert captured["selected_task_ids"] == {"R01"}
+    assert captured["run_source"] == "manual_single_task"
+    assert captured["run_date"] == date(2026, 8, 1)
     assert payload["ok"] is True
-    assert payload["task_id"] == "R01"
-    assert Path(payload["output_path"]).exists()
-    assert "click:統計報表" in payload["actions"]
-    assert "click:課程服務明細表" in payload["actions"]
+
+
+def test_run_task_cli_contains_runner_exception_and_writes_diagnostic(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    class CrashingRunner:
+        def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def run(self):  # type: ignore[no-untyped-def]
+            raise RuntimeError("simulated manual run-task crash")
+
+    monkeypatch.setattr(cli, "AutomationRunner", CrashingRunner)
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "programdata"))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp"))
+
+    config_path = ROOT / "config_templates" / "app.template.yaml"
+    runtime_config = cli.load_project_config(config_path)
+    runtime_config.app.logs_dir = str(tmp_path / "logs")
+    monkeypatch.setattr(cli, "load_project_config", lambda _path: runtime_config)
+    exit_code = cli.main(
+        ["--run-task", "R01", "--config", str(config_path), "--today", "2026-08-01"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert payload["ok"] is False
+    assert payload["error_code"] == "RUNNER_FAILED"
+    diagnostic_path = Path(payload["startup_diagnostic_path"])
+    assert diagnostic_path.exists()
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["kind"] == "manual_single_task_startup"
+    assert diagnostic["run_source"] == "manual_single_task"
+    assert diagnostic["phase"] == "runner_failed"
+    assert diagnostic["task_id"] == "R01"
+    assert diagnostic["run_date"] == "2026-08-01"
+    assert diagnostic["error_code"] == "RUNNER_FAILED"
+    assert diagnostic["exception"]["type"] == "RuntimeError"
+    assert "simulated manual run-task crash" in diagnostic["exception"]["traceback"]
 
 
 def test_run_task_cli_executes_r14_without_connecting_pos(
@@ -257,16 +323,20 @@ def test_run_task_cli_executes_r14_without_connecting_pos(
     template_config = ROOT / "config_templates" / "app.template.yaml"
     config_text = template_config.read_text(encoding="utf-8")
     replacements = {
-        r"C:\\ProgramData\\POSReportBot\\downloads": str(tmp_path / "downloads"),
-        r"C:\\ProgramData\\POSReportBot\\logs": str(tmp_path / "logs"),
-        r"C:\\ProgramData\\POSReportBot\\screenshots": str(tmp_path / "screenshots"),
-        r"C:\\ProgramData\\POSReportBot\\state": str(tmp_path / "state"),
-        r"C:\\ProgramData\\POSReportBot\\templates": str(ROOT / "tests" / "R14_TEST"),
+        r"C:\\ProgramData\\POSReportBot\\downloads": str(tmp_path / "downloads").replace("\\", "\\\\"),
+        r"C:\\ProgramData\\POSReportBot\\logs": str(tmp_path / "logs").replace("\\", "\\\\"),
+        r"C:\\ProgramData\\POSReportBot\\screenshots": str(tmp_path / "screenshots").replace("\\", "\\\\"),
+        r"C:\\ProgramData\\POSReportBot\\state": str(tmp_path / "state").replace("\\", "\\\\"),
+        r"C:\\ProgramData\\POSReportBot\\templates": str(ROOT / "tests" / "R14_TEST").replace("\\", "\\\\"),
     }
     for old, new in replacements.items():
         config_text = config_text.replace(old, new)
-    config_text = config_text.replace('template_path: ""', f'template_path: "{ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx"}"')
-    config_text = config_text.replace('raw_search_dir: ""', f'raw_search_dir: "{ROOT / "tests" / "R14_TEST"}"')
+    template_yaml_path = str(
+        ROOT / "tests" / "R14_TEST" / "診所stock status - 2026 demand planning-0531.xlsx"
+    ).replace("\\", "\\\\")
+    raw_yaml_path = str(ROOT / "tests" / "R14_TEST").replace("\\", "\\\\")
+    config_text = config_text.replace('template_path: ""', f'template_path: "{template_yaml_path}"')
+    config_text = config_text.replace('raw_search_dir: ""', f'raw_search_dir: "{raw_yaml_path}"')
     config_text = config_text.replace("google_drive:\n  upload_enabled: true", "google_drive:\n  upload_enabled: false")
     config_text = config_text.replace("r14_email:\n  enabled: true", "r14_email:\n  enabled: false")
     runtime_config = tmp_path / "app.template.yaml"
@@ -307,11 +377,21 @@ def test_run_task_cli_forces_w01_on_non_configured_weekday(monkeypatch, capsys, 
         failures = ()
 
     class FakeRunner:
-        def __init__(self, config, *, settings_path: Path, app_version: str, run_source: str, run_date: date) -> None:  # type: ignore[no-untyped-def]
+        def __init__(
+            self,
+            config,
+            *,
+            settings_path: Path,
+            app_version: str,
+            run_source: str,
+            run_date: date,
+            selected_task_ids: set[str],
+        ) -> None:  # type: ignore[no-untyped-def]
             captured["enabled_report_ids"] = [report.id for report in config.reports if report.enabled]
             captured["settings_path"] = settings_path
             captured["run_source"] = run_source
             captured["run_date"] = run_date
+            captured["selected_task_ids"] = selected_task_ids
 
         def run(self) -> FakeSummary:
             captured["ran"] = True
@@ -326,6 +406,7 @@ def test_run_task_cli_forces_w01_on_non_configured_weekday(monkeypatch, capsys, 
     assert exit_code == 0
     assert captured["ran"] is True
     assert captured["enabled_report_ids"] == ["W01"]
+    assert captured["selected_task_ids"] == {"W01"}
     assert captured["run_source"] == "manual_single_task"
     assert captured["run_date"] == date(2026, 6, 9)
     assert payload["ok"] is True
@@ -415,6 +496,52 @@ def test_run_enabled_scheduler_source_writes_startup_diagnostic(monkeypatch, cap
     assert startup_payload["kind"] == "windows_task_scheduler_startup"
     assert startup_payload["phase"] == "runner_finished"
     assert startup_payload["config_path"] == str(config_path)
+
+
+def test_run_enabled_scheduler_records_active_run_lock_error_code(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    fake_config = SimpleNamespace(app=SimpleNamespace(name="POSReportBot", logs_dir=str(tmp_path / "logs")))
+
+    class FakeSummary:
+        ok = False
+        completed = 0
+        skipped = 0
+        total = 0
+        message = "another run is active"
+        error_code = "AUTOMATION_ALREADY_RUNNING"
+        details = '{"run_source":"historical_backfill"}'
+        failures = ()
+
+    class FakeRunner:
+        def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def run(self) -> FakeSummary:
+            return FakeSummary()
+
+    monkeypatch.setattr(cli, "load_project_config", lambda _path: fake_config)
+    monkeypatch.setattr(cli, "AutomationRunner", FakeRunner)
+    config_path = tmp_path / "app.yaml"
+
+    exit_code = cli.main(
+        [
+            "--run-enabled",
+            "--run-source",
+            "windows_task_scheduler",
+            "--config",
+            str(config_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    startup_payload = json.loads(Path(payload["scheduler_startup_path"]).read_text(encoding="utf-8"))
+
+    assert exit_code == 1
+    assert payload["error_code"] == "AUTOMATION_ALREADY_RUNNING"
+    assert startup_payload["phase"] == "runner_finished"
+    assert startup_payload["error_code"] == "AUTOMATION_ALREADY_RUNNING"
 
 
 def test_run_enabled_scheduler_source_writes_config_load_failure(monkeypatch, capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

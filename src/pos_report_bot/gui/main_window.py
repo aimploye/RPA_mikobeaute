@@ -48,6 +48,7 @@ from pos_report_bot.app.automation_runner import (
     forced_weekly_report_ids_for_run_source,
 )
 from pos_report_bot.config.models import ProjectConfig, TaskDriveTarget
+from pos_report_bot.config.loader import FIXED_REPORT_BRANCH_MODES
 from pos_report_bot.config.writer import save_project_config
 from pos_report_bot.drive.folder_id import parse_drive_folder_id
 from pos_report_bot.drive.target_settings import apply_drive_target_values, build_drive_target_rows
@@ -58,6 +59,8 @@ from pos_report_bot.google.oauth import (
     GOOGLE_DRIVE_SCOPES,
     GOOGLE_GMAIL_PROFILE,
     GOOGLE_GMAIL_SCOPES,
+    GOOGLE_SHEETS_PROFILE,
+    GOOGLE_SHEETS_SCOPES,
     GoogleOAuthService,
 )
 from pos_report_bot.pos.launcher import resolve_pos_executable_path
@@ -79,9 +82,18 @@ from pos_report_bot.storage.runtime_paths import RuntimePaths, dated_runtime_dir
 ReportAutomationError = _ReportAutomationError
 
 POS_INI_PROFILE_OPTIONS = (
-    ("測試機", r"c:\tkhspa\tkhspa-測試區.ini"),
-    ("正式機", r"c:\tkhspa\tkhspa-正式區.ini"),
+    ("測試機", r"c:\tkhspa\tkhspa -測試.ini"),
+    ("正式機", r"c:\tkhspa\tkhspa-正式.ini"),
 )
+POS_INI_PROFILE_LEGACY_ALIASES = {
+    r"c:\tkhspa\tkhspa-測試區.ini": r"c:\tkhspa\tkhspa -測試.ini",
+    r"c:\tkhspa\tkhspa-正式區.ini": r"c:\tkhspa\tkhspa-正式.ini",
+}
+
+
+def _canonical_pos_ini_profile(profile: str) -> str:
+    normalized = profile.strip().lower()
+    return POS_INI_PROFILE_LEGACY_ALIASES.get(normalized, normalized)
 
 
 class SettingsPageContract(BaseModel):
@@ -111,13 +123,14 @@ class AutomationRunWorker(QObject):
     def run(self) -> None:
         try:
             summary = self.runner.run(on_progress=self.progress.emit)
-        except Exception as exc:
+        except BaseException as exc:
             summary = AutomationRunSummary(
                 ok=False,
                 completed=0,
                 total=0,
                 error_code="UNEXPECTED_AUTOMATION_ERROR",
                 message=f"背景自動化執行發生未預期錯誤：{exc}",
+                details=f"{type(exc).__name__}: {exc}",
             )
         self.finished.emit(summary)
 
@@ -193,7 +206,7 @@ def build_settings_pages(config: ProjectConfig) -> list[SettingsPageContract]:
             page_id="email",
             title="Email 通知設定",
             fields=["啟用通知", "SMTP host", "SMTP port", "TLS/SSL", "SMTP username", "收件人", "CC"],
-            actions=["測試寄信"],
+            actions=["儲存設定", "測試寄信"],
         ),
         SettingsPageContract(
             page_id="r14_email",
@@ -620,7 +633,7 @@ class SettingsMainWindow(QMainWindow):
 
         profile_combo = QComboBox()
         profile_combo.setObjectName("pos_ini_profile_choice")
-        current_profile = self.config.pos.startup_ini_profile.strip().lower()
+        current_profile = _canonical_pos_ini_profile(self.config.pos.startup_ini_profile)
         current_index = 0
         for index, (label, profile) in enumerate(POS_INI_PROFILE_OPTIONS):
             profile_combo.addItem(f"{label} - {profile}", profile)
@@ -650,8 +663,8 @@ class SettingsMainWindow(QMainWindow):
         if page.page_id == "reports":
             layout.addWidget(
                 QLabel(
-                    "啟用＝排程/一般執行是否納入；本次執行＝按下「立即執行選取任務」時才執行，"
-                    "不會修改啟用設定。W02 未到下一次發動日期時預設不勾選。"
+                    "啟用＝是否納入排程；本次執行＝按下「立即執行選取任務」時才執行，"
+                    "可獨立勾選且不會修改排程啟用設定。W02 未到下一次發動日期時預設不勾選。"
                 )
             )
 
@@ -713,7 +726,9 @@ class SettingsMainWindow(QMainWindow):
             run_selected = QCheckBox()
             run_selected.setObjectName(f"report_{report.id}_run_selected")
             run_selected.setChecked(self._default_manual_run_selection(report))
-            run_selected.setToolTip("只影響本次『立即執行選取任務』，不會改變排程啟用設定。")
+            run_selected.setToolTip(
+                "只影響本次『立即執行選取任務』，不會改變排程啟用設定；即使左側排程啟用未勾選，明確勾選本欄仍會執行。"
+            )
             table.setCellWidget(row_index, 1, run_selected)
             table.setItem(row_index, 2, QTableWidgetItem(report.id))
             table.setCellWidget(row_index, 3, self._table_line_edit(f"report_{report.id}_name", report.name))
@@ -723,11 +738,15 @@ class SettingsMainWindow(QMainWindow):
                 5,
                 self._table_line_edit(f"report_{report.id}_report_menu_text", self._report_menu_entry_text(report)),
             )
-            table.setCellWidget(
-                row_index,
-                6,
-                self._table_combo(f"report_{report.id}_branch_mode", ("all", "each_branch", "multi_select", "single"), report.branch_mode),
+            branch_mode = self._table_combo(
+                f"report_{report.id}_branch_mode",
+                ("all", "each_branch", "multi_select", "single"),
+                FIXED_REPORT_BRANCH_MODES.get(report.id, report.branch_mode),
             )
+            if report.id in FIXED_REPORT_BRANCH_MODES:
+                branch_mode.setEnabled(False)
+                branch_mode.setToolTip("此報表的分館模式由已驗證工作流程固定，避免產出錯誤查詢範圍。")
+            table.setCellWidget(row_index, 6, branch_mode)
             table.setCellWidget(row_index, 7, self._table_line_edit(f"report_{report.id}_date_start", report.date_range.start))
             table.setCellWidget(row_index, 8, self._table_line_edit(f"report_{report.id}_date_end", report.date_range.end))
             table.setCellWidget(row_index, 9, self._table_line_edit(f"report_{report.id}_output_filename", report.output_filename))
@@ -1082,8 +1101,20 @@ class SettingsMainWindow(QMainWindow):
 
     def test_google_account(self) -> GuiActionResult:
         self._sync_gui_to_config()
-        result = GoogleOAuthService(self.config).status()
-        return GuiActionResult(ok=result.ok, error_code=result.error_code, message=result.message)
+        checks = (
+            ("Drive", GOOGLE_DRIVE_SCOPES, GOOGLE_DRIVE_PROFILE),
+            ("Sheets", GOOGLE_SHEETS_SCOPES, GOOGLE_SHEETS_PROFILE),
+            ("Gmail", GOOGLE_GMAIL_SCOPES, GOOGLE_GMAIL_PROFILE),
+        )
+        for label, scopes, profile in checks:
+            result = GoogleOAuthService(self.config, scopes=scopes, profile=profile).status()
+            if not result.ok:
+                return GuiActionResult(
+                    ok=False,
+                    error_code=result.error_code,
+                    message=f"Google {label} 執行期授權不可用：{result.message}",
+                )
+        return GuiActionResult(ok=True, message="Google 執行期授權可用：Drive、Sheets、Gmail。")
 
     def test_google_drive_upload(self) -> GuiActionResult:
         self._sync_gui_to_config()
@@ -1382,7 +1413,7 @@ class SettingsMainWindow(QMainWindow):
                 self.config.pos.startup_ini_profile = str(profile)
 
     def _pos_ini_profile_label(self) -> str:
-        profile = self.config.pos.startup_ini_profile.strip().lower()
+        profile = _canonical_pos_ini_profile(self.config.pos.startup_ini_profile)
         for label, candidate in POS_INI_PROFILE_OPTIONS:
             if candidate.lower() == profile:
                 return label
@@ -1399,6 +1430,9 @@ class SettingsMainWindow(QMainWindow):
                 SettingFieldSpec("state 資料夾", "app.state_dir", "text"),
                 SettingFieldSpec("R14 模板檔路徑", "r14_transform.template_path", "text"),
                 SettingFieldSpec("R14 模板搜尋資料夾", "r14_transform.template_search_dir", "text"),
+                SettingFieldSpec("R14 雲端模板資料夾", "r14_transform.template_drive_folder_id_or_url", "text"),
+                SettingFieldSpec("R14 雲端模板檔名規則", "r14_transform.template_drive_filename_glob", "text"),
+                SettingFieldSpec("R14 雲端失敗允許本機備援", "r14_transform.template_drive_fallback_to_local", "bool"),
                 SettingFieldSpec("R14 raw data 搜尋資料夾", "r14_transform.raw_search_dir", "text"),
             ],
             "pos": [
@@ -1640,7 +1674,10 @@ class SettingsMainWindow(QMainWindow):
                     report.menu_path = []
                     report.report_menu_text = report_menu_text.text().strip()
             if branch_mode is not None:
-                report.branch_mode = branch_mode.currentText()  # type: ignore[assignment]
+                report.branch_mode = FIXED_REPORT_BRANCH_MODES.get(  # type: ignore[assignment]
+                    report.id,
+                    branch_mode.currentText(),
+                )
             if date_start is not None:
                 report.date_range.start = date_start.text()
             if date_end is not None:
@@ -1655,8 +1692,6 @@ class SettingsMainWindow(QMainWindow):
     def _selected_manual_task_ids(self) -> set[str]:
         selected: set[str] = set()
         for report in self.config.reports:
-            if not report.enabled:
-                continue
             checkbox = self.findChild(QCheckBox, f"report_{report.id}_run_selected")
             if checkbox is not None and checkbox.isChecked():
                 selected.add(report.id)
@@ -1681,6 +1716,9 @@ class SettingsMainWindow(QMainWindow):
             checkbox = self.findChild(QCheckBox, f"report_{report.id}_enabled")
             if checkbox is not None:
                 checkbox.setChecked(report.enabled)
+            run_selected = self.findChild(QCheckBox, f"report_{report.id}_run_selected")
+            if run_selected is not None:
+                run_selected.setChecked(report.id == report_id)
 
     def _set_all_reports_enabled(self) -> None:
         for report in self.config.reports:
@@ -1688,6 +1726,9 @@ class SettingsMainWindow(QMainWindow):
             checkbox = self.findChild(QCheckBox, f"report_{report.id}_enabled")
             if checkbox is not None:
                 checkbox.setChecked(report.enabled)
+            run_selected = self.findChild(QCheckBox, f"report_{report.id}_run_selected")
+            if run_selected is not None:
+                run_selected.setChecked(self._default_manual_run_selection(report))
 
     def _refresh_reports_title(self) -> None:
         title = self.findChild(QLabel, "reports_title")

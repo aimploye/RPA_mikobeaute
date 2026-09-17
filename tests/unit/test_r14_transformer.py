@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -6,13 +6,16 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from pos_report_bot.reports.r14_transformer import (
+    R13UsageData,
     R14TransformError,
     _days_in_month_label,
     load_r14_workbook_snapshot,
     parse_r13_usage_summary,
+    r14_template_actual_month_state_issues,
     sync_r14_template_actual_month_state,
     sync_r14_template_inventory,
     transform_r13_to_r14,
+    transform_r13_usage_to_r14,
 )
 
 
@@ -44,6 +47,28 @@ def test_r14_previous_month_day_count_handles_month_boundaries() -> None:
     assert _days_in_month_label("2026/12") == 31
 
 
+def test_legacy_r14_snapshot_reports_missing_sixth_branch_state() -> None:
+    issues = r14_template_actual_month_state_issues(
+        FIXTURE_DIR / "診所stock status - 2026 demand planning-0608.xlsx",
+        "2026/06",
+    )
+
+    assert "缺少分館頁籤：忠孝預防醫學3樓" in issues
+
+
+def test_load_r14_workbook_snapshot_allows_legacy_five_branch_for_weekly_analysis() -> None:
+    with pytest.raises(R14TransformError, match="忠孝預防醫學3樓"):
+        load_r14_workbook_snapshot(FIXTURE_DIR / "診所stock status - 2026 demand planning-0608.xlsx")
+
+    snapshot = load_r14_workbook_snapshot(
+        FIXTURE_DIR / "診所stock status - 2026 demand planning-0608.xlsx",
+        allow_legacy_missing_n006=True,
+    )
+
+    assert snapshot.missing_branches == ("忠孝預防醫學3樓",)
+    assert all(item.branch != "忠孝預防醫學3樓" for item in snapshot.items)
+
+
 def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: Path) -> None:
     output_path = tmp_path / "診所stock status - 2026 demand planning-0608.xlsx"
 
@@ -71,6 +96,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
         "忠孝國際醫學3樓",
         "忠孝7樓",
         "忠孝健康7樓",
+        "忠孝預防醫學3樓",
         "領用表",
     ]
 
@@ -95,24 +121,24 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
 
     summary = workbook["Summary"]
     assert summary["F2"].value.date() == date(2026, 5, 31)
-    assert [(summary.cell(2, col).value, summary.cell(3, col).value) for col in range(121, 127)] == [
+    actual_group = _find_summary_metric_group(summary, total_label="2026/06", metric_label="Actual")
+    assert [(summary.cell(2, col).value, summary.cell(3, col).value) for col in actual_group] == [
         ("2026/06", "Actual"),
         ("站前4樓", "Actual"),
         ("站前11樓", "Actual"),
         ("忠孝7樓", "Actual"),
         ("忠孝國際醫學3樓", "Actual"),
         ("忠孝健康7樓", "Actual"),
+        ("忠孝預防醫學3樓", "Actual"),
     ]
-    assert summary.column_dimensions["DQ"].hidden is False
-    assert summary.column_dimensions["DQ"].collapsed is True
-    assert summary.column_dimensions["DR"].hidden is True
-    assert summary.column_dimensions["DR"].outlineLevel == 1
-    assert summary.column_dimensions["DR"].min == 122
-    assert summary.column_dimensions["DR"].max == 126
-    assert "DW2:DW3" in _merged_ranges(summary, min_col=121)
-    assert "DX2:DX3" in _merged_ranges(summary, min_col=121)
-    assert summary["DW2"].value == "2026\n總銷量\n(單支/條/點)"
-    assert summary["DX2"].value == "2026\n月均銷\n(單支/條/點)"
+    actual_total_letter = _col_letter(actual_group[0])
+    actual_first_detail_letter = _col_letter(actual_group[1])
+    assert summary.column_dimensions[actual_total_letter].hidden is False
+    assert summary.column_dimensions[actual_total_letter].collapsed is True
+    assert summary.column_dimensions[actual_first_detail_letter].hidden is True
+    assert summary.column_dimensions[actual_first_detail_letter].outlineLevel == 1
+    assert summary.column_dimensions[actual_first_detail_letter].min == actual_group[1]
+    assert summary.column_dimensions[actual_first_detail_letter].max == actual_group[-1]
 
     forecast_group = _find_summary_metric_group(summary, total_label="2026/06", metric_label="Forecast")
     safety_group = _find_summary_metric_group(summary, total_label="安庫", metric_label="安庫")
@@ -123,6 +149,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
         ("忠孝7樓", "Forecast"),
         ("忠孝國際醫學3樓", "Forecast"),
         ("忠孝健康7樓", "Forecast"),
+        ("忠孝預防醫學3樓", "Forecast"),
     ]
     assert [(summary.cell(2, col).value, summary.cell(3, col).value) for col in safety_group] == [
         ("安庫", "安庫"),
@@ -131,6 +158,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
         ("忠孝7樓", "安庫"),
         ("忠孝國際醫學3樓", "安庫"),
         ("忠孝健康7樓", "安庫"),
+        ("忠孝預防醫學3樓", "安庫"),
     ]
     forecast_total_letter = _col_letter(forecast_group[0])
     forecast_first_detail = _col_letter(forecast_group[1])
@@ -153,21 +181,17 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
     assert _merged_ranges_in_column(summary, safety_group[0], min_row=4) == []
 
     summary_row = _find_item_row(summary, "6050010")
-    assert [summary.cell(summary_row, col).value for col in range(121, 127)] == [1, 1, None, None, None, None]
-    assert summary.cell(summary_row, 127).value == f"=SUM(CN{summary_row},CS{summary_row},CY{summary_row},DE{summary_row},DK{summary_row},DQ{summary_row})"
-    assert summary.cell(summary_row, 128).value == (
-        f"=AVERAGEA(CN{summary_row},CS{summary_row},CY{summary_row},DE{summary_row},DK{summary_row},DQ{summary_row})"
-    )
+    assert [summary.cell(summary_row, col).value for col in actual_group] == [1, 1, None, None, None, None, None]
     assert _find_item_row(summary, "6110181") > 0
     assert summary.cell(summary_row, forecast_group[0]).value == (
         f"=SUM({forecast_first_detail}{summary_row}:{forecast_last_detail}{summary_row})"
     )
     branch_planning_columns: dict[str, tuple[int, int]] = {}
-    for sheet_name in ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓"):
+    for sheet_name in ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓", "忠孝預防醫學3樓"):
         branch = workbook[sheet_name]
         branch_forecast_col = _find_forecast_month_column(branch)
         branch_planning_columns[sheet_name] = (branch_forecast_col, branch_forecast_col + 2)
-    for branch_index, sheet_name in enumerate(("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓"), start=1):
+    for branch_index, sheet_name in enumerate(("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓", "忠孝預防醫學3樓"), start=1):
         branch_forecast_col, _branch_safety_col = branch_planning_columns[sheet_name]
         branch_forecast_letter = _col_letter(branch_forecast_col)
         assert summary.cell(summary_row, forecast_group[branch_index]).value == (
@@ -178,7 +202,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
     assert summary.cell(summary_row, safety_group[0]).value == (
         f"=SUM({safety_first_detail_letter}{summary_row}:{safety_last_detail_letter}{summary_row})"
     )
-    for branch_index, sheet_name in enumerate(("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓"), start=1):
+    for branch_index, sheet_name in enumerate(("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓", "忠孝預防醫學3樓"), start=1):
         _branch_forecast_col, branch_safety_col = branch_planning_columns[sheet_name]
         branch_safety_letter = _col_letter(branch_safety_col)
         assert summary.cell(summary_row, safety_group[branch_index]).value == (
@@ -220,6 +244,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
         "忠孝國際醫學3樓": ("T", "U", "V", 22, 27),
         "忠孝7樓": ("V", "W", "X", 24, 29),
         "忠孝健康7樓": ("T", "U", "V", 22, 27),
+        "忠孝預防醫學3樓": ("T", "U", "V", 22, 27),
     }
     for sheet_name, (previous_month, current_month, future_group, group_min, group_max) in expected_visibility.items():
         branch_sheet = workbook[sheet_name]
@@ -233,7 +258,7 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
         forecast_col = _find_forecast_month_column(branch_sheet)
         assert branch_sheet.cell(2, forecast_col).value == "2026/06"
 
-    for sheet_name in ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓"):
+    for sheet_name in ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓", "忠孝預防醫學3樓"):
         branch_sheet = workbook[sheet_name]
         item_row = _first_item_row(branch_sheet)
         previous_actual_col = _find_month_column(branch_sheet, "2026/05")
@@ -267,6 +292,115 @@ def test_transform_r13_to_r14_rebuilds_usage_sheet_and_actual_columns(tmp_path: 
     assert workbook["站前11樓"].column_dimensions["H"].max == 44
     for hidden_col in ("H", "I", "J", "K"):
         assert workbook["忠孝健康7樓"].column_dimensions[hidden_col].hidden is True
+
+
+def test_transform_r13_usage_to_r14_outputs_zero_usage_report_after_pos_confirms_no_data(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "診所stock status - 2026 demand planning-0608.xlsx"
+    usage = R13UsageData(
+        start_date=datetime(2026, 6, 1),
+        end_date=datetime(2026, 6, 8),
+        report_month="2026/06",
+        rows=(),
+    )
+
+    result = transform_r13_usage_to_r14(
+        usage,
+        TEMPLATE_PATH,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+    )
+
+    assert result.output_path == output_path
+    assert result.imported_rows == 0
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+
+
+def test_transform_adds_n006_and_summary_order_turnover_sections(tmp_path: Path) -> None:
+    output_path = tmp_path / "with-n006-summary-metrics.xlsx"
+
+    transform_r13_to_r14(
+        RAW_PATH,
+        TEMPLATE_PATH,
+        output_path,
+        expected_end_date=date(2026, 6, 8),
+        branch_inventory={"忠孝預防醫學3樓": {"6050010": 123}},
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    assert workbook.sheetnames == [
+        "Summary",
+        "站前4樓",
+        "站前11樓",
+        "忠孝國際醫學3樓",
+        "忠孝7樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+        "領用表",
+    ]
+
+    n006 = workbook["忠孝預防醫學3樓"]
+    n006_row = _find_item_row(n006, "6050010")
+    n006_stock_col = _find_branch_stock_column(n006, "忠孝預防醫學3樓")
+    n006_forecast_col = _find_forecast_month_column(n006)
+    assert n006.cell(n006_row, n006_stock_col).value == 123
+    assert n006.cell(2, n006_forecast_col + 1).value == "下單數"
+    assert n006.cell(3, n006_forecast_col).value == "Forecast"
+
+    summary = workbook["Summary"]
+    assert _normal_header(summary["K3"].value) == _normal_header("忠孝預防醫學3樓庫存")
+    assert summary["L2"].value == "下單數"
+    assert [summary.cell(3, col).value for col in range(12, 18)] == [
+        "站前4樓",
+        "站前11樓",
+        "忠孝7樓",
+        "忠孝國際醫學3樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+    ]
+    assert summary["R2"].value == "週轉天數"
+    assert [summary.cell(3, col).value for col in range(18, 24)] == [
+        "站前4樓",
+        "站前11樓",
+        "忠孝7樓",
+        "忠孝國際醫學3樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+    ]
+    assert "F2:K2" in {str(merged_range) for merged_range in summary.merged_cells.ranges}
+    assert "F2:J2" not in {str(merged_range) for merged_range in summary.merged_cells.ranges}
+    assert "L2:Q2" in {str(merged_range) for merged_range in summary.merged_cells.ranges}
+    assert "R2:W2" in {str(merged_range) for merged_range in summary.merged_cells.ranges}
+    assert summary["F2"].number_format == 'yyyy/m/d"庫存"'
+    assert summary["F2"].fill.fgColor.rgb == "FFDBE5F1"
+    assert summary["L2"].fill.fgColor.rgb == "FFC04F15"
+    assert summary["L2"].font.color.rgb == "FFFFFFFF"
+    assert summary["R2"].fill.fgColor.rgb == "FF205C98"
+    assert summary["R2"].font.color.rgb == "FFFFFFFF"
+    for col in range(6, 12):
+        assert summary.cell(3, col).fill.fgColor.rgb == "FFDBE5F1"
+        assert summary.cell(3, col).alignment.horizontal == "center"
+        assert summary.cell(3, col).alignment.vertical == "center"
+        assert summary.cell(3, col).alignment.wrap_text is True
+    for col in range(12, 18):
+        assert summary.cell(3, col).fill.fgColor.rgb == "FFFCE2D5"
+    for col in range(18, 24):
+        assert summary.cell(3, col).fill.fgColor.rgb == "FFDBE5F1"
+    assert summary["X2"].value.strftime("%Y/%m") == "2021/12"
+
+    summary_row = _find_item_row(summary, "6050010")
+    order_col = _find_header_column(n006, "下單數")
+    actual_col = _find_month_column(n006, "2026/06")
+    order_formula = str(summary.cell(summary_row, 17).value)
+    turnover_formula = str(summary.cell(summary_row, 23).value)
+    assert f"'{n006.title}'!{get_column_letter(order_col)}:{get_column_letter(order_col)}" in order_formula
+    assert f"'{n006.title}'!{get_column_letter(actual_col)}:{get_column_letter(actual_col)}" in turnover_formula
+    assert "/8" in turnover_formula
+    assert '""' in turnover_formula
+    assert "=SUM(" not in order_formula
+    assert "=SUM(" not in turnover_formula
 
 
 def test_transform_r13_to_r14_writes_weekly_google_sheet_inventory(tmp_path: Path) -> None:
@@ -369,6 +503,33 @@ def test_sync_r14_template_inventory_updates_existing_template_file(tmp_path: Pa
     )
 
     workbook = load_workbook(template_path, data_only=False)
+    assert workbook.sheetnames == [
+        "Summary",
+        "站前4樓",
+        "站前11樓",
+        "忠孝國際醫學3樓",
+        "忠孝7樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+        "領用表",
+    ]
+    assert workbook["Summary"]["K3"].value == "忠孝預防醫學3樓\n庫存"
+    assert [workbook["Summary"].cell(3, col).value for col in range(12, 18)] == [
+        "站前4樓",
+        "站前11樓",
+        "忠孝7樓",
+        "忠孝國際醫學3樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+    ]
+    assert [workbook["Summary"].cell(3, col).value for col in range(18, 24)] == [
+        "站前4樓",
+        "站前11樓",
+        "忠孝7樓",
+        "忠孝國際醫學3樓",
+        "忠孝健康7樓",
+        "忠孝預防醫學3樓",
+    ]
     expected = {
         "站前4樓": ("6050010", 321),
         "站前11樓": ("6120001", 654),
@@ -492,9 +653,51 @@ def test_sync_r14_template_actual_month_state_overwrites_existing_previous_month
     summary_group = _find_summary_metric_group(summary, total_label="2026/06", metric_label="Actual")
     branch = workbook["站前4樓"]
     branch_col = _find_month_column(branch, "2026/06")
-    assert result.updated_columns == 11
+    assert result.updated_columns == 13
     assert summary.cell(summary_row, summary_group[0]).value == 1
     assert branch.cell(branch_row, branch_col).value == 1
+
+
+def test_sync_r14_template_actual_month_state_migrates_legacy_five_branch_snapshot_to_zero_n006(
+    tmp_path: Path,
+) -> None:
+    runtime_template = tmp_path / "runtime-template.xlsx"
+    runtime_template.write_bytes(TEMPLATE_PATH.read_bytes())
+    source_report = tmp_path / "source-report.xlsx"
+    transform_r13_to_r14(
+        RAW_PATH,
+        runtime_template,
+        source_report,
+        expected_end_date=date(2026, 6, 8),
+        update_template_path=runtime_template,
+    )
+
+    legacy_workbook = load_workbook(source_report)
+    legacy_summary = legacy_workbook["Summary"]
+    legacy_group = _find_summary_metric_group(legacy_summary, total_label="2026/06", metric_label="Actual")
+    legacy_summary.delete_cols(legacy_group[-1], 1)
+    del legacy_workbook["忠孝預防醫學3樓"]
+    legacy_workbook.save(source_report)
+
+    result = sync_r14_template_actual_month_state(
+        runtime_template,
+        source_report,
+        "2026/06",
+        overwrite_values=True,
+    )
+
+    workbook = load_workbook(runtime_template, data_only=False)
+    summary = workbook["Summary"]
+    summary_group = _find_summary_metric_group(summary, total_label="2026/06", metric_label="Actual")
+    summary_row = _find_item_row(summary, "6050010")
+    n006_summary_col = summary_group[-1]
+    n006 = workbook["忠孝預防醫學3樓"]
+    n006_col = _find_month_column(n006, "2026/06")
+    n006_row = _find_item_row(n006, "6050010")
+
+    assert result.updated_columns == 13
+    assert summary.cell(summary_row, n006_summary_col).value == 0
+    assert n006.cell(n006_row, n006_col).value == 0
 
 
 def test_transform_requires_template_inventory_date_when_w01_is_not_running(tmp_path: Path) -> None:
@@ -538,9 +741,9 @@ def test_transform_replaces_existing_usage_month_instead_of_appending(tmp_path: 
     assert "FAKE999" not in item_codes
 
     summary = workbook["Summary"]
-    assert len(_find_summary_metric_group(summary, total_label="2026/06", metric_label="Forecast")) == 6
-    assert len(_find_summary_metric_group(summary, total_label="安庫", metric_label="安庫")) == 6
-    for sheet_name in ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓"):
+    assert len(_find_summary_metric_group(summary, total_label="2026/06", metric_label="Forecast")) == 7
+    assert len(_find_summary_metric_group(summary, total_label="安庫", metric_label="安庫")) == 7
+    for sheet_name in ("站前4樓", "站前11樓", "忠孝國際醫學3樓", "忠孝7樓", "忠孝健康7樓", "忠孝預防醫學3樓"):
         sheet = workbook[sheet_name]
         assert _count_header_columns(sheet, "下單數") == 1
 
@@ -630,7 +833,14 @@ def _find_summary_metric_group(sheet, *, total_label: str, metric_label: str) ->
         if not total_matches:
             continue
         columns = [col]
-        for branch in ("站前4樓", "站前11樓", "忠孝7樓", "忠孝國際醫學3樓", "忠孝健康7樓"):
+        for branch in (
+            "站前4樓",
+            "站前11樓",
+            "忠孝7樓",
+            "忠孝國際醫學3樓",
+            "忠孝健康7樓",
+            "忠孝預防醫學3樓",
+        ):
             next_col = columns[-1] + 1
             assert sheet.cell(2, next_col).value == branch
             assert sheet.cell(3, next_col).value == metric_label

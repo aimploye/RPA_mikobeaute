@@ -1,9 +1,11 @@
+from datetime import date
 from pathlib import Path
 from shutil import copyfile
 
 import yaml
 
 from pos_report_bot.config.loader import load_project_config
+from pos_report_bot.reports.planner import build_dry_run_plan
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +20,7 @@ def test_load_project_config_from_template_files() -> None:
         r"台灣凱惠資訊科技有限公司\SPA1\SPA資訊服務應用系統.appref-ms"
     )
     assert config.pos.startup_ini_selection_enabled is True
-    assert config.pos.startup_ini_profile == r"c:\tkhspa\tkhspa-測試區.ini"
+    assert config.pos.startup_ini_profile == r"c:\tkhspa\tkhspa -測試.ini"
     assert config.scheduler.daily_time == "01:00"
     assert config.email.enabled is True
     assert config.email.recipients == ["joe.little7208@gmail.com", "mickey.chen@mikobeaute.com"]
@@ -35,6 +37,9 @@ def test_load_project_config_from_template_files() -> None:
     assert "附件為本日耗材領用報表" in config.r14_email.body
     assert config.w02_order.diagnostic_mode is False
     assert config.r14_inventory_source.enabled is True
+    assert config.r14_transform.template_drive_folder_id_or_url == ""
+    assert config.r14_transform.template_drive_filename_glob == "診所stock status - * demand planning-*.xlsx"
+    assert config.r14_transform.template_drive_fallback_to_local is False
     assert config.r14_inventory_source.sheet_name == "Summary"
     assert config.r14_inventory_source.item_code_column == "B"
     assert config.r14_inventory_source.branch_inventory_columns == {
@@ -43,6 +48,7 @@ def test_load_project_config_from_template_files() -> None:
         "忠孝7樓": "I",
         "忠孝國際醫學3樓": "J",
         "忠孝健康7樓": "K",
+        "忠孝預防醫學3樓": "L",
     }
     assert config.google_drive.upload_enabled is True
     assert config.save_as.default_extension == ".xls"
@@ -151,6 +157,77 @@ def test_load_project_config_from_installed_config_filenames(tmp_path: Path) -> 
     assert len(config.reports) == 16
     assert len(config.branches) == 6
     assert config.drive_targets.targets["R06"].branches["N006"].endswith("1BK8pIlpdMdHn0TAVveWgDe5KA8XN35kG")
+
+
+def test_load_project_config_restores_legacy_placeholder_r06_execution_contract(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    legacy_r06 = next(report for report in payload["reports"] if report["id"] == "R06")
+    legacy_r06["handler"] = "placeholder"
+    legacy_r06["report_menu_text"] = ""
+    legacy_r06["branch_mode"] = "all"
+    legacy_r06["output_filename"] = "R06_{branch_code}_會員剩餘點數殘值統計表_{end}.xls"
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(saved_config)
+    report = next(report for report in config.reports if report.id == "R06")
+
+    assert report.handler == "member_remaining_points"
+    assert report.report_menu_text == "會員剩餘點數殘值統計表"
+    assert report.branch_mode == "each_branch"
+    plan = build_dry_run_plan(
+        config,
+        today=date(2026, 9, 2),
+        selected_task_ids={"R06"},
+    )
+    assert [output.branch_code for output in plan.outputs] == [
+        "N001",
+        "N002",
+        "N003",
+        "N004",
+        "N005",
+        "N006",
+    ]
+
+
+def test_load_project_config_migrates_r06_frequency_to_daily(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    legacy_r06 = next(report for report in payload["reports"] if report["id"] == "R06")
+    legacy_r06["frequency"] = "weekly"
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(saved_config)
+    report = next(report for report in config.reports if report.id == "R06")
+
+    assert report.frequency == "daily"
+
+
+def test_load_project_config_preserves_custom_executable_report_contract(tmp_path: Path) -> None:
+    original = load_project_config(ROOT / "config_templates" / "app.template.yaml")
+    payload = original.model_dump(mode="json")
+    custom_r06 = next(report for report in payload["reports"] if report["id"] == "R06")
+    custom_r06["handler"] = "custom_member_remaining_points"
+    custom_r06["report_menu_text"] = "自訂會員殘值表"
+    saved_config = tmp_path / "app.yaml"
+    saved_config.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(saved_config)
+    report = next(report for report in config.reports if report.id == "R06")
+
+    assert report.handler == "custom_member_remaining_points"
+    assert report.report_menu_text == "自訂會員殘值表"
 
 
 def test_load_project_config_prefers_user_companion_yaml_over_template_yaml(tmp_path: Path) -> None:
@@ -358,6 +435,7 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
         if report["id"] == "R11":
             report["options"]["check"] = ["顯示銷售分店", "顯示銷售分攤金額", "顯示退費", "僅含新客"]
         if report["id"] == "R06":
+            report["branch_mode"] = "multi_select"
             report["options"]["check"] = ["清單顯示"]
             report["output_filename"] = "R06_{branch_code}_會員剩餘點數殘值統計表_{end}.xls"
     reports_path.write_text(yaml.safe_dump(reports_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -393,9 +471,42 @@ def test_load_project_config_normalizes_video_derived_legacy_report_options(tmp_
     ]
     assert reports["R11"].options.other_conditions == ["二次篩選"]
     assert reports["R06"].options.check == ["清單檢視"]
+    assert reports["R06"].branch_mode == "each_branch"
     assert reports["R06"].output_filename == "會員剩餘點數殘值統計表-清單檢視{today}-{branch_name}.xls"
     assert reports["R13"].menu_path == ["庫存管理", "相關報表", "沙貨耗材領用查詢表"]
     assert reports["R13"].options.check == ["顯示課程耗用"]
+
+
+def test_load_project_config_restores_canonical_branch_modes_for_fixed_builtin_reports(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "POSReportBot" / "config"
+    config_dir.mkdir(parents=True)
+    copyfile(ROOT / "config_templates" / "app.template.yaml", config_dir / "app.yaml")
+    copyfile(ROOT / "config_templates" / "reports.template.yaml", config_dir / "reports.yaml")
+    copyfile(ROOT / "config_templates" / "branches.template.yaml", config_dir / "branches.yaml")
+    copyfile(
+        ROOT / "config_templates" / "drive_targets.template.yaml",
+        config_dir / "drive_targets.yaml",
+    )
+    reports_path = config_dir / "reports.yaml"
+    reports_data = yaml.safe_load(reports_path.read_text(encoding="utf-8"))
+    for report in reports_data["reports"]:
+        if report["id"] in {"R04", "R05", "R06", "R07", "R08"}:
+            report["branch_mode"] = "single"
+    reports_path.write_text(
+        yaml.safe_dump(reports_data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(config_dir / "app.yaml")
+    reports = {report.id: report for report in config.reports}
+
+    assert reports["R04"].branch_mode == "multi_select"
+    assert reports["R05"].branch_mode == "all"
+    assert reports["R06"].branch_mode == "each_branch"
+    assert reports["R07"].branch_mode == "multi_select"
+    assert reports["R08"].branch_mode == "multi_select"
 
 
 def test_load_project_config_migrates_legacy_r13_filename_to_rawdata_filename(tmp_path: Path) -> None:
